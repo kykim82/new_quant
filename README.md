@@ -37,6 +37,7 @@ npm run build
 
 ## 데이터와 배포
 
+- 비공개 배포 주소는 `https://krw-quant-radar.kykim82.chatgpt.site`입니다.
 - Cloudflare Worker가 업비트 API를 서버에서 호출하므로 브라우저의 호출 제한과 CORS 문제를 피합니다.
 - D1에는 최신 분석 결과와 최근 96회 결과를 저장합니다.
 - 예약 분석은 매 15분봉 마감 1분 뒤에 실행됩니다.
