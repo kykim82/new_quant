@@ -2,6 +2,7 @@
 
 ## 고정 계획 요청 결정.
 
+- 운영 검증. 코드93b1a86을 기존 GitHub main에 반영했다. 운영 화면 자산 dashboard-Ape6Op9x.js와 API schemaVersion4/generatedAt1788626528000/stale=false/error=null을 확인했다. 당시 저장 계획0개이며 실제 계획 생명주기는 SQLite 모의 통합 및 단위 검사로 검증했다. 기존 ZIP은 release/upbit_recommender-pre-fixed-plan.zip으로 보존하고 upbit_recommender.zip을 갱신했다.
 - 검증. 73개 테스트와 typecheck/lint/build를 통과했다. SQLite 통합 검사에서 탈락·만료·재시작·캐시 지연 이후에도 최초 ID와 목표가를 보존했다. 로컬 API schemaVersion4, stale=false, error=null을 확인했다.
 - UI는 기존 구성을 유지하면서 저장 가격 계획과 신규 진입 대기 사유를 추가했다. 순회 차례 밖 종목도 관측된 현재가 손절·목표 도달을 저장한다. 완료된15분봉 저가도 검사하되 손절과 같은 가격은 하회가 아니다. 초단위 체결 전수 관측은 아니므로 누락 없는 실시간 손절 감시를 보장하지 않는다.
 - 신규 진입 검증 유효시간은 저장 가격의 기존 만료와 별도다. 모의 기록은 fixed-plan-v4로 분리했고 실제 계좌 보유를 자동 판단하지 않는다. 기존 모의 보유기한·청산 규칙은 변경하지 않았다.
