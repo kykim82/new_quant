@@ -1,15 +1,16 @@
 // 전체 원화시장을 D1 커서·캔들 캐시로 순회하고 진입 후보와 관찰 대상을 집계한다
 import type { Candidate, DashboardPayload, ExecutionQuality, MarketDefinition, MarketRegime, MarketTicker, Observation } from './domain';
 import { getLatestDashboard, saveDashboard } from './database';
-import { acquireCycle, ensureCycleSchema, marketRows, readCandles, releaseCycle, writeMarket, type MarketResult } from './cycle-store';
-import { activityRatio, candleCost, dueUnits, emptyCandles, entryStillValid, ENTRY_VOLUME, makeObservation, nextMarkets, REASONS, retainPricePlan, SIGNAL_FRESH_MS, type CandleCache } from './market-cycle';
-import { deriveBtcRegime, evaluateScalp, evaluateSwing, rankCandidates, type StrategyInput } from './strategy';
+import { acquireCycle, ensureCycleSchema, marketRows, readCandles, releaseCycle, writeMarket, writeStoredPlans, type MarketResult } from './cycle-store';
+import { activityRatio, candleCost, dueUnits, emptyCandles, entryStillValid, ENTRY_VOLUME, makeObservation, nextMarkets, REASONS, SIGNAL_FRESH_MS, type CandleCache } from './market-cycle';
+import { chartSet, deriveBtcRegime, evaluateScalp, evaluateSwing, rankCandidates, type StrategyInput } from './strategy';
 import { evaluateScalp as legacyScalp, evaluateSwing as legacySwing } from './pre-confluence-strategy';
 import { fetchExecutionQualities, fetchKrwMarkets, fetchKrwTickers, updateCandleCache } from './upbit';
 import { paperSummary, trackPaper } from './paper-trades';
 import { withSpreadWarning } from './execution-warning';
 import { advanceTrends, trendsReady } from './trend-state';
 import { costedPlan } from './confluence-plan';
+import { advanceSavedPlan, canReplacePlan, createSavedPlan, describeSavedPlan, planBlockReason } from './plan-lifecycle';
 
 export const ANALYSIS_NOTIONAL_KRW = 1_000_000;
 export const ASSUMED_FEE_RATE = 0.0005;
@@ -24,6 +25,7 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
   const observations: Observation[] = [];
   const accepted: Candidate[] = [];
   const legacy: Candidate[] = [];
+  const savedPlans: Candidate[] = [];
   const diagnostics: Record<string, number> = {};
   let fresh = 0;
   for (const result of valid) {
@@ -38,23 +40,37 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
     }
     const isFresh = now - result.analyzedAt <= SIGNAL_FRESH_MS;
     if (isFresh && result.complete) fresh++;
+    for (const saved of result.plans ?? []) {
+      const observed = advanceSavedPlan(saved, [], ticker.tradePrice, now);
+      const candidate = observed.candidate;
+      const execution = executions.get(candidate.market);
+      const plan = execution ? costedPlan(candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct) : candidate.plan;
+      const reason = planBlockReason(observed) ?? (!isFresh ? REASONS.DATA_DELAYED : regime === 'RISK_OFF' ? REASONS.BTC_RISK_OFF
+        : ticker.quoteVolume24h < ENTRY_VOLUME[candidate.strategy] ? REASONS.LOW_LIQUIDITY
+        : !execution?.sufficientDepth || execution.buySlippagePct > (candidate.strategy === 'scalp' ? 0.15 : 0.25) || (plan.netReturns?.[0] ?? -1) <= 0 ? REASONS.POOR_EXECUTION
+        : candidate.entryStatus !== 'ready' ? candidate.entryBlockReason ?? '신규 진입 조건 재확인 대기'
+        : !entryStillValid(candidate, ticker.tradePrice, now) ? REASONS.CURRENT_PRICE_OUTSIDE_ENTRY : undefined);
+      savedPlans.push({ ...candidate, plan, currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h,
+        entryStatus: observed.stoppedAt !== undefined ? 'stopped' : reason ? 'waiting' : 'ready', entryBlockReason: reason });
+    }
     for (const candidate of result.candidates) {
+      const saved = savedPlans.find(c => c.market === candidate.market && c.strategy === candidate.strategy);
       const execution = executions.get(candidate.market);
       const plan = execution ? costedPlan(candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct) : candidate.plan;
       const executionOk = execution?.sufficientDepth
         && execution.buySlippagePct <= (candidate.strategy === 'scalp' ? 0.15 : 0.25) && (plan.netReturns?.[0] ?? -1) > 0;
-      if (isFresh && regime !== 'RISK_OFF' && ticker.quoteVolume24h >= ENTRY_VOLUME[candidate.strategy]
+      if ((!saved || saved.entryStatus === 'ready') && isFresh && regime !== 'RISK_OFF' && ticker.quoteVolume24h >= ENTRY_VOLUME[candidate.strategy]
         && executionOk && entryStillValid(candidate, ticker.tradePrice, now)) {
         accepted.push({ ...candidate, currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h, signedChangeRate: ticker.signedChangeRate,
           warnings: withSpreadWarning(candidate.warnings, candidate.strategy, execution.spreadPct),
           plan,
           metrics: { ...candidate.metrics, spreadPct: execution.spreadPct, slippagePct: execution.buySlippagePct } });
       } else {
-        const code = !isFresh ? 'DATA_DELAYED' : regime === 'RISK_OFF' ? 'BTC_RISK_OFF'
+        const code = saved && saved.entryStatus !== 'ready' ? 'SAVED_PLAN_WAITING' : !isFresh ? 'DATA_DELAYED' : regime === 'RISK_OFF' ? 'BTC_RISK_OFF'
           : ticker.quoteVolume24h < ENTRY_VOLUME[candidate.strategy] ? 'LOW_LIQUIDITY' : !executionOk ? 'POOR_EXECUTION' : 'CURRENT_PRICE_OUTSIDE_ENTRY';
         observations.push({ market: candidate.market, koreanName: candidate.koreanName, strategy: candidate.strategy,
           currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h, analyzedAt: result.analyzedAt,
-          code, reason: REASONS[code], trendScore: candidate.score });
+          code, reason: code === 'SAVED_PLAN_WAITING' ? saved!.entryBlockReason ?? REASONS[code] : REASONS[code], trendScore: candidate.score });
         diagnostics[code] = (diagnostics[code] ?? 0) + 1;
       }
     }
@@ -64,12 +80,13 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
       const code = !isFresh ? 'DATA_DELAYED' : regime === 'RISK_OFF' ? 'BTC_RISK_OFF'
         : ticker.quoteVolume24h < ENTRY_VOLUME[observation.strategy] ? 'LOW_LIQUIDITY' : observation.code;
       diagnostics[code] = (diagnostics[code] ?? 0) + 1;
-      observations.push({ ...observation, currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h, code, reason: REASONS[code] ?? code });
+      observations.push({ ...observation, currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h, code, reason: code === observation.code ? observation.reason : REASONS[code] ?? code });
     }
   }
   const btc = prices.get('KRW-BTC');
   return {
-    schemaVersion: 3, generatedAt: now, priceUpdatedAt: now, source: 'live', stale: false,
+    schemaVersion: 4, generatedAt: now, priceUpdatedAt: now, source: 'live', stale: false,
+    savedPlans,
     analysisNotionalKrw: ANALYSIS_NOTIONAL_KRW, marketRegime: regime,
     btcPrice: btc?.tradePrice ?? null, btcChangeRate: btc?.signedChangeRate ?? null,
     coverage: { krwMarketCount: markets.length, eligibleMarketCount: safe.size, analyzedMarketCount: valid.length,
@@ -84,15 +101,17 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
     rejections: { lowLiquidity: diagnostics.LOW_LIQUIDITY ?? 0, marketWarning: markets.length - safe.size,
       technicalConditions: observations.filter(o => !['LOW_LIQUIDITY', 'POOR_EXECUTION', 'DATA_DELAYED', 'INSUFFICIENT_DATA'].includes(o.code)).length,
       executionQuality: diagnostics.POOR_EXECUTION ?? 0, insufficientData: diagnostics.INSUFFICIENT_DATA ?? 0 },
-    notice: '구조·피벗·피보나치·TT 목표 v3 · 모의 주문금액 100만원 · 편도 수수료 가정 0.05% · 스프레드는 주의 표시만 · 자동주문 없음',
+    notice: '가격 계획 고정 · 신규 진입 상태 별도 확인 · 모의 주문금액 100만원 · 편도 수수료 가정 0.05% · 스프레드는 주의 표시만 · 자동주문 없음',
   };
 }
 
 function cachedPayload(payload: DashboardPayload, now: number, error?: unknown): DashboardPayload {
-  const stale = payload.schemaVersion !== 3 || now - payload.generatedAt > 3 * 60_000 || Boolean(error);
+  const stale = payload.schemaVersion !== 4 || now - payload.generatedAt > 3 * 60_000 || Boolean(error);
   return { ...payload, source: 'cached', stale,
-    scalp: stale ? [] : payload.scalp.filter(c => c.plan.expiresAt > now),
-    swing: stale ? [] : payload.swing.filter(c => c.plan.expiresAt > now),
+    scalp: stale ? [] : payload.scalp.filter(c => entryStillValid(c, c.currentPrice, now)),
+    swing: stale ? [] : payload.swing.filter(c => entryStillValid(c, c.currentPrice, now)),
+    savedPlans: payload.savedPlans?.map(c => c.entryStatus === 'stopped' || (!stale && (c.entryValidUntil ?? 0) > now) ? c
+      : { ...c, entryStatus: 'waiting', entryBlockReason: stale ? REASONS.DATA_DELAYED : c.entryBlockReason ?? '신규 진입 조건 재확인 대기' }),
     error: error instanceof Error ? error.message : error ? '시세 갱신 실패' : undefined };
 }
 
@@ -140,6 +159,7 @@ export async function refreshDashboard(db: D1Database, options: { force?: boolea
         prepared.push({ market, candles });
       } catch {
         const failure: MarketResult = { market: market.market, analyzedAt: now, complete: false, engineVersion: 3, trends: results.get(market.market)?.trends,
+          plans: (results.get(market.market)?.plans ?? results.get(market.market)?.candidates.map(createSavedPlan))?.map(p => describeSavedPlan(p, undefined, REASONS.DATA_DELAYED, now, SIGNAL_FRESH_MS)),
           candidates: [], legacy: [], observations: (['scalp', 'swing'] as const).map(strategy => ({
             market: market.market, koreanName: market.koreanName, strategy, currentPrice: 0, quoteVolume24h: 0,
             analyzedAt: now, code: 'INSUFFICIENT_DATA', reason: REASONS.INSUFFICIENT_DATA, trendScore: 0 })) };
@@ -148,9 +168,19 @@ export async function refreshDashboard(db: D1Database, options: { force?: boolea
     }
     tickers = await fetchKrwTickers();
     const tickerMap = new Map(tickers.map(t => [t.market, t]));
+    // 순회 차례가 아닌 종목도 이번 시세에서 확인한 손절·목표 도달을 영속 보존한다.
+    for (const result of results.values()) {
+      const ticker = tickerMap.get(result.market);
+      if (!ticker || !result.plans?.length) continue;
+      const plans = result.plans.map(p => advanceSavedPlan(p, [], ticker.tradePrice, now));
+      if (JSON.stringify(plans) !== JSON.stringify(result.plans)) {
+        result.plans = plans;
+        await writeStoredPlans(db, result);
+      }
+    }
     const safeCodes = new Set(markets.filter(m => !m.warned).map(m => m.market));
     const executionCodes = [...new Set([...prepared.map(p => p.market.market),
-      ...[...results.values()].filter(r => safeCodes.has(r.market) && now - r.analyzedAt <= SIGNAL_FRESH_MS && r.candidates.length > 0).map(r => r.market)])];
+      ...[...results.values()].filter(r => safeCodes.has(r.market) && now - r.analyzedAt <= SIGNAL_FRESH_MS && (r.candidates.length > 0 || r.plans?.some(p => p.candidate.entryStatus === 'ready'))).map(r => r.market)])];
     const executions = await fetchExecutionQualities(executionCodes, ANALYSIS_NOTIONAL_KRW, Date.now());
     for (const { market, candles } of prepared) {
       const ticker = tickerMap.get(market.market);
@@ -164,9 +194,14 @@ export async function refreshDashboard(db: D1Database, options: { force?: boolea
         btcChangeRate: tickerMap.get('KRW-BTC')?.signedChangeRate ?? 0, feeRate: ASSUMED_FEE_RATE, trends };
       const result: MarketResult = { market: market.market, analyzedAt: now, engineVersion: 3, trends,
         complete: trendsReady(candles, trends),
-        candidates: [], legacy: [], observations: [] };
+        candidates: [], plans: [], legacy: [], observations: [] };
       for (const strategy of ['scalp', 'swing'] as const) {
-        const evaluation = strategy === 'scalp' ? evaluateScalp(input) : evaluateSwing(input);
+        const previousPlan = previous?.plans?.find(p => p.candidate.strategy === strategy)
+          ?? (previous?.engineVersion === 3 && previous.candidates.find(c => c.strategy === strategy)
+            ? createSavedPlan(previous.candidates.find(c => c.strategy === strategy)!) : undefined);
+        let saved = previousPlan ? advanceSavedPlan(previousPlan, candles['15'], ticker.tradePrice, now) : undefined;
+        const fixed = saved && saved.stoppedAt === undefined ? saved.candidate.plan : undefined;
+        const evaluation = strategy === 'scalp' ? evaluateScalp(input, fixed) : evaluateSwing(input, fixed);
         const activity = activityRatio(candles['60'], ticker.quoteVolume24h);
         if (evaluation.accepted && activity !== null) {
           evaluation.candidate.metrics.activityRatio = activity;
@@ -174,12 +209,20 @@ export async function refreshDashboard(db: D1Database, options: { force?: boolea
           evaluation.candidate.reasons.push(`24시간 거래대금 / 이전 3일 일평균 ${activity.toFixed(2)}배`);
         }
         const threshold = strategy === 'scalp' ? 70 : 72;
-        if (evaluation.accepted && evaluation.candidate.score >= threshold && ticker.quoteVolume24h >= ENTRY_VOLUME[strategy]) {
-          const candidate = retainPricePlan(evaluation.candidate, previous?.engineVersion === 3 ? previous.candidates : [], ticker.tradePrice, now);
-          candidate.plan = costedPlan(candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct);
-          if ((candidate.plan.netReturns?.[0] ?? -1) > 0) result.candidates.push(candidate);
-          else result.observations.push(makeObservation(input, strategy, { accepted: false, category: 'technicalConditions', code: 'NO_RESISTANCE_ROOM' }, now));
-        } else result.observations.push(makeObservation(input, strategy, evaluation, now));
+        const qualified = evaluation.accepted && evaluation.candidate.score >= threshold && ticker.quoteVolume24h >= ENTRY_VOLUME[strategy];
+        const observation = makeObservation(input, strategy, evaluation, now);
+        if (qualified && canReplacePlan(saved, evaluation.candidate)) saved = advanceSavedPlan(createSavedPlan(evaluation.candidate), [], ticker.tradePrice, now);
+        if (saved) {
+          saved = describeSavedPlan(saved, qualified ? evaluation.candidate : undefined, observation.reason, now, SIGNAL_FRESH_MS);
+          const candidate = { ...saved.candidate, currentPrice: ticker.tradePrice, charts: chartSet(input),
+            plan: costedPlan(saved.candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct) };
+          if (candidate.entryStatus === 'ready' && (candidate.plan.netReturns?.[0] ?? -1) <= 0) {
+            candidate.entryStatus = 'waiting'; candidate.entryBlockReason = REASONS.NO_RESISTANCE_ROOM;
+          }
+          result.plans!.push({ ...saved, candidate });
+          if (candidate.entryStatus === 'ready' && entryStillValid(candidate, ticker.tradePrice, now)) result.candidates.push(candidate);
+          else result.observations.push({ ...observation, code: 'SAVED_PLAN_WAITING', reason: candidate.entryBlockReason ?? REASONS.CURRENT_PRICE_OUTSIDE_ENTRY });
+        } else result.observations.push(observation);
         if (ticker.quoteVolume24h >= ENTRY_VOLUME[strategy]) {
           const baseline = strategy === 'scalp' ? legacyScalp(input) : legacySwing(input);
           if (baseline.accepted && baseline.candidate.score >= threshold) result.legacy.push(baseline.candidate);

@@ -94,6 +94,7 @@ export function mergeLevels(levels: readonly Level[], tolerance: number): Zone[]
 }
 
 export function costedPlan(plan: PricePlan, feeRate: number, slippagePct: number): PricePlan {
+  if (!Number.isFinite(slippagePct)) return { ...plan, netReturns: undefined, netSplitReturn: null, netRewardRiskAtTarget2: 0 };
   // 청산 비용은 미래 호가 예측이 아니라 매수 시점과 동일 비율이라는 명시적 시나리오 가정이다.
   const cost = feeRate + slippagePct / 100;
   const entry = plan.entryAnchor * (1 + cost);

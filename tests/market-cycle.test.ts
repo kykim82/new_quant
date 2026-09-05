@@ -1,7 +1,8 @@
 // 전체시장 순환과 만료·경고 재검사 및 비용 검증을 회귀 검사한다
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { activityRatio, candleCost, emptyCandles, nextMarkets, retainPricePlan } from '../lib/market-cycle';
+import { activityRatio, candleCost, emptyCandles, nextMarkets } from '../lib/market-cycle';
+import { createSavedPlan, describeSavedPlan } from '../lib/plan-lifecycle';
 import { summarizeMarkets } from '../lib/scanner';
 import { withSpreadWarning } from '../lib/execution-warning';
 import type { Candidate, ExecutionQuality, MarketDefinition, MarketTicker } from '../lib/domain';
@@ -105,10 +106,21 @@ test('구 엔진 후보는 새 목표가 후보로 표시하지 않고 준비 �
   assert.equal(payload.watchlist?.[0].code, 'ENGINE_WARMUP');
 });
 
-test('같은 진입 계획이 유효하면 목표·손절·발행 시각을 고정하고 만료 이후만 새로 발행한다', () => {
+test('기존 만료 시각이 지나도 계획을 바꾸지 않고 재검증된 후보를 표시한다', () => {
   const next = { ...candidate, signalTime: now + 300_000, plan: { ...candidate.plan, targets: [110, 120, 130] } };
-  const frozen = retainPricePlan(next, [candidate], 100, now + 300_000);
-  assert.deepEqual(frozen.plan, candidate.plan);
-  assert.equal(frozen.signalTime, candidate.signalTime);
-  assert.deepEqual(retainPricePlan(next, [candidate], 100, now + 600_001), next);
+  const saved = describeSavedPlan(createSavedPlan(candidate), next, '', now + 600_001, 1_200_000);
+  assert.deepEqual(saved.candidate.plan, candidate.plan);
+  assert.equal(saved.candidate.signalTime, candidate.signalTime);
+  const payload = summarizeMarkets([{ ...result, plans: [saved], candidates: [saved.candidate] }], [market], [ticker], 'NEUTRAL', now + 600_001, quality);
+  assert.equal(payload.scalp.length, 1);
+  assert.deepEqual(payload.scalp[0].plan.targets, candidate.plan.targets);
+  assert.equal(payload.savedPlans![0].entryStatus, 'ready');
+});
+
+test('추세 대기와 지연에도 가격은 조회되며 추천 목록에서는 제외한다', () => {
+  const saved = describeSavedPlan(createSavedPlan(candidate), undefined, '추세 약화', now, 1_200_000);
+  const payload = summarizeMarkets([{ ...result, plans: [saved], candidates: [] }], [market], [ticker], 'NEUTRAL', now, quality);
+  assert.equal(payload.scalp.length, 0);
+  assert.equal(payload.savedPlans![0].entryBlockReason, '추세 약화');
+  assert.deepEqual(payload.savedPlans![0].plan.targets, candidate.plan.targets);
 });

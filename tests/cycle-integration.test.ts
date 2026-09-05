@@ -2,8 +2,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { acquireCycle, ensureCycleSchema, releaseCycle } from '../lib/cycle-store';
-import { refreshDashboard } from '../lib/scanner';
+import { acquireCycle, ensureCycleSchema, releaseCycle, writeStoredPlans, type MarketResult } from '../lib/cycle-store';
+import { getDashboard, refreshDashboard } from '../lib/scanner';
+import { createSavedPlan } from '../lib/plan-lifecycle';
+import type { Candidate } from '../lib/domain';
 
 function database() {
   const sqlite = new DatabaseSync(':memory:');
@@ -71,11 +73,32 @@ test('800봉 초기 수집도 전체 종목을 순회하고 각 실행은 45회 
       assert.ok(calls <= 45, `요청 수 ${calls}`);
       seen.push(payload.coverage.analyzedMarketCount);
       assert.equal(payload.coverage.eligibleMarketCount, 21);
+      if (cycle === 0) {
+        const row = await db.prepare('SELECT result_json FROM market_analysis WHERE market = ?').bind('KRW-BTC').first<{ result_json: string }>();
+        const result = JSON.parse(row!.result_json) as MarketResult;
+        const signalTime = (Math.floor(simulatedNow / 900_000) - 1) * 900_000;
+        const candidate: Candidate = { market: 'KRW-BTC', koreanName: '비트코인', englishName: 'Bitcoin', strategy: 'scalp', setup: 'breakout',
+          score: 80, rank: 0, currentPrice: 2000, signedChangeRate: 0, quoteVolume24h: 20e9, signalTime, reasons: [], warnings: [],
+          metrics: { rsi: 55, atrPct: 1, rvol: 2, spreadPct: 0.1, slippagePct: 0 }, charts: { '15': [], '60': [], '240': [] },
+          plan: { entryLow: 1990, entryAnchor: 2000, entryHigh: 2010, stop: 1900, targets: [2200, 2300, 2400], riskPct: 5,
+            netRewardRiskAtTarget2: 3, expiresAt: signalTime + 900_000, id: 'persisted-plan', version: 'confluence-v3', issuedAt: signalTime } };
+        result.plans = [createSavedPlan(candidate)];
+        await writeStoredPlans(db, result);
+      }
+      if (cycle > 0) {
+        const saved = payload.savedPlans!.find(c => c.market === 'KRW-BTC')!;
+        assert.equal(saved.plan.id, 'persisted-plan');
+        assert.deepEqual(saved.plan.targets, [2200, 2300, 2400]);
+        assert.equal(saved.entryStatus, 'waiting');
+      }
       simulatedNow += 60_000;
     }
     assert.ok(seen[1] > seen[0]); assert.equal(seen.at(-1), 21);
     const stored = await db.prepare('SELECT market FROM market_analysis').all<{ market: string }>();
     assert.ok(stored.results.some(row => row.market === 'KRW-X19'));
     assert.ok(!stored.results.some(row => row.market === 'KRW-WARN'));
+    const stale = await getDashboard(db, simulatedNow + 1_800_000);
+    assert.equal(stale!.stale, true); assert.equal(stale!.scalp.length, 0);
+    assert.equal(stale!.savedPlans!.find(c => c.market === 'KRW-BTC')!.plan.id, 'persisted-plan');
   } finally { globalThis.fetch = originalFetch; close(); }
 });

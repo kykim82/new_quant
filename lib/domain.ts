@@ -89,6 +89,9 @@ export interface PricePlan {
 }
 
 export interface Candidate {
+  entryStatus?: 'ready' | 'waiting' | 'stopped';
+  entryBlockReason?: string;
+  entryValidUntil?: number;
   market: string;
   koreanName: string;
   englishName: string;
@@ -117,6 +120,14 @@ export interface Candidate {
   charts: Record<'15' | '60' | '240', ChartPoint[]>;
 }
 
+export interface SavedPlan {
+  candidate: Candidate;
+  checkedThrough: number;
+  stoppedAt?: number;
+  targetReachedAt?: number;
+  hasGap?: boolean;
+}
+
 export interface RejectionSummary {
   lowLiquidity: number;
   marketWarning: number;
@@ -126,6 +137,7 @@ export interface RejectionSummary {
 }
 
 export interface DashboardPayload {
+  savedPlans?: Candidate[];
   schemaVersion?: number;
   priceUpdatedAt?: number;
   watchlist?: Observation[];

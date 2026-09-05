@@ -136,7 +136,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
     <div>
       <div className="flex items-start justify-between gap-4">
         <div>
-          <span className="eyebrow">{candidate.strategy === 'scalp' ? '15분 단타' : '1~4시간 스윙'} · {candidate.rank}위</span>
+          <span className="eyebrow">{candidate.strategy === 'scalp' ? '15분 단타' : '1~4시간 스윙'} · {candidate.rank > 0 ? `${candidate.rank}위` : '저장 계획'}</span>
           <h2 className="mt-2 text-xl font-bold">{candidate.koreanName} <span className="font-mono text-sm text-muted-foreground">{candidate.market}</span></h2>
           <p className="mt-1 font-mono text-lg font-semibold">{formatPrice(candidate.currentPrice)}</p>
         </div>
@@ -163,7 +163,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <div className="detail-stat"><Clock3 /><span>신호 유효</span><strong>{remainingText(candidate.plan.expiresAt, now)}</strong></div>
+        <div className="detail-stat"><Clock3 /><span>신규 진입 상태</span><strong>{candidate.entryStatus === 'stopped' ? '계획 종료' : candidate.entryStatus === 'waiting' ? '대기' : remainingText(candidate.entryValidUntil ?? candidate.plan.expiresAt, now)}</strong></div>
         <div className="detail-stat"><ShieldCheck /><span>분할 순수익 여력</span><strong>{candidate.plan.netSplitReturn == null ? '산정 대기' : `${candidate.plan.netSplitReturn.toFixed(2)}%`}</strong></div>
         <div className="detail-stat"><Gauge /><span>RSI</span><strong>{candidate.metrics.rsi.toFixed(1)}</strong></div>
         <div className="detail-stat"><Signal /><span>거래대금</span><strong>{candidate.metrics.rvol.toFixed(2)}배</strong></div>
@@ -175,7 +175,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
           <ul>{candidate.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
         </div>
         <div className="evidence-box">
-          <h3><Activity />지표 값</h3>
+          <h3><Activity />최근 조건 통과 지표</h3>
           <dl>
             <div><dt>ATR 변동성</dt><dd>{candidate.metrics.atrPct.toFixed(2)}%</dd></div>
             <div><dt>호가 스프레드 · 참고용</dt><dd>{candidate.metrics.spreadPct.toFixed(3)}%</dd></div>
@@ -198,9 +198,11 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
             </div>;
           })}
           <p className="text-xs text-muted-foreground">도달 확률을 반영한 기대수익이 아닙니다. 분할 수익은 각 목표에서 1/3씩 모두 매도했을 때입니다. 미래 매도 비용은 현재 매수 슬리피지와 같은 비율로 가정하며 실제 체결 비용과 다를 수 있습니다.</p>
-          <p className="text-xs text-muted-foreground">계획 발행 {formatKst(candidate.plan.issuedAt ?? candidate.signalTime)} KST · 가격 고정 · 2차 손익비 {candidate.plan.targets.length > 1 ? `${candidate.plan.netRewardRiskAtTarget2.toFixed(2)}R (참고용)` : '산정 대기'}</p>
+          <p className="text-xs text-muted-foreground">계획 발행 {formatKst(candidate.plan.issuedAt ?? candidate.signalTime)} KST · 가격 고정 · 2차 손익비 {candidate.plan.netReturns && candidate.plan.targets.length > 1 ? `${candidate.plan.netRewardRiskAtTarget2.toFixed(2)}R (참고용)` : '산정 대기'}</p>
+          <p className="text-xs text-muted-foreground">시간 경과나 신규 진입 대기로 매수가·손절가·목표가를 변경하지 않습니다. 실제 매수·보유 여부는 자동 확인하지 않습니다.</p>
         </section>
       )}
+      {candidate.entryBlockReason && <p className="mt-4 rounded-lg border border-warning/30 p-3 text-sm text-warning">{candidate.entryBlockReason}. 기존 가격을 보존한 기록이며 현재 매수 추천은 아닙니다.</p>}
       {candidate.warnings.length > 0 && (
         <Alert className="mt-4 border-warning/30 bg-warning/8 text-warning-foreground">
           <AlertTriangle /><AlertTitle>주의할 점</AlertTitle><AlertDescription>{candidate.warnings.join(' · ')}</AlertDescription>
@@ -330,9 +332,11 @@ export function Dashboard() {
   }, []);
 
   const activeCandidates = useMemo(() => data?.[activeStrategy] ?? [], [activeStrategy, data]);
+  const savedCandidates = useMemo(() => (data?.savedPlans ?? []).filter(c => c.strategy === activeStrategy).map(c => data?.stale && c.entryStatus !== 'stopped'
+    ? { ...c, entryStatus: 'waiting' as const, entryBlockReason: '데이터 지연 · 신규 진입 대기' } : c), [activeStrategy, data]);
   const selectedCandidate = useMemo(
-    () => activeCandidates.find((candidate) => candidate.market === selectedMarket) ?? activeCandidates[0] ?? null,
-    [activeCandidates, selectedMarket],
+    () => activeCandidates.find((candidate) => candidate.market === selectedMarket) ?? savedCandidates.find(c => c.market === selectedMarket) ?? activeCandidates[0] ?? savedCandidates[0] ?? null,
+    [activeCandidates, savedCandidates, selectedMarket],
   );
   const regime = data ? regimeLabel(data) : null;
   const degraded = state === 'error' || Boolean(data?.stale);
@@ -381,7 +385,7 @@ export function Dashboard() {
           </div>
         </section>
 
-        {data?.schemaVersion === 3 && (
+        {(data?.schemaVersion ?? 0) >= 3 && data && (
           <section className="mt-4 rounded-xl border border-border bg-card/55 p-4 text-sm" aria-label="전체시장 분석 진행률">
             <div className="flex flex-wrap justify-between gap-2">
               <span>전체 {data.coverage.krwMarketCount}개 · 주의·경고 제외 {data.rejections.marketWarning}개</span>
@@ -421,6 +425,19 @@ export function Dashboard() {
                 {data?.[strategy].map((candidate) => (
                   <CandidateCard candidate={candidate} key={candidate.market} onSelect={() => chooseCandidate(candidate)} selected={selectedCandidate?.market === candidate.market} />
                 ))}
+                {strategy === activeStrategy && savedCandidates.length > 0 && (
+                  <details className="rounded-xl border border-border bg-card/60 p-4" open>
+                    <summary className="cursor-pointer font-semibold">저장 가격 계획 {savedCandidates.length}개</summary>
+                    <p className="mt-2 text-sm text-muted-foreground">가격은 고정하고 신규 진입 상태만 재검사합니다. 대기·종료 기록은 매수 추천이 아닙니다.</p>
+                    <div className="mt-3 space-y-2">{savedCandidates.map(candidate => (
+                      <Button className="h-auto w-full justify-start whitespace-normal p-3 text-left" variant="outline" key={candidate.market} onClick={() => chooseCandidate(candidate)}>
+                        <span className="block"><span className="font-semibold">{candidate.koreanName} · {candidate.entryStatus === 'stopped' ? '계획 종료' : candidate.entryStatus === 'ready' ? '진입 조건 충족' : '신규 진입 대기'}</span>
+                          <span className="mt-1 block text-sm">고정 매수 {formatPrice(candidate.plan.entryAnchor)} · 손절 {formatPrice(candidate.plan.stop)}</span>
+                          <span className="mt-1 block text-xs text-muted-foreground">{candidate.entryBlockReason ?? '차트와 고정 목표가 보기'}</span></span>
+                      </Button>
+                    ))}</div>
+                  </details>
+                )}
               </TabsContent>
             ))}
           </Tabs>
@@ -462,7 +479,7 @@ export function Dashboard() {
             <div className="mt-3 flex flex-wrap gap-2">{Object.entries(data.diagnostics).sort((a, b) => b[1] - a[1]).map(([code, count]) => <span className="reason-chip" key={code}>{REASONS[code] ?? code} · {count}</span>)}</div>
             {data.comparison && <p className="mt-4">기존 기준 {data.comparison.legacy}개 / 개선 기준 {data.comparison.improved}개. {data.comparison.note}</p>}
             <p className="mt-3 text-xs text-muted-foreground">모의 성과는 버전별로 분리합니다. 산정된 목표에서 각각 1/3씩 청산하고, 목표가 없는 잔량은 손절 또는 보유기한에 청산합니다. 동일 봉 진입·청산이나 목표·손절 동시 도달은 불명확으로 분리하며 종료 평균에서 제외되어 편향될 수 있습니다. 과거 전체 기간 백테스트나 실제 체결 성과가 아닙니다.</p>
-            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'confluence-v3' ? '구조 목표 v3' : stat.variant === 'pre-confluence-v2' ? '이전 R목표 비교군' : `이전 기록 (${stat.variant})`} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
+            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'fixed-plan-v4' ? '고정 계획 v4' : stat.variant === 'confluence-v3' ? '구조 목표 v3' : stat.variant === 'pre-confluence-v2' ? '이전 R목표 비교군' : `이전 기록 (${stat.variant})`} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
           </details>
         )}
 

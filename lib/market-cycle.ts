@@ -24,6 +24,7 @@ export const REASONS: Record<string, string> = {
   ZERO_ATR: '가격 변동 데이터 부족', DATA_DELAYED: '분석 지연 · 재분석 대기',
   NO_RESISTANCE_ROOM: '가까운 목표 근거 부족 또는 비용 후 상승 여력 부족',
   ENGINE_WARMUP: '새 지표 이력 준비 · 순차 재분석 대기',
+  SAVED_PLAN_WAITING: '가격 계획 보존 · 신규 진입 대기',
 };
 
 export function nextMarkets(markets: MarketDefinition[], tickers: MarketTicker[], checked: Map<string, number>): MarketDefinition[] {
@@ -55,13 +56,8 @@ export function activityRatio(candles: Candle[], current24h: number): number | n
 
 export function entryStillValid(candidate: Candidate, price: number, now: number): boolean {
   const tolerance = (candidate.plan.entryHigh - candidate.plan.entryLow) * 0.625;
-  return candidate.plan.expiresAt > now && price > candidate.plan.stop && price < candidate.plan.targets[0]
+  return (candidate.entryValidUntil ?? candidate.plan.expiresAt) > now && (!candidate.entryStatus || candidate.entryStatus === 'ready') && price > candidate.plan.stop && price < candidate.plan.targets[0]
     && price >= candidate.plan.entryLow - tolerance && price <= candidate.plan.entryHigh + tolerance;
-}
-
-export function retainPricePlan(candidate: Candidate, previous: readonly Candidate[], price: number, now: number): Candidate {
-  const frozen = previous.find(c => c.market === candidate.market && c.strategy === candidate.strategy && c.setup === candidate.setup && entryStillValid(c, price, now));
-  return frozen ? { ...candidate, signalTime: frozen.signalTime, plan: frozen.plan } : candidate;
 }
 
 export function makeObservation(input: StrategyInput, strategy: Strategy, result: StrategyEvaluation, now: number): Observation {

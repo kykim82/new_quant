@@ -1,9 +1,10 @@
 // D1에 전체시장 순회 캐시와 작업 잠금을 영속 저장한다
-import type { Candidate, Observation } from './domain';
+import type { Candidate, Observation, SavedPlan } from './domain';
 import type { CandleCache } from './market-cycle';
 import type { TrendState } from './trend-state';
 
 export interface MarketResult {
+  plans?: SavedPlan[];
   market: string;
   analyzedAt: number;
   complete: boolean;
@@ -12,6 +13,11 @@ export interface MarketResult {
   observations: Observation[];
   engineVersion?: 3;
   trends?: Record<'15' | '60' | '240', TrendState>;
+}
+
+export async function writeStoredPlans(db: D1Database, result: MarketResult): Promise<void> {
+  // 가격 관측만으로 기술 분석 시각을 최신으로 위장하지 않는다.
+  await db.prepare('UPDATE market_analysis SET result_json = ? WHERE market = ?').bind(JSON.stringify(result), result.market).run();
 }
 export interface MarketRow { market: string; checked_at: number; result_json: string }
 

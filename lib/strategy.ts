@@ -6,6 +6,7 @@ import type {
   MarketDefinition,
   MarketRegime,
   MarketTicker,
+  PricePlan,
   Strategy,
 } from '@/lib/domain';
 import {
@@ -71,7 +72,7 @@ function hasRecentSynthetic(candles: readonly Candle[], count: number): boolean 
   return candles.slice(-count).some((candle) => candle.synthetic);
 }
 
-function chartSet(input: StrategyInput): Candidate['charts'] {
+export function chartSet(input: StrategyInput): Candidate['charts'] {
   const charts = {
     '15': buildChartPoints(input.candles['15']),
     '60': buildChartPoints(input.candles['60']),
@@ -85,7 +86,7 @@ function chartSet(input: StrategyInput): Candidate['charts'] {
   return charts;
 }
 
-export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
+export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): StrategyEvaluation {
   const trends = trendSet(input);
   if (!trendsReady(input.candles, trends)) return reject('insufficientData', 'ENGINE_WARMUP');
   if (trends['60'].stDirection !== 1) return reject('technicalConditions', 'TREND_MISMATCH');
@@ -137,7 +138,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   if (!pivot) return reject('technicalConditions', 'NO_CONFIRMED_SWING_LOW');
   const anchor = isBreakout ? breakout! : ema20_15!;
   const rawStop = isBreakout ? Math.min(pivot.price, breakout! - atr14! * 0.7) : pivot.price - atr14! * 0.2;
-  const plan = buildConfluencePlan({
+  const plan = fixedPlan ?? buildConfluencePlan({
     entryLow: anchor,
     entryAnchor: anchor + atr14! * 0.1,
     entryHigh: anchor + atr14! * 0.3,
@@ -198,7 +199,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   };
 }
 
-export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
+export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): StrategyEvaluation {
   const trends = trendSet(input);
   if (!trendsReady(input.candles, trends)) return reject('insufficientData', 'ENGINE_WARMUP');
   if (trends['240'].stDirection !== 1) return reject('technicalConditions', 'TREND_MISMATCH');
@@ -269,7 +270,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
   const entryLowRaw = isBreakout ? breakout! - atr60! * 0.2 : pullbackLow;
   const entryHighRaw = isBreakout ? breakout! + atr60! * 0.2 : pullbackHigh;
   const entryAnchorRaw = isBreakout ? breakout! : (pullbackLow + pullbackHigh) / 2;
-  const plan = buildConfluencePlan({
+  const plan = fixedPlan ?? buildConfluencePlan({
     entryLow: entryLowRaw,
     entryAnchor: entryAnchorRaw,
     entryHigh: entryHighRaw,
