@@ -98,7 +98,7 @@ function CandidateCard({
             <span className="font-mono text-xs text-muted-foreground">{candidate.market}</span>
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-sm">
-            <Badge className="bg-signal/15 text-signal" variant="outline">{candidate.setup === 'breakout' ? '돌파형' : '눌림목형'}</Badge>
+            <Badge className="bg-signal/15 text-signal" variant="outline">{candidate.setup === 'reversal' ? '초기 전환형' : candidate.setup === 'breakout' ? '돌파형' : '눌림목형'}</Badge>
             <span className={isUp ? 'text-rise' : 'text-fall'}>
               {isUp ? <ArrowUpRight className="inline size-4" /> : <ArrowDownRight className="inline size-4" />}
               {isUp ? '+' : ''}{(candidate.signedChangeRate * 100).toFixed(2)}%
@@ -114,12 +114,13 @@ function CandidateCard({
         <div className="price-grid">
           <div className="col-span-2"><span>매수 구간</span><strong>{formatPrice(candidate.plan.entryLow)} ~ {formatPrice(candidate.plan.entryHigh)}</strong></div>
           <div><span>대표가 기준 손절 · {candidate.plan.riskPct.toFixed(2)}%</span><strong className="text-fall">{formatPrice(candidate.plan.stop)}</strong></div>
-          <div><span>1차 수익 여력 · 비용 전 {candidate.plan.grossReturns?.[0]?.toFixed(2) ?? '—'}%</span><strong className="text-rise">{formatPrice(candidate.plan.targets[0])}</strong></div>
+          {candidate.plan.targets.map((target, index) => <div key={index}><span>{index + 1}차 목표 · 매수가 대비 +{((target / candidate.plan.entryAnchor - 1) * 100).toFixed(2)}%</span><strong className="text-rise">{formatPrice(target)}</strong></div>)}
         </div>
+        <p className="text-sm text-muted-foreground">현재가 {formatPrice(candidate.currentPrice)} · 고정 매수가와 {((candidate.currentPrice / candidate.plan.entryAnchor - 1) * 100).toFixed(2)}% 차이 · 현재가→1차 목표 {((candidate.plan.targets[0] / candidate.currentPrice - 1) * 100).toFixed(2)}% 남음 (비용 전).</p>
         <div className="flex flex-wrap gap-2">
           {candidate.reasons.slice(0, 3).map((reason) => <span className="reason-chip" key={reason}>{reason}</span>)}
         </div>
-        {candidate.warnings.filter(warning => warning.startsWith('호가 스프레드 ')).map(warning => (
+        {candidate.warnings.map(warning => (
           <p className="text-sm text-warning" key={warning}><AlertTriangle className="mr-1 inline size-4" />{warning}</p>
         ))}
         <Button className="h-11 w-full justify-between" onClick={onSelect} variant="outline">
@@ -156,11 +157,13 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
 
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
         <div className="level-stat entry"><span>대표 매수가</span><strong>{formatPrice(candidate.plan.entryAnchor)}</strong></div>
-        <div className="level-stat stop"><span>손절가</span><strong>{formatPrice(candidate.plan.stop)}</strong></div>
+        <div className="level-stat stop"><span>손절가 · 대표가 대비 -{candidate.plan.riskPct.toFixed(2)}%</span><strong>{formatPrice(candidate.plan.stop)}</strong></div>
         {[0, 1, 2].map((index) => (
           <div className="level-stat target" key={index}><span>{index + 1}차 매도가</span><strong>{candidate.plan.targets[index] === undefined ? '산정 대기' : formatPrice(candidate.plan.targets[index])}</strong></div>
         ))}
       </div>
+
+      <p className="mt-3 text-sm text-muted-foreground">현재가 기준 손절까지 {((candidate.plan.stop / candidate.currentPrice - 1) * 100).toFixed(2)}% · {candidate.plan.targets.map((target, i) => `${i + 1}차까지 ${((target / candidate.currentPrice - 1) * 100).toFixed(2)}%`).join(' · ')} (비용 전). 기존 고정 매수가를 현재가로 변경한 값이 아닙니다.</p>
 
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <div className="detail-stat"><Clock3 /><span>신규 진입 상태</span><strong>{candidate.entryStatus === 'stopped' ? '계획 종료' : candidate.entryStatus === 'waiting' ? '대기' : remainingText(candidate.entryValidUntil ?? candidate.plan.expiresAt, now)}</strong></div>
@@ -182,6 +185,8 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
             <div><dt>예상 슬리피지</dt><dd>{candidate.metrics.slippagePct.toFixed(3)}%</dd></div>
             {candidate.metrics.adx !== undefined && <div><dt>ADX</dt><dd>{candidate.metrics.adx.toFixed(1)}</dd></div>}
             {candidate.metrics.activityRatio !== undefined && <div><dt>평소 대비 24h 거래대금</dt><dd>{candidate.metrics.activityRatio.toFixed(2)}배</dd></div>}
+            {candidate.metrics.averageTurnover3d !== undefined && <div><dt>이전 3일 일평균 거래대금</dt><dd>{formatCompactKrw(candidate.metrics.averageTurnover3d)}</dd></div>}
+            {candidate.metrics.hourlyTurnoverRatio !== undefined && <div><dt>최근 1h / 이전 20h 시간평균</dt><dd>{candidate.metrics.hourlyTurnoverRatio.toFixed(2)}배</dd></div>}
           </dl>
         </div>
       </div>
@@ -380,7 +385,7 @@ export function Dashboard() {
           </div>
           <div className="market-metrics">
             <div><span>BTC 시장</span><strong className={regime?.className}>{regime?.label ?? '확인 중'}</strong></div>
-            <div><span>주의·경고 제외 순회</span><strong>{data ? `${data.coverage.analyzedMarketCount}/${data.coverage.eligibleMarketCount}종목` : '—'}</strong></div>
+            <div><span>거래대금 선별 대상 분석</span><strong>{data ? `${data.coverage.analyzedMarketCount}/${data.coverage.eligibleMarketCount}종목` : '—'}</strong></div>
             <div><span>마지막 분석</span><strong>{data ? `${formatKst(data.generatedAt)} KST` : '—'}</strong></div>
           </div>
         </section>
@@ -388,11 +393,11 @@ export function Dashboard() {
         {(data?.schemaVersion ?? 0) >= 3 && data && (
           <section className="mt-4 rounded-xl border border-border bg-card/55 p-4 text-sm" aria-label="전체시장 분석 진행률">
             <div className="flex flex-wrap justify-between gap-2">
-              <span>전체 {data.coverage.krwMarketCount}개 · 주의·경고 제외 {data.rejections.marketWarning}개</span>
-              <span>미분석 {data.coverage.pendingMarketCount}개 · 분석 지연 {data.coverage.delayedMarketCount}개 · 이력 충족 {data.coverage.completedMarketCount}개</span>
+              <span>전체 시세 {data.coverage.krwMarketCount}개 · 주의·경고 제외 {data.rejections.marketWarning}개 · 기본 감시 {data.coverage.monitoringMarketCount ?? 0}개</span>
+              <span>상세 대상 {data.coverage.eligibleMarketCount}개 (거래대금 증가 예외 {data.coverage.volumeGrowthMarketCount ?? 0}개) · 미분석 {data.coverage.pendingMarketCount}개 · 지연 {data.coverage.delayedMarketCount}개</span>
             </div>
             <progress className="mt-3 h-2 w-full accent-lime-400" max={data.coverage.eligibleMarketCount || 1} value={data.coverage.analyzedMarketCount} aria-label="전체 종목 최초 분석 진행률" />
-            <p className="mt-2 text-xs text-muted-foreground">매분 다음 묶음을 분석합니다. 원본 TT용 800봉 이력을 순차 확보하므로 최초 전체 준비는 1시간 이상 걸릴 수 있습니다. 분석 후 20분이 지난 종목은 진입 후보에서 제외합니다. 현재가 갱신 {formatKst(data.priceUpdatedAt ?? data.generatedAt)} KST.</p>
+            <p className="mt-2 text-sm text-muted-foreground">24h 10억 이상 또는 거래대금 증가 종목을 우선 분석합니다. 기본 감시 종목은 1시간 거래대금만 순차 확인하고, 상승 구조를 통과한 종목에서 진입 봉을 분석합니다. TT 준비 여부와 별개로 가격 구조를 평가합니다. 20분 이상 지연된 결과는 추천에서 제외합니다. 현재가 갱신 {formatKst(data.priceUpdatedAt ?? data.generatedAt)} KST.</p>
           </section>
         )}
 
@@ -418,7 +423,7 @@ export function Dashboard() {
                     <EmptyHeader>
                       <EmptyMedia className="size-11 rounded-xl text-muted-foreground" variant="icon"><Signal /></EmptyMedia>
                       <EmptyTitle className="text-base">현재 {strategy === 'scalp' ? '단타' : '스윙'} 매수 후보가 없습니다</EmptyTitle>
-                      <EmptyDescription>아래 관찰·대기 목록에서 종목별 미충족 조건을 확인할 수 있습니다. 미분석 종목은 순차적으로 추가됩니다.</EmptyDescription>
+                      <EmptyDescription>거래대금으로 선별된 종목 중 현재 진입 조건을 확인하고 있습니다. 상승 구조가 살아 있는 눌림 대기와 전환 관찰 종목은 아래에서 확인할 수 있습니다.</EmptyDescription>
                     </EmptyHeader>
                   </Empty>
                 )}
@@ -460,7 +465,7 @@ export function Dashboard() {
               <div className="grid gap-2 rounded-lg border border-border/60 p-3 sm:grid-cols-[1fr_1fr_2fr]" key={`${row.market}:${row.strategy}`}>
                 <div><strong className="text-sm">{row.koreanName}</strong><span className="ml-2 text-xs text-muted-foreground">{row.market}</span></div>
                 <div className="text-sm">{formatPrice(row.currentPrice)}<span className="ml-2 text-xs text-muted-foreground">24h {formatCompactKrw(row.quoteVolume24h)}</span></div>
-                <div><p className="text-sm text-warning">{row.reason}</p><p className="mt-1 text-xs text-muted-foreground">분석 {formatKst(row.analyzedAt)} KST</p></div>
+                <div><p className="text-sm text-warning">{row.code === 'NO_ENTRY_SETUP' ? '눌림·진입 대기 · ' : row.code === 'UPPER_TREND_WAIT' ? '전환 관찰 · ' : ''}{row.reason}</p><p className="mt-1 text-xs text-muted-foreground">{row.analyzedAt > 0 ? `분석 ${formatKst(row.analyzedAt)} KST` : '거래대금 선별 완료 · 상세 분석 대기'}</p></div>
               </div>
             ))}
             {watchRows.length === 0 && <p className="py-4 text-sm text-muted-foreground">아직 표시할 관찰 결과가 없습니다. 분석 진행률을 확인해 주세요.</p>}
@@ -479,7 +484,7 @@ export function Dashboard() {
             <div className="mt-3 flex flex-wrap gap-2">{Object.entries(data.diagnostics).sort((a, b) => b[1] - a[1]).map(([code, count]) => <span className="reason-chip" key={code}>{REASONS[code] ?? code} · {count}</span>)}</div>
             {data.comparison && <p className="mt-4">기존 기준 {data.comparison.legacy}개 / 개선 기준 {data.comparison.improved}개. {data.comparison.note}</p>}
             <p className="mt-3 text-xs text-muted-foreground">모의 성과는 버전별로 분리합니다. 산정된 목표에서 각각 1/3씩 청산하고, 목표가 없는 잔량은 손절 또는 보유기한에 청산합니다. 동일 봉 진입·청산이나 목표·손절 동시 도달은 불명확으로 분리하며 종료 평균에서 제외되어 편향될 수 있습니다. 과거 전체 기간 백테스트나 실제 체결 성과가 아닙니다.</p>
-            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'fixed-plan-v4' ? '고정 계획 v4' : stat.variant === 'confluence-v3' ? '구조 목표 v3' : stat.variant === 'pre-confluence-v2' ? '이전 R목표 비교군' : `이전 기록 (${stat.variant})`} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
+            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'opportunity-v5' ? '거래대금·전환 기회 v5' : stat.variant === 'fixed-plan-v4' ? '고정 계획 v4' : stat.variant === 'confluence-v3' ? '구조 목표 v3' : stat.variant === 'pre-confluence-v2' ? '이전 R목표 비교군' : `이전 기록 (${stat.variant})`} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
           </details>
         )}
 

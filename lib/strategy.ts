@@ -24,8 +24,9 @@ import {
   trueRanges,
 } from '@/lib/indicators';
 import { withSpreadWarning } from '@/lib/execution-warning';
-import { advanceTrends, trendsReady, type TrendState } from '@/lib/trend-state';
+import { advanceTrends, type TrendState } from '@/lib/trend-state';
 import { buildConfluencePlan, resistanceLevels } from '@/lib/confluence-plan';
+import { dailyContext, upperStructure } from '@/lib/opportunity';
 
 export type RejectCategory =
   | 'technicalConditions'
@@ -54,6 +55,7 @@ export interface StrategyInput {
   btcChangeRate: number;
   feeRate: number;
   trends?: Record<'15' | '60' | '240', TrendState>;
+  liquidityQualified?: boolean;
 }
 
 function reject(category: RejectCategory, code: string): RejectedEvaluation {
@@ -88,8 +90,9 @@ export function chartSet(input: StrategyInput): Candidate['charts'] {
 
 export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): StrategyEvaluation {
   const trends = trendSet(input);
-  if (!trendsReady(input.candles, trends)) return reject('insufficientData', 'ENGINE_WARMUP');
-  if (trends['60'].stDirection !== 1) return reject('technicalConditions', 'TREND_MISMATCH');
+  const upper = upperStructure(input.candles, input.ticker.timestamp, trends);
+  if (!upper.ready) return reject('insufficientData', 'INSUFFICIENT_DATA');
+  if (!upper.alive) return reject('technicalConditions', 'UPPER_TREND_WAIT');
   const candles15 = input.candles['15'];
   const candles60 = input.candles['60'];
   if (candles15.length < 60 || candles60.length < 55) return reject('insufficientData', 'INSUFFICIENT_DATA');
@@ -117,27 +120,23 @@ export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): Stra
     return reject('insufficientData', 'INDICATOR_WARMUP');
   }
   if (atr14! <= 0 || previousAtr! <= 0) return reject('insufficientData', 'ZERO_ATR');
-  if (!(ema20_15! > ema50_15! && ema20_60! > ema50_60! && latest.close > ema20_15!)) {
-    return reject('technicalConditions', 'TREND_MISMATCH');
-  }
   const previous = candles15.at(-2)!;
   const isBreakout = latest.close > breakout! && relativeVolume! >= 1.2;
-  const isPullback = previous.low <= ema20_15! + atr14! * 0.25
-    && previous.close <= ema20_15! + atr14! * 0.25
+  const isPullback = candles15.slice(-5, -1).some(c => c.low <= ema20_15! + atr14! * 0.4)
     && latest.close > previous.high && latest.close > ema20_15!
-    && latest.close - ema20_15! <= atr14! * 0.75 && relativeVolume! >= 0.8;
-  if (!isBreakout && !isPullback) return reject('technicalConditions', latest.close > breakout! ? 'LOW_RVOL' : 'NO_ENTRY_SETUP');
-  if (rsi14! < 45 || rsi14! > 78) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
+    && latest.close - ema20_15! <= atr14! * 1.5 && relativeVolume! >= 0.8;
+  const isReversal = upper.early && latest.close > previous.high && latest.close > ema20_15! && relativeVolume! >= 1;
+  if (!fixedPlan && !isBreakout && !isPullback && !isReversal) return reject('technicalConditions', latest.close > breakout! ? 'LOW_RVOL' : 'NO_ENTRY_SETUP');
 
   const extensionAtr = (latest.close - breakout!) / atr14!;
   const currentRangeRatio = trueRanges(candles15).at(-1)! / previousAtr!;
-  if (isBreakout && extensionAtr > 0.75) return reject('technicalConditions', 'OVEREXTENDED');
-  if (currentRangeRatio > 3) return reject('technicalConditions', 'PUMP_CANDLE');
+  if (!fixedPlan && isBreakout && extensionAtr > 1.5) return reject('technicalConditions', 'OVEREXTENDED');
+  if (!fixedPlan && currentRangeRatio > 4) return reject('technicalConditions', 'PUMP_CANDLE');
 
   const pivot = lastConfirmedPivotLow(candles15.slice(-20));
-  if (!pivot) return reject('technicalConditions', 'NO_CONFIRMED_SWING_LOW');
+  if (!pivot && !fixedPlan) return reject('technicalConditions', 'NO_CONFIRMED_SWING_LOW');
   const anchor = isBreakout ? breakout! : ema20_15!;
-  const rawStop = isBreakout ? Math.min(pivot.price, breakout! - atr14! * 0.7) : pivot.price - atr14! * 0.2;
+  const rawStop = fixedPlan?.stop ?? (isBreakout ? Math.min(pivot!.price, breakout! - atr14! * 0.7) : pivot!.price - atr14! * 0.2);
   const plan = fixedPlan ?? buildConfluencePlan({
     entryLow: anchor,
     entryAnchor: anchor + atr14! * 0.1,
@@ -146,24 +145,26 @@ export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): Stra
     atr: atr14!, execution: input.execution,
     levels: resistanceLevels(input.candles, 'scalp', latest.closeTime, trends),
     market: input.market.market, strategy: 'scalp', signalTime: latest.closeTime,
-    entryReason: isBreakout ? '15분 고점 돌파 후 기준 구간 진입' : 'EMA20 눌림 회복 구간 진입',
+    entryReason: isReversal ? '1시간·4시간 초기 전환 후 15분 고가 회복' : isBreakout ? '15분 고점 돌파 후 기준 구간 진입' : 'EMA20 눌림 회복 구간 진입',
     stopReason: '확정된 15분 지지 저점과 ATR 완충 아래',
     expiresAt: latest.closeTime + 30 * 60_000,
     feeRate: input.feeRate,
   });
   if (!plan) return reject('technicalConditions', 'NO_RESISTANCE_ROOM');
-  if (plan.riskPct > 2 || plan.entryAnchor - plan.stop > atr14! * 1.5) return reject('technicalConditions', 'RISK_TOO_WIDE');
   if (input.ticker.tradePrice < plan.entryLow - atr14! * 0.25 || input.ticker.tradePrice > plan.entryHigh + atr14! * 0.25) {
     return reject('technicalConditions', 'CURRENT_PRICE_OUTSIDE_ENTRY');
   }
 
   const centeredRsi = clamp(1 - Math.abs(rsi14! - 60) / 20, 0, 1);
   const rvolStrength = clamp((relativeVolume! - 0.8) / 2.2, 0, 1);
-  const extensionQuality = isBreakout ? clamp(1 - extensionAtr / 0.75, 0, 1) : 0.8;
+  const extensionQuality = isBreakout ? clamp(1 - extensionAtr / 1.5, 0, 1) : 0.8;
   const slippageQuality = clamp(1 - input.execution.buySlippagePct / 0.15, 0, 1);
-  // 스프레드 10점을 제외한 90점 만점을 100점으로 환산한다.
+  const daily = dailyContext(input.candles['240'], input.ticker.timestamp);
+  // 방향·진입·거래대금·상승 여력을 평가한다. 손절폭과 R배수는 점수/탈락 조건이 아니다.
   const score = Math.round(
-    (30 + 10 + centeredRsi * 5 + extensionQuality * 10 + 10 + rvolStrength * 15 + slippageQuality * 10) * 100 / 90,
+    45 + upper.score * 0.1 + (ema20_15! > ema50_15! ? 3 : 0) + (ema20_60! > ema50_60! ? 2 : 0)
+    + centeredRsi * 5 + extensionQuality * 7 + rvolStrength * 10 + slippageQuality * 5
+    + clamp((plan.netSplitReturn ?? plan.netReturns?.[0] ?? 0) / 10, 0, 1) * 10 + (daily === 'up' ? 5 : 0),
   );
 
   return {
@@ -173,7 +174,7 @@ export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): Stra
       koreanName: input.market.koreanName,
       englishName: input.market.englishName,
       strategy: 'scalp',
-      setup: isBreakout ? 'breakout' : 'pullback',
+      setup: isReversal ? 'reversal' : isBreakout ? 'breakout' : 'pullback',
       score: clamp(score, 0, 100),
       rank: 0,
       currentPrice: input.ticker.tradePrice,
@@ -181,11 +182,16 @@ export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): Stra
       quoteVolume24h: input.ticker.quoteVolume24h,
       signalTime: latest.closeTime,
       reasons: [
-        '1시간 Supertrend 상승 · 1시간·15분 EMA 상승 배열',
+        upper.reason,
         `${isBreakout ? '20봉 고점 돌파' : 'EMA20 눌림 후 직전 봉 고가 회복'} · 거래대금 ${relativeVolume!.toFixed(1)}배`,
-        `RSI ${rsi14!.toFixed(1)} · 추격 제한 통과`,
+        `RSI ${rsi14!.toFixed(1)} · 일봉 ${daily === 'up' ? '상승 배경' : daily === 'down' ? '회복 확인 중' : '이력 준비'}`,
       ],
-      warnings: withSpreadWarning(plan.riskPct > 1.5 ? ['손절 폭이 다소 넓습니다'] : [], 'scalp', input.execution.spreadPct),
+      warnings: withSpreadWarning([
+        ...(plan.riskPct > 2 ? [`손절폭 ${plan.riskPct.toFixed(2)}% · 넓은 위험 구간, 투자 규모 직접 판단`] : []),
+        ...(rsi14! >= 78 ? ['RSI 과열 · 추격 주의'] : []),
+        ...(daily === 'down' ? ['일봉 추세 회복 전 · 상위 저항 주의'] : []),
+        ...(trends['15'].ttUpper === null ? ['Target Trend 이력 준비 중 · 가격 구조로 목표 산정'] : []),
+      ], 'scalp', input.execution.spreadPct),
       plan,
       metrics: {
         rsi: rsi14!,
@@ -201,11 +207,12 @@ export function evaluateScalp(input: StrategyInput, fixedPlan?: PricePlan): Stra
 
 export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): StrategyEvaluation {
   const trends = trendSet(input);
-  if (!trendsReady(input.candles, trends)) return reject('insufficientData', 'ENGINE_WARMUP');
-  if (trends['240'].stDirection !== 1) return reject('technicalConditions', 'TREND_MISMATCH');
+  const upper = upperStructure(input.candles, input.ticker.timestamp, trends);
+  if (!upper.ready) return reject('insufficientData', 'INSUFFICIENT_DATA');
+  if (!upper.alive) return reject('technicalConditions', 'UPPER_TREND_WAIT');
   const candles60 = input.candles['60'];
   const candles240 = input.candles['240'];
-  if (candles60.length < 60 || candles240.length < 220) return reject('insufficientData', 'INSUFFICIENT_DATA');
+  if (candles60.length < 60 || candles240.length < 60) return reject('insufficientData', 'INSUFFICIENT_DATA');
   if (hasRecentSynthetic(candles60, 36) || hasRecentSynthetic(candles240, 20)) return reject('insufficientData', 'MISSING_RECENT_CANDLES');
   if (input.marketRegime === 'RISK_OFF') return reject('technicalConditions', 'BTC_RISK_OFF');
   if (!input.execution.sufficientDepth || input.execution.buySlippagePct > 0.25) {
@@ -220,7 +227,6 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
   const ema20_240 = lastValue(ema20Series);
   const ema50_240 = lastValue(ema50Series);
   const ema200_240 = lastValue(ema200Series);
-  const ema50SlopeBase = ema50Series.at(-4) ?? null;
   const rsi240 = lastValue(rsi(close240, 14));
   const atr240 = lastValue(atr(candles240, 14));
   const atr60 = lastValue(atr(candles60, 14));
@@ -231,42 +237,30 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
   const latest240 = candles240.at(-1)!;
   const latest60 = candles60.at(-1)!;
 
-  if ([ema20_240, ema50_240, ema200_240, ema50SlopeBase, rsi240, atr240, atr60, adx240, plusDi, minusDi].some((value) => value === null)) {
+  if ([ema20_240, ema50_240, rsi240, atr240, atr60, adx240, plusDi, minusDi].some((value) => value === null)) {
     return reject('insufficientData', 'INDICATOR_WARMUP');
   }
   if (atr240! <= 0 || atr60! <= 0) return reject('insufficientData', 'ZERO_ATR');
-  if (!(ema20_240! > ema50_240! && latest240.close > ema50_240! && ema50_240! > ema50SlopeBase!)) {
-    return reject('technicalConditions', 'TREND_MISMATCH');
-  }
-  if (!(adx240! >= 15 && plusDi! > minusDi!)) return reject('technicalConditions', 'WEAK_TREND');
-  if (rsi240! < 45 || rsi240! >= 78) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
-  if (Math.abs(latest240.close - ema20_240!) / atr240! > 1.5) return reject('technicalConditions', 'OVEREXTENDED');
 
   const breakout = lastValue(donchianHigh(candles60, 20));
   const relativeVolume = lastValue(rvol(candles60, 20));
-  const rsi60Series = rsi(close60, 14);
-  const rsi60Now = lastValue(rsi60Series);
-  const rsi60Previous = rsi60Series.at(-2) ?? null;
   const pivot = lastConfirmedPivotLow(candles60.slice(-30));
-  if ([breakout, relativeVolume, rsi60Now, rsi60Previous].some((value) => value === null) || !pivot) {
+  if ([breakout, relativeVolume].some((value) => value === null) || (!pivot && !fixedPlan)) {
     return reject('insufficientData', 'ENTRY_DATA_MISSING');
   }
 
-  const isBreakout = latest60.close > breakout! && relativeVolume! >= 1.2 && (latest60.close - breakout!) / atr60! <= 0.75;
-  const supportLow = pivot.price - atr60! * 0.25;
-  const supportHigh = pivot.price + atr60! * 0.25;
-  const trendLow = Math.min(ema20_240!, ema50_240!);
-  const trendHigh = Math.max(ema20_240!, ema50_240!);
-  const pullbackLow = Math.max(supportLow, trendLow);
-  const pullbackHigh = Math.min(supportHigh, trendHigh);
-  const isPullback = pullbackLow < pullbackHigh
-    && latest60.close >= pullbackLow - atr60! * 0.25
-    && latest60.close <= pullbackHigh + atr60! * 0.25
-    && rsi60Previous! <= 50
-    && rsi60Now! > 50;
-  if (!isBreakout && !isPullback) return reject('technicalConditions', 'NO_ENTRY_SETUP');
+  const isBreakout = latest60.close > breakout! && relativeVolume! >= 1.2 && (latest60.close - breakout!) / atr60! <= 1.5;
+  const ema20_60 = lastValue(ema(close60, 20))!;
+  const previous60 = candles60.at(-2)!;
+  const pullbackLow = ema20_60 - atr60! * 0.2;
+  const pullbackHigh = ema20_60 + atr60! * 0.4;
+  const isPullback = candles60.slice(-5, -1).some(c => c.low <= pullbackHigh)
+    && latest60.close > previous60.high && latest60.close > ema20_60
+    && latest60.close - ema20_60 <= atr60! * 1.5 && relativeVolume! >= 0.8;
+  const isReversal = upper.early && latest60.close > previous60.high && relativeVolume! >= 1;
+  if (!fixedPlan && !isBreakout && !isPullback && !isReversal) return reject('technicalConditions', 'NO_ENTRY_SETUP');
 
-  const setup = isBreakout ? 'breakout' : 'pullback';
+  const setup = isReversal ? 'reversal' : isBreakout ? 'breakout' : 'pullback';
   const entryLowRaw = isBreakout ? breakout! - atr60! * 0.2 : pullbackLow;
   const entryHighRaw = isBreakout ? breakout! + atr60! * 0.2 : pullbackHigh;
   const entryAnchorRaw = isBreakout ? breakout! : (pullbackLow + pullbackHigh) / 2;
@@ -274,7 +268,7 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
     entryLow: entryLowRaw,
     entryAnchor: entryAnchorRaw,
     entryHigh: entryHighRaw,
-    rawStop: pivot.price - atr60! * 0.3,
+    rawStop: pivot!.price - atr60! * 0.3,
     atr: atr60!, execution: input.execution,
     levels: resistanceLevels(input.candles, 'swing', latest60.closeTime, trends),
     market: input.market.market, strategy: 'swing', signalTime: latest60.closeTime,
@@ -284,7 +278,6 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
     feeRate: input.feeRate,
   });
   if (!plan) return reject('technicalConditions', 'NO_RESISTANCE_ROOM');
-  if (plan.riskPct > 6 || plan.entryAnchor - plan.stop > atr60! * 2.5) return reject('technicalConditions', 'RISK_TOO_WIDE');
   if (input.ticker.tradePrice < plan.entryLow - atr60! * 0.25 || input.ticker.tradePrice > plan.entryHigh + atr60! * 0.25) {
     return reject('technicalConditions', 'CURRENT_PRICE_OUTSIDE_ENTRY');
   }
@@ -297,9 +290,12 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
   const flowQuality = clamp((flow + 0.1) / 0.3, 0, 1);
   const momentumQuality = momentum > 0 ? 1 : clamp(1 + momentum / 0.5, 0, 1);
   const relativeQuality = clamp((relativeStrength + 0.02) / 0.06, 0, 1);
-  // 스프레드와 손익비 점수를 제외한 90점을 100점으로 환산한다.
+  const daily = dailyContext(candles240, input.ticker.timestamp);
   const score = Math.round(
-    (20 + (ema50_240! > ema200_240! ? 10 : 0) + 10 + clamp((adx240! - 15) / 10, 0, 1) * 10 + volumeQuality * 10 + flowQuality * 5 + rsiQuality * 8 + momentumQuality * 7 + relativeQuality * 10) * 100 / 90,
+    45 + upper.score * 0.1 + (ema200_240 !== null && ema50_240! > ema200_240 ? 3 : 0)
+    + clamp((adx240! - 15) / 15, 0, 1) * 5 + volumeQuality * 10 + flowQuality * 4 + rsiQuality * 4
+    + momentumQuality * 4 + relativeQuality * 4 + (plusDi! > minusDi! ? 3 : 0)
+    + clamp((plan.netSplitReturn ?? plan.netReturns?.[0] ?? 0) / 15, 0, 1) * 10 + (daily === 'up' ? 5 : 0),
   );
 
   return {
@@ -317,11 +313,17 @@ export function evaluateSwing(input: StrategyInput, fixedPlan?: PricePlan): Stra
       quoteVolume24h: input.ticker.quoteVolume24h,
       signalTime: latest60.closeTime,
       reasons: [
-        `4시간 Supertrend 상승 · ADX ${adx240!.toFixed(1)}${ema50_240! > ema200_240! ? ' · 장기 정배열' : ' · 장기 추세 회복 대기'}`,
-        setup === 'breakout' ? `1시간 고점 돌파 · 거래대금 ${relativeVolume!.toFixed(1)}배` : '1시간 지지 구간 눌림 후 회복',
+        upper.reason,
+        setup === 'reversal' ? '확정 고점 회복 · 초기 전환형' : setup === 'breakout' ? `1시간 고점 돌파 · 거래대금 ${relativeVolume!.toFixed(1)}배` : '1시간 지지 구간 눌림 후 회복',
         `RSI ${rsi240!.toFixed(1)} · CMF ${flow.toFixed(2)}`,
       ],
-      warnings: withSpreadWarning(relativeStrength < 0 ? ['BTC보다 상대 강도가 낮습니다'] : [], 'swing', input.execution.spreadPct),
+      warnings: withSpreadWarning([
+        ...(relativeStrength < 0 ? ['BTC보다 상대 강도가 낮습니다'] : []),
+        ...(plan.riskPct > 6 ? [`손절폭 ${plan.riskPct.toFixed(2)}% · 넓은 위험 구간, 투자 규모 직접 판단`] : []),
+        ...(daily === 'down' ? ['일봉 추세 회복 전 · 상위 저항 주의'] : []),
+        ...(rsi240! >= 78 ? ['RSI 과열 · 추격 주의'] : []),
+        ...(trends['60'].ttUpper === null ? ['Target Trend 이력 준비 중 · 가격 구조로 목표 산정'] : []),
+      ], 'swing', input.execution.spreadPct),
       plan,
       metrics: {
         rsi: rsi240!,
@@ -348,7 +350,7 @@ export function rankCandidates(candidates: readonly Candidate[], strategy: Strat
 }
 
 export function deriveBtcRegime(candles60: readonly Candle[], candles240: readonly Candle[]): MarketRegime {
-  if (candles60.length < 55 || candles240.length < 205) return 'NEUTRAL';
+  if (candles60.length < 55 || candles240.length < 200) return 'NEUTRAL';
   const close60 = candles60.map((candle) => candle.close);
   const close240 = candles240.map((candle) => candle.close);
   const e20_60 = lastValue(ema(close60, 20));

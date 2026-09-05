@@ -161,7 +161,7 @@ test('확정 ABC 상승 파동은 C 기준 확장을 생성하고 C 저점 이�
 
 function strategyInput(): StrategyInput {
   const candles = {} as StrategyInput['candles'];
-  const end = 1_800_000_000_000;
+  const end = Math.floor(1_800_000_000_000 / 14_400_000) * 14_400_000;
   for (const unit of [15, 60, 240] as const) {
     let previous = 1280;
     const data = bars(801, unit).map((c, i) => {
@@ -202,13 +202,40 @@ for (const [name, evaluate] of [['단타', evaluateScalp], ['스윙', evaluateSw
   });
 }
 
-test('신규 전략은 상위 Supertrend 하락·준비 부족·합성 봉만으로 채운 이력을 구분한다', () => {
+test('상위 하락은 대기하되 TT 준비 부족만으로 가격 구조 분석을 차단하지 않는다', () => {
   const input = strategyInput();
   input.trends!['60'].stDirection = -1;
-  assert.deepEqual(evaluateScalp(input), { accepted: false, category: 'technicalConditions', code: 'TREND_MISMATCH' });
+  assert.deepEqual(evaluateScalp(input), { accepted: false, category: 'technicalConditions', code: 'UPPER_TREND_WAIT' });
+  input.trends!['60'].stDirection = 1;
   input.trends!['240'].ttUpper = null;
-  assert.deepEqual(evaluateSwing(input), { accepted: false, category: 'insufficientData', code: 'ENGINE_WARMUP' });
+  assert.equal(evaluateSwing(input).accepted, true);
   const synthetic = strategyInput();
   synthetic.candles['240'].slice(0, 450).forEach(c => { c.synthetic = true; });
   assert.equal(trendsReady(synthetic.candles, synthetic.trends!), false);
+});
+
+for (const [name, evaluate] of [['단타', evaluateScalp], ['스윙', evaluateSwing]] as const) {
+  test(`${name} 넓은 손절폭은 고정 목표나 점수를 바꾸지 않고 주의로 표시한다`, () => {
+    const input = strategyInput();
+    const first = evaluate(input);
+    assert.ok(first.accepted, first.accepted ? '' : first.code);
+    if (!first.accepted) return;
+    const base = first.candidate.plan;
+    const narrow = evaluate(input, { ...base, stop: base.entryAnchor * 0.99, riskPct: 1 });
+    const wide = evaluate(input, { ...base, stop: base.entryAnchor * 0.8, riskPct: 20 });
+    assert.ok(wide.accepted, wide.accepted ? '' : wide.code);
+    assert.ok(narrow.accepted);
+    if (!wide.accepted || !narrow.accepted) return;
+    assert.deepEqual(wide.candidate.plan.targets, base.targets);
+    assert.equal(wide.candidate.plan.stop, base.entryAnchor * 0.8);
+    assert.equal(wide.candidate.score, narrow.candidate.score);
+    assert.ok(wide.candidate.warnings.some(w => w.includes('손절폭 20.00%')));
+  });
+}
+
+test('15분 신호가 있어도 4시간 하락 구조에서는 추천하지 않는다', () => {
+  const input = strategyInput();
+  input.candles['240'] = input.candles['240'].map((c, i) => ({ ...c, open: 4000 - i, high: 4001 - i, low: 3998 - i, close: 3999 - i }));
+  input.trends!['240'] = advanceTrends(input.candles['240']);
+  assert.deepEqual(evaluateScalp(input), { accepted: false, category: 'technicalConditions', code: 'UPPER_TREND_WAIT' });
 });

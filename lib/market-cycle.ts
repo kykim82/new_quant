@@ -4,11 +4,12 @@ import { ema, lastValue, rsi } from './indicators';
 import type { StrategyEvaluation, StrategyInput } from './strategy';
 
 export type CandleCache = Record<'15' | '60' | '240', Candle[]>;
-export const ENTRY_VOLUME = { scalp: 1_000_000_000, swing: 500_000_000 };
+export const ENTRY_VOLUME = { scalp: 1_000_000_000, swing: 1_000_000_000 };
 export const SIGNAL_FRESH_MS = 20 * 60_000;
 export const HISTORY_BARS = 800;
 export const REASONS: Record<string, string> = {
-  LOW_LIQUIDITY: '거래대금 부족 · 단타 10억 / 스윙 5억 원 기준',
+  LOW_LIQUIDITY: '기본 시세 감시 · 24h 10억 또는 거래대금 증가 대기',
+  UPPER_TREND_WAIT: '1시간·4시간 상승 구조 확인 대기',
   BTC_RISK_OFF: 'BTC 위험회피 국면 · 신규 매수 대기',
   POOR_EXECUTION: '호가 데이터·물량 또는 예상 체결 비용 기준 미달',
   TREND_MISMATCH: '상승 추세 형성 대기', WEAK_TREND: '추세 강도 회복 대기',
@@ -70,7 +71,7 @@ export function makeObservation(input: StrategyInput, strategy: Strategy, result
     + (e20 && input.ticker.tradePrice > e20 ? 20 : 0)
     + (strength !== null && strength >= 45 && strength <= 70 ? 20 : 0)
     + (input.ticker.quoteVolume24h >= ENTRY_VOLUME[strategy] ? 20 : 0);
-  const code = input.ticker.quoteVolume24h < ENTRY_VOLUME[strategy] ? 'LOW_LIQUIDITY'
+  const code = !input.liquidityQualified && input.ticker.quoteVolume24h < ENTRY_VOLUME[strategy] ? 'LOW_LIQUIDITY'
     : result.accepted ? 'SCORE_TOO_LOW' : result.code;
   return { market: input.market.market, koreanName: input.market.koreanName, strategy,
     currentPrice: input.ticker.tradePrice, quoteVolume24h: input.ticker.quoteVolume24h,

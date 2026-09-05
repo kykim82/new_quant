@@ -38,21 +38,23 @@ test('D1 잠금은 중복 수집과 해제 토큰 오용을 방지하고 다음 
   } finally { close(); }
 });
 
-test('800봉 초기 수집도 전체 종목을 순회하고 각 실행은 45회 이하 호출한다', async () => {
+test('저거래대금은 1시간만 순회하고 고정 계획은 보존하며 각 실행은 45회 이하 호출한다', async () => {
   const { db, close } = database();
   const originalFetch = globalThis.fetch;
-  const markets = ['KRW-BTC', ...Array.from({ length: 20 }, (_, index) => `KRW-X${index}`)];
+  const markets = ['KRW-BTC', ...Array.from({ length: 40 }, (_, index) => `KRW-H${index}`), ...Array.from({ length: 20 }, (_, index) => `KRW-X${index}`)];
   let simulatedNow = Date.now();
   let calls = 0;
+  const candleRequests: Array<{ market: string; unit: number }> = [];
   globalThis.fetch = (async (url: string | URL | Request) => {
     calls++;
     const address = new URL(String(url));
     const path = address.pathname;
     let body: unknown;
     if (path.endsWith('/market/all')) body = [...markets, 'KRW-WARN'].map(market => ({ market, korean_name: market, english_name: market, market_event: { warning: market === 'KRW-WARN', caution: {} } }));
-    else if (path.endsWith('/ticker/all')) body = [...markets, 'KRW-WARN'].map(market => ({ market, trade_price: 2000, signed_change_rate: 0, acc_trade_price_24h: market === 'KRW-BTC' ? 20_000_000_000 : 10_000_000, timestamp: simulatedNow }));
+    else if (path.endsWith('/ticker/all')) body = [...markets, 'KRW-WARN'].map(market => ({ market, trade_price: 2000, signed_change_rate: 0, acc_trade_price_24h: market === 'KRW-BTC' || market.startsWith('KRW-H') ? 20_000_000_000 : 10_000_000, timestamp: simulatedNow }));
     else if (path.includes('/candles/minutes/')) {
       const unit = Number(path.split('/').at(-1));
+      candleRequests.push({ market: address.searchParams.get('market')!, unit });
       const to = Date.parse(address.searchParams.get('to')!);
       body = Array.from({ length: 200 }, (_, index) => ({ market: address.searchParams.get('market'), unit,
         candle_date_time_utc: new Date(to - (index + 1) * unit * 60_000).toISOString().slice(0, -1),
@@ -72,7 +74,9 @@ test('800봉 초기 수집도 전체 종목을 순회하고 각 실행은 45회 
       assert.equal(payload.error, undefined);
       assert.ok(calls <= 45, `요청 수 ${calls}`);
       seen.push(payload.coverage.analyzedMarketCount);
-      assert.equal(payload.coverage.eligibleMarketCount, 21);
+      assert.equal(payload.coverage.eligibleMarketCount, 41);
+      assert.equal(payload.coverage.monitoringMarketCount, 20);
+      assert.equal(payload.watchlist?.some(o => o.market.startsWith('KRW-X')), false);
       if (cycle === 0) {
         const row = await db.prepare('SELECT result_json FROM market_analysis WHERE market = ?').bind('KRW-BTC').first<{ result_json: string }>();
         const result = JSON.parse(row!.result_json) as MarketResult;
@@ -93,7 +97,12 @@ test('800봉 초기 수집도 전체 종목을 순회하고 각 실행은 45회 
       }
       simulatedNow += 60_000;
     }
-    assert.ok(seen[1] > seen[0]); assert.equal(seen.at(-1), 21);
+    assert.ok(seen[1] > seen[0]);
+    assert.equal(seen[4], 41);
+    assert.equal(seen.at(-1), 41);
+    assert.ok(candleRequests.filter(r => r.market.startsWith('KRW-X')).every(r => r.unit === 60));
+    assert.ok(candleRequests.filter(r => r.market.startsWith('KRW-H')).every(r => r.unit !== 15));
+    assert.ok(candleRequests.some(r => r.market === 'KRW-BTC' && r.unit === 15));
     const stored = await db.prepare('SELECT market FROM market_analysis').all<{ market: string }>();
     assert.ok(stored.results.some(row => row.market === 'KRW-X19'));
     assert.ok(!stored.results.some(row => row.market === 'KRW-WARN'));

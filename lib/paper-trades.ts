@@ -2,7 +2,7 @@
 import type { Candle, Candidate, DashboardPayload } from './domain';
 
 export interface PaperTrade {
-  id: string; variant: 'legacy' | 'improved' | 'confluence-v3' | 'pre-confluence-v2' | 'fixed-plan-v4'; market: string;
+  id: string; variant: 'legacy' | 'improved' | 'confluence-v3' | 'pre-confluence-v2' | 'fixed-plan-v4' | 'opportunity-v5'; market: string;
   status: 'pending' | 'open' | 'closed' | 'expired' | 'ambiguous' | 'data_gap';
   createdAt: number; lastClose: number; entryExpires: number; holdUntil: number;
   entry: number; stop: number; targets: number[];
@@ -72,7 +72,7 @@ export async function trackPaper(db: D1Database, market: string, candles: Candle
     if (JSON.stringify(updated) !== row.payload_json) writes.push(db.prepare('UPDATE paper_signals SET status = ?, payload_json = ? WHERE id = ?')
       .bind(updated.status, JSON.stringify(updated), updated.id));
   }
-  for (const [variant, candidates] of [['fixed-plan-v4', improved], ['pre-confluence-v2', legacy]] as const) {
+  for (const [variant, candidates] of [['opportunity-v5', improved], ['pre-confluence-v2', legacy]] as const) {
     for (const candidate of candidates) {
       const trade = newPaper(candidate, variant, now);
       writes.push(db.prepare('INSERT OR IGNORE INTO paper_signals VALUES (?, ?, ?, ?, ?)')

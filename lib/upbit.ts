@@ -79,6 +79,7 @@ async function requestJson<T>(path: string): Promise<T> {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(12_000),
   });
+  if (/sec=0(?:;|$)/.test(response.headers.get('Remaining-Req') ?? '')) await delay(1_050);
   if (response.ok) return await response.json() as T;
   const text = await response.text();
   throw new UpbitApiError(`업비트 API ${response.status}: ${text.slice(0, 160)}`, response.status);
@@ -286,6 +287,24 @@ export async function updateCandleCache(market: string, cache: CandleCache, asOf
     result[key] = [...combined.values()].sort((a, b) => a.openTime - b.openTime).slice(-HISTORY_BARS);
   }
   return result;
+}
+
+export function candleUnitDue(cache: CandleCache, unit: CandleUnit, now: number): boolean {
+  return (cache[String(unit) as keyof CandleCache].at(-1)?.closeTime ?? 0) < boundaryFor(unit, now);
+}
+
+// 단계별 수집은 최신 페이지 1회만 사용한다. 과거 이력의 반복 백필은 최신 분석을 막지 않는다.
+export async function refreshCandleUnit(market: string, unit: CandleUnit, cache: CandleCache, asOf: number): Promise<CandleCache> {
+  if (!candleUnitDue(cache, unit, asOf)) return cache;
+  const page = await fetchCandlePage(market, unit, boundaryFor(unit, asOf));
+  await delay(150);
+  if (!page.length) throw new Error(`${market} ${unit}분 최신 캔들 응답 없음`);
+  const key = String(unit) as keyof CandleCache;
+  const retained = cache[key].filter(c => !c.synthetic).map(c => ({ market, unit, candle_date_time_utc: new Date(c.openTime).toISOString(),
+    opening_price: c.open, high_price: c.high, low_price: c.low, trade_price: c.close,
+    candle_acc_trade_volume: c.baseVolume, candle_acc_trade_price: c.quoteVolume }));
+  const candles = normalizeCandles([...retained, ...page], unit, asOf).slice(-HISTORY_BARS);
+  return { ...cache, [key]: candles };
 }
 
 export async function fetchExecutionQualities(

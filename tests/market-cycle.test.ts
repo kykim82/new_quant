@@ -17,7 +17,7 @@ const candidate: Candidate = { ...market, strategy: 'scalp', setup: 'breakout', 
   plan: { entryLow: 99.9, entryAnchor: 100, entryHigh: 100.1, stop: 98, targets: [102, 104, 106], riskPct: 2, netRewardRiskAtTarget2: 1.8, expiresAt: now + 600_000 },
   metrics: { rsi: 60, atrPct: 1, rvol: 1.5, spreadPct: 0.01, slippagePct: 0.01 } };
 const execution: ExecutionQuality = { spreadPct: 0.01, buySlippagePct: 0.01, sufficientDepth: true, tickSize: 0.1, tickSizeReferencePrice: 100 };
-const result: MarketResult = { market: market.market, engineVersion: 3, analyzedAt: now, complete: true, candidates: [candidate], legacy: [], observations: [] };
+const result: MarketResult = { market: market.market, engineVersion: 5, analyzedAt: now, complete: true, candidates: [candidate], legacy: [], observations: [] };
 const quality = new Map([[market.market, execution]]);
 
 test('저장된 단타·스윙 후보의 넓은 스프레드도 제외하지 않고 최신 주의로 교체한다', () => {

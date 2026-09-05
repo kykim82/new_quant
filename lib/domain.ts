@@ -1,7 +1,7 @@
 // 업비트 시세와 추천 결과가 공유하는 도메인 타입을 정의한다
 export type CandleUnit = 15 | 60 | 240;
 export type Strategy = 'scalp' | 'swing';
-export type SetupType = 'breakout' | 'pullback';
+export type SetupType = 'breakout' | 'pullback' | 'reversal';
 export type MarketRegime = 'BULLISH' | 'NEUTRAL' | 'RISK_OFF';
 
 export interface Candle {
@@ -114,6 +114,8 @@ export interface Candidate {
     cmf?: number;
     ppoHistogram?: number;
     activityRatio?: number;
+    averageTurnover3d?: number;
+    hourlyTurnoverRatio?: number;
     spreadPct: number;
     slippagePct: number;
   };
@@ -160,6 +162,8 @@ export interface DashboardPayload {
     freshMarketCount?: number;
     delayedMarketCount?: number;
     oldestAnalysisAt?: number;
+    monitoringMarketCount?: number;
+    volumeGrowthMarketCount?: number;
   };
   scalp: Candidate[];
   swing: Candidate[];

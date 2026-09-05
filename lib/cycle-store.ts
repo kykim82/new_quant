@@ -2,6 +2,7 @@
 import type { Candidate, Observation, SavedPlan } from './domain';
 import type { CandleCache } from './market-cycle';
 import type { TrendState } from './trend-state';
+import type { LiquidityScreen } from './opportunity';
 
 export interface MarketResult {
   plans?: SavedPlan[];
@@ -11,7 +12,8 @@ export interface MarketResult {
   candidates: Candidate[];
   legacy: Candidate[];
   observations: Observation[];
-  engineVersion?: 3;
+  engineVersion?: 3 | 5;
+  screen?: LiquidityScreen;
   trends?: Record<'15' | '60' | '240', TrendState>;
 }
 
@@ -48,7 +50,7 @@ export async function readCandles(db: D1Database, market: string): Promise<Candl
   const row = await db.prepare('SELECT candles_json FROM market_analysis WHERE market = ?').bind(market).first<{ candles_json: string }>();
   return row ? JSON.parse(row.candles_json) as CandleCache : null;
 }
-export async function writeMarket(db: D1Database, result: MarketResult, candles: CandleCache): Promise<void> {
+export async function writeMarket(db: D1Database, result: MarketResult, candles: CandleCache, checkedAt = result.analyzedAt): Promise<void> {
   await db.prepare('INSERT INTO market_analysis VALUES (?, ?, ?, ?) ON CONFLICT(market) DO UPDATE SET checked_at=excluded.checked_at, result_json=excluded.result_json, candles_json=excluded.candles_json')
-    .bind(result.market, result.analyzedAt, JSON.stringify(result), JSON.stringify(candles)).run();
+    .bind(result.market, checkedAt, JSON.stringify(result), JSON.stringify(candles)).run();
 }
