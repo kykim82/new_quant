@@ -10,7 +10,7 @@ import {
   evaluateSwing,
   rankCandidates,
   type StrategyInput,
-} from '../lib/strategy';
+} from '../lib/pre-confluence-strategy';
 
 function trendCandles(count: number, unit: 15 | 60 | 240, start = 2_000): Candle[] {
   const width = unit * 60_000;

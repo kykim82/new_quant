@@ -64,6 +64,8 @@ export interface ChartPoint {
   ema20: number | null;
   ema50: number | null;
   ema200: number | null;
+  supertrend?: number | null;
+  targetBand?: number | null;
 }
 
 export interface PricePlan {
@@ -71,10 +73,19 @@ export interface PricePlan {
   entryAnchor: number;
   entryHigh: number;
   stop: number;
-  targets: [number, number, number];
+  targets: number[];
   riskPct: number;
   netRewardRiskAtTarget2: number;
   expiresAt: number;
+  version?: 'confluence-v3';
+  id?: string;
+  issuedAt?: number;
+  entryReason?: string;
+  stopReason?: string;
+  targetEvidence?: Array<{ low: number; high: number; kind: 'resistance' | 'projection'; reasons: string[] }>;
+  grossReturns?: number[];
+  netReturns?: number[];
+  netSplitReturn?: number | null;
 }
 
 export interface Candidate {

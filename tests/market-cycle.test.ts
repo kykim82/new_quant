@@ -1,7 +1,7 @@
 // 전체시장 순환과 만료·경고 재검사 및 비용 검증을 회귀 검사한다
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { activityRatio, candleCost, emptyCandles, nextMarkets } from '../lib/market-cycle';
+import { activityRatio, candleCost, emptyCandles, nextMarkets, retainPricePlan } from '../lib/market-cycle';
 import { summarizeMarkets } from '../lib/scanner';
 import { withSpreadWarning } from '../lib/execution-warning';
 import type { Candidate, ExecutionQuality, MarketDefinition, MarketTicker } from '../lib/domain';
@@ -16,7 +16,7 @@ const candidate: Candidate = { ...market, strategy: 'scalp', setup: 'breakout', 
   plan: { entryLow: 99.9, entryAnchor: 100, entryHigh: 100.1, stop: 98, targets: [102, 104, 106], riskPct: 2, netRewardRiskAtTarget2: 1.8, expiresAt: now + 600_000 },
   metrics: { rsi: 60, atrPct: 1, rvol: 1.5, spreadPct: 0.01, slippagePct: 0.01 } };
 const execution: ExecutionQuality = { spreadPct: 0.01, buySlippagePct: 0.01, sufficientDepth: true, tickSize: 0.1, tickSizeReferencePrice: 100 };
-const result: MarketResult = { market: market.market, analyzedAt: now, complete: true, candidates: [candidate], legacy: [], observations: [] };
+const result: MarketResult = { market: market.market, engineVersion: 3, analyzedAt: now, complete: true, candidates: [candidate], legacy: [], observations: [] };
 const quality = new Map([[market.market, execution]]);
 
 test('저장된 단타·스윙 후보의 넓은 스프레드도 제외하지 않고 최신 주의로 교체한다', () => {
@@ -62,12 +62,12 @@ test('거래대금이 작은 종목도 전체 순회 대상이고 경고만 제�
   assert.ok(second.every(m => !first.some(f => f.market === m.market)));
 });
 
-test('첫 종목 캔들은 4회이며 최신 캐시는 0회로 계산한다', () => {
+test('첫 종목 800봉 캔들은 12회이며 충분한 최신 캐시는 0회로 계산한다', () => {
   const cache = emptyCandles();
-  assert.equal(candleCost(cache, now), 4);
+  assert.equal(candleCost(cache, now), 12);
   for (const unit of [15, 60, 240] as const) {
     const boundary = Math.floor(now / (unit * 60_000)) * unit * 60_000;
-    cache[String(unit) as keyof typeof cache] = [{ closeTime: boundary } as never];
+    cache[String(unit) as keyof typeof cache] = Array.from({ length: 800 }, () => ({ closeTime: boundary } as never));
   }
   assert.equal(candleCost(cache, now), 0);
 });
@@ -95,4 +95,20 @@ test('미분석 종목을 분석 완료나 후보 없음으로 집계하지 않�
   const payload = summarizeMarkets([], [market], [ticker], 'NEUTRAL', now);
   assert.equal(payload.coverage.pendingMarketCount, 1);
   assert.equal(payload.coverage.analyzedMarketCount, 0);
+});
+
+test('구 엔진 후보는 새 목표가 후보로 표시하지 않고 준비 대기로 분류한다', () => {
+  const payload = summarizeMarkets([{ ...result, engineVersion: undefined }], [market], [ticker], 'NEUTRAL', now, quality);
+  assert.equal(payload.scalp.length, 0);
+  assert.equal(payload.coverage.completedMarketCount, 0);
+  assert.equal(payload.coverage.pendingMarketCount, 1);
+  assert.equal(payload.watchlist?.[0].code, 'ENGINE_WARMUP');
+});
+
+test('같은 진입 계획이 유효하면 목표·손절·발행 시각을 고정하고 만료 이후만 새로 발행한다', () => {
+  const next = { ...candidate, signalTime: now + 300_000, plan: { ...candidate.plan, targets: [110, 120, 130] } };
+  const frozen = retainPricePlan(next, [candidate], 100, now + 300_000);
+  assert.deepEqual(frozen.plan, candidate.plan);
+  assert.equal(frozen.signalTime, candidate.signalTime);
+  assert.deepEqual(retainPricePlan(next, [candidate], 100, now + 600_001), next);
 });

@@ -36,7 +36,7 @@ test('D1 잠금은 중복 수집과 해제 토큰 오용을 방지하고 다음 
   } finally { close(); }
 });
 
-test('3회 실행으로 9개를 넘어 저거래대금까지 순회하고 각 실행은 45회 이하 호출한다', async () => {
+test('800봉 초기 수집도 전체 종목을 순회하고 각 실행은 45회 이하 호출한다', async () => {
   const { db, close } = database();
   const originalFetch = globalThis.fetch;
   const markets = ['KRW-BTC', ...Array.from({ length: 20 }, (_, index) => `KRW-X${index}`)];
@@ -64,7 +64,7 @@ test('3회 실행으로 9개를 넘어 저거래대금까지 순회하고 각 �
   }) as typeof fetch;
   try {
     const seen: number[] = [];
-    for (let cycle = 0; cycle < 3; cycle++) {
+    for (let cycle = 0; cycle < 10; cycle++) {
       calls = 0;
       const payload = await refreshDashboard(db, { now: simulatedNow });
       assert.equal(payload.error, undefined);
@@ -73,7 +73,7 @@ test('3회 실행으로 9개를 넘어 저거래대금까지 순회하고 각 �
       assert.equal(payload.coverage.eligibleMarketCount, 21);
       simulatedNow += 60_000;
     }
-    assert.ok(seen[1] > seen[0]); assert.equal(seen[2], 21);
+    assert.ok(seen[1] > seen[0]); assert.equal(seen.at(-1), 21);
     const stored = await db.prepare('SELECT market FROM market_analysis').all<{ market: string }>();
     assert.ok(stored.results.some(row => row.market === 'KRW-X19'));
     assert.ok(!stored.results.some(row => row.market === 'KRW-WARN'));

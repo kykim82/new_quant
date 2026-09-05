@@ -2,15 +2,15 @@
 import type { Candle, Candidate, DashboardPayload } from './domain';
 
 export interface PaperTrade {
-  id: string; variant: 'legacy' | 'improved'; market: string;
+  id: string; variant: 'legacy' | 'improved' | 'confluence-v3' | 'pre-confluence-v2'; market: string;
   status: 'pending' | 'open' | 'closed' | 'expired' | 'ambiguous' | 'data_gap';
   createdAt: number; lastClose: number; entryExpires: number; holdUntil: number;
-  entry: number; stop: number; targets: [number, number, number];
+  entry: number; stop: number; targets: number[];
   filledAt?: number; sold: number; netPct: number; costRate: number;
 }
 
 export function newPaper(candidate: Candidate, variant: PaperTrade['variant'], now: number): PaperTrade {
-  return { id: `${variant}:${candidate.market}:${candidate.strategy}:${candidate.signalTime}`,
+  return { id: `${variant}:${candidate.plan.id ?? `${candidate.market}:${candidate.strategy}:${candidate.signalTime}`}`,
     variant, market: candidate.market, status: 'pending', createdAt: now, lastClose: now,
     entryExpires: candidate.plan.expiresAt,
     holdUntil: now + (candidate.strategy === 'scalp' ? 6 : 72) * 3_600_000,
@@ -42,13 +42,13 @@ export function advancePaper(original: PaperTrade, candles: Candle[], now: numbe
       continue;
     }
     const hitsStop = bar.low <= trade.stop;
-    const hitsTarget = trade.sold < 3 && bar.high >= trade.targets[trade.sold];
+    const hitsTarget = trade.sold < trade.targets.length && bar.high >= trade.targets[trade.sold];
     if (hitsStop && hitsTarget) { trade.status = 'ambiguous'; return trade; }
     if (hitsStop) {
       trade.netPct += returnAt(trade, Math.min(bar.open, trade.stop)) * (3 - trade.sold) / 3;
       trade.status = 'closed'; return trade;
     }
-    while (trade.sold < 3 && bar.high >= trade.targets[trade.sold]) {
+    while (trade.sold < trade.targets.length && bar.high >= trade.targets[trade.sold]) {
       trade.netPct += returnAt(trade, trade.targets[trade.sold]) / 3;
       trade.sold++;
     }
@@ -72,7 +72,7 @@ export async function trackPaper(db: D1Database, market: string, candles: Candle
     if (JSON.stringify(updated) !== row.payload_json) writes.push(db.prepare('UPDATE paper_signals SET status = ?, payload_json = ? WHERE id = ?')
       .bind(updated.status, JSON.stringify(updated), updated.id));
   }
-  for (const [variant, candidates] of [['improved', improved], ['legacy', legacy]] as const) {
+  for (const [variant, candidates] of [['confluence-v3', improved], ['pre-confluence-v2', legacy]] as const) {
     for (const candidate of candidates) {
       const trade = newPaper(candidate, variant, now);
       writes.push(db.prepare('INSERT OR IGNORE INTO paper_signals VALUES (?, ?, ?, ?, ?)')

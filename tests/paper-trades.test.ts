@@ -28,3 +28,12 @@ test('보유 중 목표·손절 동시 도달은 임의로 승리 처리하지 �
 test('평가 구간 누락을 확인하면 결과 추정 대신 누락으로 분류한다', () => {
   assert.equal(advancePaper(original, [bar(4, 99, 108)], 5_000_000).status, 'data_gap');
 });
+
+test('목표가 하나면 1/3만 청산하고 잔량은 보유 만료 가격으로 처리한다', () => {
+  const partial = { ...original, variant: 'confluence-v3' as const, targets: [102], holdUntil: 2_700_000 };
+  const open = advancePaper(partial, [bar(0, 99, 101), bar(1, 100, 103)], 1_800_000);
+  assert.equal(open.status, 'open'); assert.equal(open.sold, 1);
+  const closed = advancePaper(open, [bar(2, 100, 101)], 2_700_000);
+  assert.equal(closed.status, 'closed'); assert.equal(closed.sold, 1);
+  assert.ok(closed.netPct > open.netPct);
+});

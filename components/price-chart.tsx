@@ -35,7 +35,7 @@ function pathFor(
   let started = false;
   return points.reduce((path, point, index) => {
     const value = selector(point);
-    if (value === null) return path;
+    if (value === null) { started = false; return path; }
     const command = started ? 'L' : 'M';
     started = true;
     return `${path}${command}${x(index).toFixed(2)},${y(value).toFixed(2)} `;
@@ -51,6 +51,7 @@ export function PriceChart({ candidate, unit }: PriceChartProps) {
       candidate.plan.entryHigh,
       candidate.plan.stop,
       ...candidate.plan.targets,
+      ...points.flatMap(point => [point.supertrend, point.targetBand]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value)),
     ];
     const low = Math.min(...points.map((point) => point.low), ...planPrices);
     const high = Math.max(...points.map((point) => point.high), ...planPrices);
@@ -80,6 +81,7 @@ export function PriceChart({ candidate, unit }: PriceChartProps) {
         <span><i className="ema20" />EMA 20</span>
         <span><i className="ema50" />EMA 50</span>
         {unit === 240 && <span><i className="ema200" />EMA 200</span>}
+        <span>ST 추세선</span><span>TT 추세선</span>
       </div>
       <svg
         aria-label={`${candidate.koreanName} ${unit}분봉 차트. 매수가 ${formatPrice(candidate.plan.entryAnchor)}원, 손절가 ${formatPrice(candidate.plan.stop)}원.`}
@@ -106,6 +108,8 @@ export function PriceChart({ candidate, unit }: PriceChartProps) {
         })}
         <path className="ema-line ema20-path" d={pathFor(points, (point) => point.ema20, geometry.x, geometry.y)} />
         <path className="ema-line ema50-path" d={pathFor(points, (point) => point.ema50, geometry.x, geometry.y)} />
+        <path fill="none" stroke="#d495ff" strokeWidth="1.5" d={pathFor(points, point => point.supertrend ?? null, geometry.x, geometry.y)} />
+        <path fill="none" stroke="#8b9bb0" strokeWidth="1.2" strokeDasharray="3 3" d={pathFor(points, point => point.targetBand ?? null, geometry.x, geometry.y)} />
         {unit === 240 && <path className="ema-line ema200-path" d={pathFor(points, (point) => point.ema200, geometry.x, geometry.y)} />}
         {lines.map((line) => {
           const y = geometry.y(line.price);

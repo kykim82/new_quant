@@ -114,7 +114,7 @@ function CandidateCard({
         <div className="price-grid">
           <div className="col-span-2"><span>매수 구간</span><strong>{formatPrice(candidate.plan.entryLow)} ~ {formatPrice(candidate.plan.entryHigh)}</strong></div>
           <div><span>대표가 기준 손절 · {candidate.plan.riskPct.toFixed(2)}%</span><strong className="text-fall">{formatPrice(candidate.plan.stop)}</strong></div>
-          <div><span>대표가 기준 2차 · {candidate.plan.netRewardRiskAtTarget2.toFixed(1)}R</span><strong className="text-rise">{formatPrice(candidate.plan.targets[1])}</strong></div>
+          <div><span>1차 수익 여력 · 비용 전 {candidate.plan.grossReturns?.[0]?.toFixed(2) ?? '—'}%</span><strong className="text-rise">{formatPrice(candidate.plan.targets[0])}</strong></div>
         </div>
         <div className="flex flex-wrap gap-2">
           {candidate.reasons.slice(0, 3).map((reason) => <span className="reason-chip" key={reason}>{reason}</span>)}
@@ -123,7 +123,7 @@ function CandidateCard({
           <p className="text-sm text-warning" key={warning}><AlertTriangle className="mr-1 inline size-4" />{warning}</p>
         ))}
         <Button className="h-11 w-full justify-between" onClick={onSelect} variant="outline">
-          차트와 가격 계획 보기<BarChart3 />
+          <span className="lg:hidden">차트와 가격 계획 보기</span><span className="hidden lg:inline">{selected ? '표시 중인 차트로 이동' : '오른쪽에 차트·가격 계획 표시'}</span><BarChart3 />
         </Button>
       </CardContent>
     </Card>
@@ -157,14 +157,14 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
         <div className="level-stat entry"><span>대표 매수가</span><strong>{formatPrice(candidate.plan.entryAnchor)}</strong></div>
         <div className="level-stat stop"><span>손절가</span><strong>{formatPrice(candidate.plan.stop)}</strong></div>
-        {candidate.plan.targets.map((target, index) => (
-          <div className="level-stat target" key={target}><span>{index + 1}차 매도가</span><strong>{formatPrice(target)}</strong></div>
+        {[0, 1, 2].map((index) => (
+          <div className="level-stat target" key={index}><span>{index + 1}차 매도가</span><strong>{candidate.plan.targets[index] === undefined ? '산정 대기' : formatPrice(candidate.plan.targets[index])}</strong></div>
         ))}
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <div className="detail-stat"><Clock3 /><span>신호 유효</span><strong>{remainingText(candidate.plan.expiresAt, now)}</strong></div>
-        <div className="detail-stat"><ShieldCheck /><span>2차 손익비</span><strong>{candidate.plan.netRewardRiskAtTarget2.toFixed(2)} R</strong></div>
+        <div className="detail-stat"><ShieldCheck /><span>분할 순수익 여력</span><strong>{candidate.plan.netSplitReturn == null ? '산정 대기' : `${candidate.plan.netSplitReturn.toFixed(2)}%`}</strong></div>
         <div className="detail-stat"><Gauge /><span>RSI</span><strong>{candidate.metrics.rsi.toFixed(1)}</strong></div>
         <div className="detail-stat"><Signal /><span>거래대금</span><strong>{candidate.metrics.rvol.toFixed(2)}배</strong></div>
       </div>
@@ -186,6 +186,21 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
         </div>
       </div>
 
+      {candidate.plan.version === 'confluence-v3' && (
+        <section className="mt-5 space-y-3 rounded-xl border border-border p-4 text-sm" aria-label="가격 계획 산정 근거">
+          <h3 className="font-semibold">가격 계획 산정 근거</h3>
+          <p>매수. {candidate.plan.entryReason}.</p><p>손절. {candidate.plan.stopReason}.</p>
+          {[0, 1, 2].map(index => {
+            const evidence = candidate.plan.targetEvidence?.[index];
+            return <div className="border-t border-border pt-2" key={index}>
+              <p className="font-semibold">{index + 1}차. {evidence ? (evidence.kind === 'resistance' ? '가격 구조 포함 구간' : '예상 확장 구간') : '목표 근거 산정 대기'}</p>
+              {evidence && <><p>{evidence.reasons.join(' · ')}</p><p className="text-muted-foreground">비용 전 {candidate.plan.grossReturns?.[index]?.toFixed(2)}% · 비용 가정 후 {candidate.plan.netReturns?.[index]?.toFixed(2)}%</p></>}
+            </div>;
+          })}
+          <p className="text-xs text-muted-foreground">도달 확률을 반영한 기대수익이 아닙니다. 분할 수익은 각 목표에서 1/3씩 모두 매도했을 때입니다. 미래 매도 비용은 현재 매수 슬리피지와 같은 비율로 가정하며 실제 체결 비용과 다를 수 있습니다.</p>
+          <p className="text-xs text-muted-foreground">계획 발행 {formatKst(candidate.plan.issuedAt ?? candidate.signalTime)} KST · 가격 고정 · 2차 손익비 {candidate.plan.targets.length > 1 ? `${candidate.plan.netRewardRiskAtTarget2.toFixed(2)}R (참고용)` : '산정 대기'}</p>
+        </section>
+      )}
       {candidate.warnings.length > 0 && (
         <Alert className="mt-4 border-warning/30 bg-warning/8 text-warning-foreground">
           <AlertTriangle /><AlertTitle>주의할 점</AlertTitle><AlertDescription>{candidate.warnings.join(' · ')}</AlertDescription>
@@ -329,6 +344,7 @@ export function Dashboard() {
   const chooseCandidate = (candidate: Candidate) => {
     setSelectedMarket(candidate.market);
     if (compactLayout) setMobileDetailOpen(true);
+    else requestAnimationFrame(() => document.getElementById('candidate-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   };
 
   return (
@@ -365,14 +381,14 @@ export function Dashboard() {
           </div>
         </section>
 
-        {data?.schemaVersion === 2 && (
+        {data?.schemaVersion === 3 && (
           <section className="mt-4 rounded-xl border border-border bg-card/55 p-4 text-sm" aria-label="전체시장 분석 진행률">
             <div className="flex flex-wrap justify-between gap-2">
               <span>전체 {data.coverage.krwMarketCount}개 · 주의·경고 제외 {data.rejections.marketWarning}개</span>
               <span>미분석 {data.coverage.pendingMarketCount}개 · 분석 지연 {data.coverage.delayedMarketCount}개 · 이력 충족 {data.coverage.completedMarketCount}개</span>
             </div>
             <progress className="mt-3 h-2 w-full accent-lime-400" max={data.coverage.eligibleMarketCount || 1} value={data.coverage.analyzedMarketCount} aria-label="전체 종목 최초 분석 진행률" />
-            <p className="mt-2 text-xs text-muted-foreground">매분 다음 묶음을 분석합니다. 최초 전체 준비에는 수십 분이 걸릴 수 있습니다. 분석 후 20분이 지난 종목은 진입 후보에서 제외합니다. 현재가 갱신 {formatKst(data.priceUpdatedAt ?? data.generatedAt)} KST.</p>
+            <p className="mt-2 text-xs text-muted-foreground">매분 다음 묶음을 분석합니다. 원본 TT용 800봉 이력을 순차 확보하므로 최초 전체 준비는 1시간 이상 걸릴 수 있습니다. 분석 후 20분이 지난 종목은 진입 후보에서 제외합니다. 현재가 갱신 {formatKst(data.priceUpdatedAt ?? data.generatedAt)} KST.</p>
           </section>
         )}
 
@@ -409,7 +425,7 @@ export function Dashboard() {
             ))}
           </Tabs>
 
-          <aside className="detail-panel hidden lg:block" aria-label="선택 종목 상세">
+          <aside id="candidate-detail" className="detail-panel hidden scroll-mt-20 lg:block" aria-label="선택 종목 상세">
             {selectedCandidate ? <CandidateDetail candidate={selectedCandidate} now={clock} /> : (
               <Empty className="min-h-[470px]"><EmptyHeader><EmptyMedia variant="icon"><BarChart3 /></EmptyMedia><EmptyTitle>표시할 후보가 없습니다</EmptyTitle><EmptyDescription>조건을 통과한 종목이 생기면 차트와 가격 계획이 여기에 표시됩니다.</EmptyDescription></EmptyHeader></Empty>
             )}
@@ -445,13 +461,14 @@ export function Dashboard() {
             <p className="mt-3 text-xs text-muted-foreground">사유는 종목×전략별 첫 미충족 조건입니다. 한 종목이 단타·스윙에 각각 집계됩니다.</p>
             <div className="mt-3 flex flex-wrap gap-2">{Object.entries(data.diagnostics).sort((a, b) => b[1] - a[1]).map(([code, count]) => <span className="reason-chip" key={code}>{REASONS[code] ?? code} · {count}</span>)}</div>
             {data.comparison && <p className="mt-4">기존 기준 {data.comparison.legacy}개 / 개선 기준 {data.comparison.improved}개. {data.comparison.note}</p>}
-            <p className="mt-3 text-xs text-muted-foreground">모의 성과는 개선 배포 이후부터 축적됩니다. 매수가 접촉 이후 세 목표에서 1/3씩 청산하고 비용을 반영합니다. 동일 봉 진입·청산이나 목표·손절 동시 도달은 불명확으로 분리합니다. 과거 전체 기간 백테스트나 실제 체결 성과가 아닙니다.</p>
-            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'legacy' ? '기존 기준' : '개선 기준'} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
+            <p className="mt-3 text-xs text-muted-foreground">모의 성과는 버전별로 분리합니다. 산정된 목표에서 각각 1/3씩 청산하고, 목표가 없는 잔량은 손절 또는 보유기한에 청산합니다. 동일 봉 진입·청산이나 목표·손절 동시 도달은 불명확으로 분리하며 종료 평균에서 제외되어 편향될 수 있습니다. 과거 전체 기간 백테스트나 실제 체결 성과가 아닙니다.</p>
+            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'confluence-v3' ? '구조 목표 v3' : stat.variant === 'pre-confluence-v2' ? '이전 R목표 비교군' : `이전 기록 (${stat.variant})`} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
           </details>
         )}
 
         <footer className="mt-8 border-t border-border py-5 text-xs leading-relaxed text-muted-foreground">
           추천 점수는 성공 확률이 아닌 후보 간 상대 순위입니다. 본 서비스는 투자 판단을 보조하며 수익을 보장하지 않습니다.
+          <a className="ml-2 underline" href="/indicator-notices.txt" target="_blank" rel="noreferrer">지표 출처·이용 조건</a>
           <span aria-live="polite" className="sr-only">{message}</span>
         </footer>
       </div>

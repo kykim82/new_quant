@@ -6,6 +6,7 @@ import type { StrategyEvaluation, StrategyInput } from './strategy';
 export type CandleCache = Record<'15' | '60' | '240', Candle[]>;
 export const ENTRY_VOLUME = { scalp: 1_000_000_000, swing: 500_000_000 };
 export const SIGNAL_FRESH_MS = 20 * 60_000;
+export const HISTORY_BARS = 800;
 export const REASONS: Record<string, string> = {
   LOW_LIQUIDITY: '거래대금 부족 · 단타 10억 / 스윙 5억 원 기준',
   BTC_RISK_OFF: 'BTC 위험회피 국면 · 신규 매수 대기',
@@ -21,6 +22,8 @@ export const REASONS: Record<string, string> = {
   INSUFFICIENT_DATA: '캔들 이력 부족', MISSING_RECENT_CANDLES: '최근 무거래·누락 봉 확인 필요',
   INDICATOR_WARMUP: '지표 계산 이력 부족', ENTRY_DATA_MISSING: '진입 구간 이력 부족',
   ZERO_ATR: '가격 변동 데이터 부족', DATA_DELAYED: '분석 지연 · 재분석 대기',
+  NO_RESISTANCE_ROOM: '가까운 목표 근거 부족 또는 비용 후 상승 여력 부족',
+  ENGINE_WARMUP: '새 지표 이력 준비 · 순차 재분석 대기',
 };
 
 export function nextMarkets(markets: MarketDefinition[], tickers: MarketTicker[], checked: Map<string, number>): MarketDefinition[] {
@@ -33,12 +36,13 @@ export function nextMarkets(markets: MarketDefinition[], tickers: MarketTicker[]
 export function dueUnits(cache: CandleCache, now: number): CandleUnit[] {
   return ([15, 60, 240] as const).filter(unit => {
     const boundary = Math.floor(now / (unit * 60_000)) * unit * 60_000;
-    return (cache[String(unit) as keyof CandleCache].at(-1)?.closeTime ?? 0) < boundary;
+    const bars = cache[String(unit) as keyof CandleCache];
+    return (bars.at(-1)?.closeTime ?? 0) < boundary || bars.length < HISTORY_BARS;
   });
 }
 
 export function candleCost(cache: CandleCache, now: number): number {
-  return dueUnits(cache, now).reduce((sum, unit) => sum + (unit === 240 && cache['240'].length < 220 ? 2 : 1), 0);
+  return dueUnits(cache, now).reduce((sum, unit) => sum + 1 + Math.ceil(Math.max(0, HISTORY_BARS - Math.max(200, cache[String(unit) as keyof CandleCache].length)) / 200), 0);
 }
 
 export function emptyCandles(): CandleCache { return { '15': [], '60': [], '240': [] }; }
@@ -53,6 +57,11 @@ export function entryStillValid(candidate: Candidate, price: number, now: number
   const tolerance = (candidate.plan.entryHigh - candidate.plan.entryLow) * 0.625;
   return candidate.plan.expiresAt > now && price > candidate.plan.stop && price < candidate.plan.targets[0]
     && price >= candidate.plan.entryLow - tolerance && price <= candidate.plan.entryHigh + tolerance;
+}
+
+export function retainPricePlan(candidate: Candidate, previous: readonly Candidate[], price: number, now: number): Candidate {
+  const frozen = previous.find(c => c.market === candidate.market && c.strategy === candidate.strategy && c.setup === candidate.setup && entryStillValid(c, price, now));
+  return frozen ? { ...candidate, signalTime: frozen.signalTime, plan: frozen.plan } : candidate;
 }
 
 export function makeObservation(input: StrategyInput, strategy: Strategy, result: StrategyEvaluation, now: number): Observation {

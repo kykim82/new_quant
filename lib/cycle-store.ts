@@ -1,6 +1,7 @@
 // D1에 전체시장 순회 캐시와 작업 잠금을 영속 저장한다
 import type { Candidate, Observation } from './domain';
 import type { CandleCache } from './market-cycle';
+import type { TrendState } from './trend-state';
 
 export interface MarketResult {
   market: string;
@@ -9,6 +10,8 @@ export interface MarketResult {
   candidates: Candidate[];
   legacy: Candidate[];
   observations: Observation[];
+  engineVersion?: 3;
+  trends?: Record<'15' | '60' | '240', TrendState>;
 }
 export interface MarketRow { market: string; checked_at: number; result_json: string }
 

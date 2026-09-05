@@ -8,7 +8,7 @@ import type {
   OrderbookSnapshot,
 } from '@/lib/domain';
 import { krwTickSize } from '@/lib/tick-size';
-import { dueUnits, type CandleCache } from '@/lib/market-cycle';
+import { dueUnits, HISTORY_BARS, type CandleCache } from '@/lib/market-cycle';
 
 const API_BASE = 'https://api.upbit.com/v1';
 const BATCH_SIZE = 6;
@@ -264,14 +264,26 @@ export async function updateCandleCache(market: string, cache: CandleCache, asOf
     const key = String(unit) as keyof CandleCache;
     const page = await fetchCandlePage(market, unit, boundaryFor(unit, asOf));
     await delay(150);
-    const older = unit === 240 && cache['240'].length < 220 && page.length > 0
-      ? await fetchCandlePage(market, 240, parseUtc(page.at(-1)!.candle_date_time_utc)) : [];
-    if (older.length) await delay(150);
-    const normalized = normalizeCandles([...older, ...page], unit, asOf);
+    const older: UpbitCandleResponse[] = [];
+    const pagesNeeded = Math.ceil(Math.max(0, HISTORY_BARS - Math.max(200, cache[key].length)) / 200);
+    let cursor = Math.min(cache[key][0]?.openTime ?? Infinity, page.length ? parseUtc(page.at(-1)!.candle_date_time_utc) : Infinity);
+    for (let index = 0; index < pagesNeeded && Number.isFinite(cursor); index++) {
+      const history = await fetchCandlePage(market, unit, cursor);
+      await delay(150);
+      if (!history.length) break;
+      older.push(...history);
+      cursor = parseUtc(history.at(-1)!.candle_date_time_utc);
+      if (history.length < 200) break;
+    }
+    // 기존 실제 봉도 함께 정규화해 백필과 최신 페이지 사이를 합성 봉으로 덮지 않는다.
+    const retained = cache[key].filter(c => !c.synthetic).map(c => ({ market, unit, candle_date_time_utc: new Date(c.openTime).toISOString(),
+      opening_price: c.open, high_price: c.high, low_price: c.low, trade_price: c.close,
+      candle_acc_trade_volume: c.baseVolume, candle_acc_trade_price: c.quoteVolume }));
+    const normalized = normalizeCandles([...retained, ...older, ...page], unit, asOf);
     if (!normalized.length) { result[key] = []; continue; }
     const combined = new Map(cache[key].map(candle => [candle.openTime, candle]));
     for (const candle of normalized) combined.set(candle.openTime, candle);
-    result[key] = [...combined.values()].sort((a, b) => a.openTime - b.openTime).slice(-(unit === 240 ? 400 : 200));
+    result[key] = [...combined.values()].sort((a, b) => a.openTime - b.openTime).slice(-HISTORY_BARS);
   }
   return result;
 }
