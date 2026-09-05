@@ -48,3 +48,7 @@
 - 배포 주소는 `https://krw-quant-radar.kykim82.chatgpt.site`이다.
 - 프로덕션 홈과 추천 API가 HTTP 200을 반환하고, 실시간 결과가 D1에 저장된 뒤 캐시로 다시 조회되는 것을 확인했다.
 - Worker 로그에서 실제 시장 스캔과 화면 요청이 모두 성공한 것을 확인했다.
+# Cloudflare 사용자 계정 D1 연결
+
+- 2026-09-05. 사용자 Cloudflare 계정에 `new-quant` D1 데이터베이스를 Asia Pacific 위치로 생성했다.
+- D1 바인딩 `DB`는 사용자 데이터베이스 ID `e980ee48-f1d7-4a21-9255-31c7a47bb4de`를 사용한다.

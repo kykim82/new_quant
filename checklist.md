@@ -20,3 +20,10 @@
 - [x] 의미 단위 Git 커밋 완료
 - [x] Cloudflare 비공개 배포
 - [x] 최종 ZIP 생성 및 위치 확인
+# 사용자 Cloudflare Workers 배포 전환
+
+- [x] GitHub `kykim82/new_quant` 저장소에 소스 푸시.
+- [x] 사용자 Cloudflare 계정의 D1 데이터베이스 생성.
+- [x] 사용자 D1 데이터베이스 ID를 배포 구성에 연결.
+- [ ] Cloudflare Workers Build 연결 및 첫 배포.
+- [ ] 원격 D1 마이그레이션과 정기 실행 검증.
