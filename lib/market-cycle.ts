@@ -9,7 +9,7 @@ export const SIGNAL_FRESH_MS = 20 * 60_000;
 export const REASONS: Record<string, string> = {
   LOW_LIQUIDITY: '거래대금 부족 · 단타 10억 / 스윙 5억 원 기준',
   BTC_RISK_OFF: 'BTC 위험회피 국면 · 신규 매수 대기',
-  POOR_EXECUTION: '호가 물량·스프레드·예상 체결 비용 기준 미달',
+  POOR_EXECUTION: '호가 데이터·물량 또는 예상 체결 비용 기준 미달',
   TREND_MISMATCH: '상승 추세 형성 대기', WEAK_TREND: '추세 강도 회복 대기',
   NO_BREAKOUT: '직전 20봉 고점 돌파 대기', NO_ENTRY_SETUP: '돌파 또는 눌림 회복 대기',
   LOW_RVOL: '신호봉 거래대금 증가 대기', RSI_OUT_OF_RANGE: 'RSI 과열 또는 모멘텀 부족',

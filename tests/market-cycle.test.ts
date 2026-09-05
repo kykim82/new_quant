@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { activityRatio, candleCost, emptyCandles, nextMarkets } from '../lib/market-cycle';
 import { summarizeMarkets } from '../lib/scanner';
+import { withSpreadWarning } from '../lib/execution-warning';
 import type { Candidate, ExecutionQuality, MarketDefinition, MarketTicker } from '../lib/domain';
 import type { MarketResult } from '../lib/cycle-store';
 
@@ -17,6 +18,32 @@ const candidate: Candidate = { ...market, strategy: 'scalp', setup: 'breakout', 
 const execution: ExecutionQuality = { spreadPct: 0.01, buySlippagePct: 0.01, sufficientDepth: true, tickSize: 0.1, tickSizeReferencePrice: 100 };
 const result: MarketResult = { market: market.market, analyzedAt: now, complete: true, candidates: [candidate], legacy: [], observations: [] };
 const quality = new Map([[market.market, execution]]);
+
+test('저장된 단타·스윙 후보의 넓은 스프레드도 제외하지 않고 최신 주의로 교체한다', () => {
+  for (const strategy of ['scalp', 'swing'] as const) {
+    const stored = { ...result, candidates: [{ ...candidate, strategy, warnings: ['기존 주의', '호가 스프레드 0.500% · 이전 값'] }] };
+    const wide = new Map([[market.market, { ...execution, spreadPct: 2 }]]);
+    const payload = summarizeMarkets([stored], [market], [ticker], 'NEUTRAL', now, wide);
+    assert.equal(payload[strategy].length, 1);
+    assert.equal(payload[strategy][0].score, candidate.score);
+    assert.equal(payload[strategy][0].metrics.spreadPct, 2);
+    assert.equal(payload[strategy][0].warnings.length, 2);
+    assert.ok(payload[strategy][0].warnings[1].includes('2.000%'));
+    const recovered = summarizeMarkets([{ ...stored, candidates: payload[strategy] }], [market], [ticker], 'NEUTRAL', now, quality);
+    assert.deepEqual(recovered[strategy][0].warnings, ['기존 주의']);
+    const expensive = new Map([[market.market, { ...execution, buySlippagePct: 1 }]]);
+    assert.equal(summarizeMarkets([stored], [market], [ticker], 'NEUTRAL', now, expensive)[strategy].length, 0);
+  }
+});
+
+test('스프레드 주의 기준 경계와 중복 제거를 검증한다', () => {
+  for (const [strategy, threshold] of [['scalp', 0.2], ['swing', 0.35]] as const) {
+    assert.deepEqual(withSpreadWarning([], strategy, threshold), []);
+    const warnings = withSpreadWarning([], strategy, threshold + 0.001);
+    assert.equal(warnings.length, 1);
+    assert.deepEqual(withSpreadWarning(warnings, strategy, threshold + 0.001), warnings);
+  }
+});
 
 test('거래대금 가속도는 최근 24봉을 제외한 이전 72시간의 일평균과 비교한다', () => {
   const candles = Array.from({ length: 96 }, (_, i) => ({ quoteVolume: i < 72 ? 10 : 9999 } as never));

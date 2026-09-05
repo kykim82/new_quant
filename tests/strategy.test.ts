@@ -65,13 +65,35 @@ test('단타 전략은 위험회피 시장에서 즉시 거절한다', () => {
   assert.deepEqual(evaluation, { accepted: false, category: 'technicalConditions', code: 'BTC_RISK_OFF' });
 });
 
-test('스윙 전략은 나쁜 호가 품질을 거절한다', () => {
+test('스윙 전략은 충분하지 않은 호가 물량을 여전히 거절한다', () => {
   const evaluation = evaluateSwing({
     ...input(),
-    execution: { spreadPct: 0.4, buySlippagePct: 0.03, sufficientDepth: true, tickSize: 1, tickSizeReferencePrice: 2_090 },
+    execution: { spreadPct: 0.4, buySlippagePct: 0.03, sufficientDepth: false, tickSize: 1, tickSizeReferencePrice: 2_090 },
   });
   assert.deepEqual(evaluation, { accepted: false, category: 'executionQuality', code: 'POOR_EXECUTION' });
 });
+
+for (const [strategy, evaluate] of [['scalp', evaluateScalp], ['swing', evaluateSwing]] as const) {
+  test(`${strategy} 스프레드는 합격·점수·가격에 영향 없이 주의만 표시한다`, () => {
+    const source = input();
+    const normal = evaluate(source);
+    const wide = evaluate({ ...source, execution: { ...source.execution, spreadPct: 2 } });
+    assert.equal(normal.accepted, true);
+    assert.equal(wide.accepted, true);
+    if (!normal.accepted || !wide.accepted) return;
+    assert.equal(wide.candidate.score, normal.candidate.score);
+    assert.deepEqual(wide.candidate.plan, normal.candidate.plan);
+    assert.ok(!normal.candidate.warnings.some(warning => warning.startsWith('호가 스프레드 ')));
+    assert.ok(wide.candidate.warnings.some(warning => warning.includes('2.000%')));
+    assert.equal(wide.candidate.metrics.spreadPct, 2);
+  });
+
+  test(`${strategy} 스프레드가 작아도 과도한 슬리피지는 거절한다`, () => {
+    const source = input();
+    assert.deepEqual(evaluate({ ...source, execution: { ...source.execution, buySlippagePct: 1 } }),
+      { accepted: false, category: 'executionQuality', code: 'POOR_EXECUTION' });
+  });
+}
 
 test('합성 결측 봉이 최근 구간에 있으면 추천하지 않는다', () => {
   const source = input();

@@ -7,6 +7,7 @@ import { deriveBtcRegime, evaluateScalp, evaluateSwing, rankCandidates, type Str
 import { evaluateScalp as legacyScalp, evaluateSwing as legacySwing } from './legacy-strategy';
 import { fetchExecutionQualities, fetchKrwMarkets, fetchKrwTickers, updateCandleCache } from './upbit';
 import { paperSummary, trackPaper } from './paper-trades';
+import { withSpreadWarning } from './execution-warning';
 
 export const ANALYSIS_NOTIONAL_KRW = 1_000_000;
 export const ASSUMED_FEE_RATE = 0.0005;
@@ -34,11 +35,12 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
       const plan = candidate.plan;
       const netRR = (plan.targets[1] * (1 - cost) - plan.entryAnchor * (1 + cost))
         / (plan.entryAnchor * (1 + cost) - plan.stop * (1 - cost));
-      const executionOk = execution?.sufficientDepth && execution.spreadPct <= (candidate.strategy === 'scalp' ? 0.2 : 0.35)
+      const executionOk = execution?.sufficientDepth
         && execution.buySlippagePct <= (candidate.strategy === 'scalp' ? 0.15 : 0.25) && netRR >= 1.5;
       if (isFresh && regime !== 'RISK_OFF' && ticker.quoteVolume24h >= ENTRY_VOLUME[candidate.strategy]
         && executionOk && entryStillValid(candidate, ticker.tradePrice, now)) {
         accepted.push({ ...candidate, currentPrice: ticker.tradePrice, quoteVolume24h: ticker.quoteVolume24h, signedChangeRate: ticker.signedChangeRate,
+          warnings: withSpreadWarning(candidate.warnings, candidate.strategy, execution.spreadPct),
           plan: { ...candidate.plan, netRewardRiskAtTarget2: netRR },
           metrics: { ...candidate.metrics, spreadPct: execution.spreadPct, slippagePct: execution.buySlippagePct } });
       } else {
@@ -76,7 +78,7 @@ export function summarizeMarkets(results: MarketResult[], markets: MarketDefinit
     rejections: { lowLiquidity: diagnostics.LOW_LIQUIDITY ?? 0, marketWarning: markets.length - safe.size,
       technicalConditions: observations.filter(o => !['LOW_LIQUIDITY', 'POOR_EXECUTION', 'DATA_DELAYED', 'INSUFFICIENT_DATA'].includes(o.code)).length,
       executionQuality: diagnostics.POOR_EXECUTION ?? 0, insufficientData: diagnostics.INSUFFICIENT_DATA ?? 0 },
-    notice: '진입 기준 단타 10억·스윙 5억 원 · 모의 주문금액 100만원 · 편도 수수료 가정 0.05% · 자동주문 없음',
+    notice: '진입 기준 단타 10억·스윙 5억 원 · 모의 주문금액 100만원 · 편도 수수료 가정 0.05% · 스프레드는 주의 표시만 · 자동주문 없음',
   };
 }
 

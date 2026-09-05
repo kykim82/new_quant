@@ -24,6 +24,7 @@ import {
   trueRanges,
 } from '@/lib/indicators';
 import { resolvedKrwTickSize } from '@/lib/tick-size';
+import { withSpreadWarning } from '@/lib/execution-warning';
 
 export type RejectCategory =
   | 'technicalConditions'
@@ -148,7 +149,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   if (candles15.length < 60 || candles60.length < 55) return reject('insufficientData', 'INSUFFICIENT_DATA');
   if (hasRecentSynthetic(candles15, 40) || hasRecentSynthetic(candles60, 24)) return reject('insufficientData', 'MISSING_RECENT_CANDLES');
   if (input.marketRegime === 'RISK_OFF') return reject('technicalConditions', 'BTC_RISK_OFF');
-  if (!input.execution.sufficientDepth || input.execution.spreadPct > 0.2 || input.execution.buySlippagePct > 0.15) {
+  if (!input.execution.sufficientDepth || input.execution.buySlippagePct > 0.15) {
     return reject('executionQuality', 'POOR_EXECUTION');
   }
 
@@ -212,10 +213,10 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   const centeredRsi = clamp(1 - Math.abs(rsi14! - 60) / 20, 0, 1);
   const rvolStrength = clamp((relativeVolume! - 0.8) / 2.2, 0, 1);
   const extensionQuality = isBreakout ? clamp(1 - extensionAtr / 0.75, 0, 1) : 0.8;
-  const spreadQuality = clamp(1 - input.execution.spreadPct / 0.2, 0, 1);
   const slippageQuality = clamp(1 - input.execution.buySlippagePct / 0.15, 0, 1);
+  // 스프레드 10점을 제외한 90점 만점을 100점으로 환산한다.
   const score = Math.round(
-    30 + 10 + centeredRsi * 5 + extensionQuality * 10 + 10 + rvolStrength * 15 + spreadQuality * 10 + slippageQuality * 10,
+    (30 + 10 + centeredRsi * 5 + extensionQuality * 10 + 10 + rvolStrength * 15 + slippageQuality * 10) * 100 / 90,
   );
 
   return {
@@ -237,7 +238,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
         `${isBreakout ? '20봉 고점 돌파' : 'EMA20 눌림 후 직전 봉 고가 회복'} · 거래대금 ${relativeVolume!.toFixed(1)}배`,
         `RSI ${rsi14!.toFixed(1)} · 추격 제한 통과`,
       ],
-      warnings: plan.riskPct > 1.5 ? ['손절 폭이 다소 넓습니다'] : [],
+      warnings: withSpreadWarning(plan.riskPct > 1.5 ? ['손절 폭이 다소 넓습니다'] : [], 'scalp', input.execution.spreadPct),
       plan,
       metrics: {
         rsi: rsi14!,
@@ -257,7 +258,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
   if (candles60.length < 60 || candles240.length < 220) return reject('insufficientData', 'INSUFFICIENT_DATA');
   if (hasRecentSynthetic(candles60, 36) || hasRecentSynthetic(candles240, 20)) return reject('insufficientData', 'MISSING_RECENT_CANDLES');
   if (input.marketRegime === 'RISK_OFF') return reject('technicalConditions', 'BTC_RISK_OFF');
-  if (!input.execution.sufficientDepth || input.execution.spreadPct > 0.35 || input.execution.buySlippagePct > 0.25) {
+  if (!input.execution.sufficientDepth || input.execution.buySlippagePct > 0.25) {
     return reject('executionQuality', 'POOR_EXECUTION');
   }
 
@@ -345,9 +346,9 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
   const flowQuality = clamp((flow + 0.1) / 0.3, 0, 1);
   const momentumQuality = momentum > 0 ? 1 : clamp(1 + momentum / 0.5, 0, 1);
   const relativeQuality = clamp((relativeStrength + 0.02) / 0.06, 0, 1);
-  const executionQuality = clamp(1 - input.execution.spreadPct / 0.35, 0, 1);
+  // 스프레드 5점을 제외한 95점 만점을 100점으로 환산한다.
   const score = Math.round(
-    20 + (ema50_240! > ema200_240! ? 10 : 0) + 10 + clamp((adx240! - 15) / 10, 0, 1) * 10 + volumeQuality * 10 + flowQuality * 5 + rsiQuality * 8 + momentumQuality * 7 + relativeQuality * 10 + executionQuality * 5 + clamp(plan.netRewardRiskAtTarget2 / 2, 0, 1) * 5,
+    (20 + (ema50_240! > ema200_240! ? 10 : 0) + 10 + clamp((adx240! - 15) / 10, 0, 1) * 10 + volumeQuality * 10 + flowQuality * 5 + rsiQuality * 8 + momentumQuality * 7 + relativeQuality * 10 + clamp(plan.netRewardRiskAtTarget2 / 2, 0, 1) * 5) * 100 / 95,
   );
 
   return {
@@ -369,7 +370,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
         setup === 'breakout' ? `1시간 고점 돌파 · 거래대금 ${relativeVolume!.toFixed(1)}배` : '1시간 지지 구간 눌림 후 회복',
         `RSI ${rsi240!.toFixed(1)} · CMF ${flow.toFixed(2)}`,
       ],
-      warnings: relativeStrength < 0 ? ['BTC보다 상대 강도가 낮습니다'] : [],
+      warnings: withSpreadWarning(relativeStrength < 0 ? ['BTC보다 상대 강도가 낮습니다'] : [], 'swing', input.execution.spreadPct),
       plan,
       metrics: {
         rsi: rsi240!,

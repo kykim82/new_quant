@@ -119,6 +119,9 @@ function CandidateCard({
         <div className="flex flex-wrap gap-2">
           {candidate.reasons.slice(0, 3).map((reason) => <span className="reason-chip" key={reason}>{reason}</span>)}
         </div>
+        {candidate.warnings.filter(warning => warning.startsWith('호가 스프레드 ')).map(warning => (
+          <p className="text-sm text-warning" key={warning}><AlertTriangle className="mr-1 inline size-4" />{warning}</p>
+        ))}
         <Button className="h-11 w-full justify-between" onClick={onSelect} variant="outline">
           차트와 가격 계획 보기<BarChart3 />
         </Button>
@@ -175,7 +178,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
           <h3><Activity />지표 값</h3>
           <dl>
             <div><dt>ATR 변동성</dt><dd>{candidate.metrics.atrPct.toFixed(2)}%</dd></div>
-            <div><dt>호가 스프레드</dt><dd>{candidate.metrics.spreadPct.toFixed(3)}%</dd></div>
+            <div><dt>호가 스프레드 · 참고용</dt><dd>{candidate.metrics.spreadPct.toFixed(3)}%</dd></div>
             <div><dt>예상 슬리피지</dt><dd>{candidate.metrics.slippagePct.toFixed(3)}%</dd></div>
             {candidate.metrics.adx !== undefined && <div><dt>ADX</dt><dd>{candidate.metrics.adx.toFixed(1)}</dd></div>}
             {candidate.metrics.activityRatio !== undefined && <div><dt>평소 대비 24h 거래대금</dt><dd>{candidate.metrics.activityRatio.toFixed(2)}배</dd></div>}
