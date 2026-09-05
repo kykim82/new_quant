@@ -1,0 +1,11 @@
+{
+  "ignorePatterns": ["components/ui/**", "hooks/**"],
+  "overrides": [
+    {
+      "files": ["tests/**/*.ts"],
+      "rules": {
+        "typescript/no-floating-promises": "off"
+      }
+    }
+  ]
+}
