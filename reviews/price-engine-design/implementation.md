@@ -34,3 +34,5 @@ AVWAP·Volume Profile·Supertrend 동적 추적 청산·최소5% 수익 강제�
 - 주요 변경 파일. `lib/trend-state.ts`, `lib/confluence-plan.ts`, `lib/strategy.ts`, `lib/scanner.ts`, `lib/upbit.ts`, `components/dashboard.tsx`, `components/price-chart.tsx` 및 관련 테스트다.
 - 출처 표시. `public/indicator-notices.txt`와 이식 모듈의 BigBeluga·CC BY-NC-SA4.0 표시를 유지한다.
 - 배포 대상. 기존 GitHub `kykim82/new_quant`의 main과 사용자 Worker `new-quant.kykim82.workers.dev`다. 새로운 Pages 프로젝트나 다른 Cloudflare 계정에 배포하지 않는다.
+
+배포 확인. 코드9e7f758의 화면 자산 dashboard-Bt_ZKiRL.js와 새 엔진 API schemaVersion3, stale=false, error=null을 운영에서 확인했다. 전체 이력 준비는 계속 순차 진행된다. ZIP은 Git 추적 파일만 포함하며 node_modules, .env, .git, .wrangler를 포함하지 않는다. 이전 ZIP은 같은 release 폴더의 upbit_recommender-pre-v3.zip으로 보존했다.

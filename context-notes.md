@@ -4,6 +4,7 @@
 
 ## 2026-09-06 구조 기반 엔진 구현 결정
 
+- 배포 검증. 코드9e7f758을 사용자 GitHub main에 푸시했다. 운영 dashboard-Bt_ZKiRL.js에서 새 가격 근거·산정 대기 문구를 확인했고 API generatedAt1788624968000/schemaVersion3/stale=false/error=null을 확인했다. 최초 새 이력 완료4/263종목, 나머지는 순차 재분석 중이다. 업로드 ZIP은 release/upbit_recommender.zip이며 이전 파일은 upbit_recommender-pre-v3.zip으로 보존했다.
 - 구현 검증. 62개 테스트, typecheck, lint, build 통과. 로컬 빌드 Worker에서 페이지·출처 문서 HTTP200, 업비트 실제 API schemaVersion3/stale=false/error=null, 263개 대상 중 최초3개 이력 완료를 확인했다.
 - 최소399개 실제 봉과 TT 준비 상태를 모두 확인한다. 첫 목표가 비용 또는 호가 반올림 후 진입 구간에 붙으면 더 먼 목표로 건너뛰지 않는다. ABC 기준 파동은 최소2ATR, 전체 군집 폭은 max(2틱,0.15ATR) 이내다.
 - 테스트의 단타 정상 사례가 전일R1과 진입 상단이 같은 호가가 되어 NO_RESISTANCE_ROOM으로 거절됐다. 이는 의도한 보호 동작이므로 해당 정상 fixture의 전일 변동폭을 수정했고, 근접 저항 거절은 별도 테스트로 유지한다.
