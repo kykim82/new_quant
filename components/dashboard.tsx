@@ -28,6 +28,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import type { Candidate, CandleUnit, DashboardPayload, Strategy } from '@/lib/domain';
 import { krwTickSize } from '@/lib/tick-size';
+import { REASONS } from '@/lib/market-cycle';
 
 type LoadState = 'loading' | 'ready' | 'refreshing' | 'error';
 
@@ -177,6 +178,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
             <div><dt>호가 스프레드</dt><dd>{candidate.metrics.spreadPct.toFixed(3)}%</dd></div>
             <div><dt>예상 슬리피지</dt><dd>{candidate.metrics.slippagePct.toFixed(3)}%</dd></div>
             {candidate.metrics.adx !== undefined && <div><dt>ADX</dt><dd>{candidate.metrics.adx.toFixed(1)}</dd></div>}
+            {candidate.metrics.activityRatio !== undefined && <div><dt>평소 대비 24h 거래대금</dt><dd>{candidate.metrics.activityRatio.toFixed(2)}배</dd></div>}
           </dl>
         </div>
       </div>
@@ -186,7 +188,7 @@ function CandidateDetail({ candidate, now }: { candidate: Candidate; now: number
           <AlertTriangle /><AlertTitle>주의할 점</AlertTitle><AlertDescription>{candidate.warnings.join(' · ')}</AlertDescription>
         </Alert>
       )}
-      <p className="mt-4 text-xs leading-relaxed text-muted-foreground">표시 가격은 확률 기반 분석 결과이며 주문은 자동으로 실행되지 않습니다. 급변 시 실제 체결 가격이 달라질 수 있습니다.</p>
+      <p className="mt-4 text-xs leading-relaxed text-muted-foreground">표시 가격은 규칙 기반 분석 결과이며 주문은 자동으로 실행되지 않습니다. 급변 시 실제 체결 가격이 달라질 수 있습니다.</p>
     </div>
   );
 }
@@ -200,6 +202,8 @@ export function Dashboard() {
   const [state, setState] = useState<LoadState>('loading');
   const [activeStrategy, setActiveStrategy] = useState<Strategy>('scalp');
   const [selectedMarket, setSelectedMarket] = useState<string | null>(null);
+  const [watchPage, setWatchPage] = useState(0);
+  const [watchQuery, setWatchQuery] = useState('');
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const [compactLayout, setCompactLayout] = useState(false);
   const [clock, setClock] = useState(() => Date.now());
@@ -230,8 +234,8 @@ export function Dashboard() {
           ...dataRef.current,
           stale: true,
           error: failureMessage,
-          scalp: dataRef.current.scalp.filter((candidate) => candidate.plan.expiresAt > now),
-          swing: dataRef.current.swing.filter((candidate) => candidate.plan.expiresAt > now),
+          scalp: [],
+          swing: [],
         };
         dataRef.current = degraded;
         setClock(now);
@@ -314,6 +318,10 @@ export function Dashboard() {
   );
   const regime = data ? regimeLabel(data) : null;
   const degraded = state === 'error' || Boolean(data?.stale);
+  const watchRows = (data?.watchlist ?? []).filter(row => row.strategy === activeStrategy
+    && `${row.market} ${row.koreanName} ${row.reason}`.toLowerCase().includes(watchQuery.toLowerCase()));
+  const pageCount = Math.max(1, Math.ceil(watchRows.length / 10));
+  const currentWatchPage = Math.min(watchPage, pageCount - 1);
 
   const chooseCandidate = (candidate: Candidate) => {
     setSelectedMarket(candidate.market);
@@ -343,16 +351,27 @@ export function Dashboard() {
               <span className={`text-xs font-semibold tracking-wide ${degraded ? 'text-warning' : 'text-signal'}`}>{state === 'error' ? '연결 오류' : data?.stale ? '데이터 지연됨' : state === 'refreshing' ? '갱신 중' : '데이터 정상'}</span>
             </div>
             <h2 className="text-xl font-bold tracking-tight sm:text-2xl" id="market-status">
-              {data ? (data.scalp.length + data.swing.length > 0 ? '조건을 통과한 매수 후보입니다' : '현재 기준을 충족한 후보가 없습니다') : '원화마켓을 분석하고 있습니다'}
+              {data ? (data.stale ? '분석 갱신을 기다리고 있습니다' : data.scalp.length + data.swing.length > 0 ? '조건을 통과한 매수 후보입니다' : (data.coverage.pendingMarketCount ?? 0) > 0 ? '전체시장을 순차 분석하고 있습니다' : '현재 분석 범위에서 진입 신호를 기다립니다') : '원화마켓을 분석하고 있습니다'}
             </h2>
-            <p className="mt-1 text-sm text-muted-foreground">{data?.notice ?? '첫 분석은 약 10~20초가 걸릴 수 있습니다.'}</p>
+            <p className="mt-1 text-sm text-muted-foreground">{data?.notice ?? '첫 묶음을 준비 중입니다. 전체 수집은 여러 번의 갱신에 걸쳐 진행됩니다.'}</p>
           </div>
           <div className="market-metrics">
             <div><span>BTC 시장</span><strong className={regime?.className}>{regime?.label ?? '확인 중'}</strong></div>
-            <div><span>분석 범위</span><strong>{data ? `${data.coverage.analyzedMarketCount}/${data.coverage.krwMarketCount}종목` : '—'}</strong></div>
+            <div><span>주의·경고 제외 순회</span><strong>{data ? `${data.coverage.analyzedMarketCount}/${data.coverage.eligibleMarketCount}종목` : '—'}</strong></div>
             <div><span>마지막 분석</span><strong>{data ? `${formatKst(data.generatedAt)} KST` : '—'}</strong></div>
           </div>
         </section>
+
+        {data?.schemaVersion === 2 && (
+          <section className="mt-4 rounded-xl border border-border bg-card/55 p-4 text-sm" aria-label="전체시장 분석 진행률">
+            <div className="flex flex-wrap justify-between gap-2">
+              <span>전체 {data.coverage.krwMarketCount}개 · 주의·경고 제외 {data.rejections.marketWarning}개</span>
+              <span>미분석 {data.coverage.pendingMarketCount}개 · 분석 지연 {data.coverage.delayedMarketCount}개 · 이력 충족 {data.coverage.completedMarketCount}개</span>
+            </div>
+            <progress className="mt-3 h-2 w-full accent-lime-400" max={data.coverage.eligibleMarketCount || 1} value={data.coverage.analyzedMarketCount} aria-label="전체 종목 최초 분석 진행률" />
+            <p className="mt-2 text-xs text-muted-foreground">매분 다음 묶음을 분석합니다. 최초 전체 준비에는 수십 분이 걸릴 수 있습니다. 분석 후 20분이 지난 종목은 진입 후보에서 제외합니다. 현재가 갱신 {formatKst(data.priceUpdatedAt ?? data.generatedAt)} KST.</p>
+          </section>
+        )}
 
         {(state === 'error' || data?.error) && (
           <Alert className="mt-4 border-warning/30 bg-warning/8 text-warning-foreground">
@@ -363,7 +382,7 @@ export function Dashboard() {
         )}
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(0,0.92fr)_minmax(420px,1.08fr)]">
-          <Tabs className="min-w-0" onValueChange={(value) => { setActiveStrategy(value as Strategy); setSelectedMarket(null); }} value={activeStrategy}>
+          <Tabs className="min-w-0" onValueChange={(value) => { setActiveStrategy(value as Strategy); setSelectedMarket(null); setWatchPage(0); }} value={activeStrategy}>
             <TabsList className="sticky top-[69px] z-10 grid h-12 w-full grid-cols-2 border border-border bg-card/95 p-1 backdrop-blur">
               <TabsTrigger className="text-[15px]" value="scalp">15분 단타 <Badge variant="secondary">{data?.scalp.length ?? 0}</Badge></TabsTrigger>
               <TabsTrigger className="text-[15px]" value="swing">1~4시간 스윙 <Badge variant="secondary">{data?.swing.length ?? 0}</Badge></TabsTrigger>
@@ -376,7 +395,7 @@ export function Dashboard() {
                     <EmptyHeader>
                       <EmptyMedia className="size-11 rounded-xl text-muted-foreground" variant="icon"><Signal /></EmptyMedia>
                       <EmptyTitle className="text-base">현재 {strategy === 'scalp' ? '단타' : '스윙'} 매수 후보가 없습니다</EmptyTitle>
-                      <EmptyDescription>기준을 낮춰 종목을 채우지 않습니다. 다음 완성 봉에서 다시 분석합니다.</EmptyDescription>
+                      <EmptyDescription>아래 관찰·대기 목록에서 종목별 미충족 조건을 확인할 수 있습니다. 미분석 종목은 순차적으로 추가됩니다.</EmptyDescription>
                     </EmptyHeader>
                   </Empty>
                 )}
@@ -393,6 +412,40 @@ export function Dashboard() {
             )}
           </aside>
         </div>
+
+        <section className="mt-6 rounded-xl border border-border bg-card/60 p-4 sm:p-5" aria-label="관찰 및 대기 종목">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div><h2 className="font-semibold">{activeStrategy === 'scalp' ? '15분 단타' : '1~4시간 스윙'} 관찰·대기 {watchRows.length}개</h2>
+              <p className="mt-1 text-xs text-muted-foreground">매수 추천이 아닙니다. 상승 구조 점수가 높은 순서이며 아직 충족하지 못한 조건을 표시합니다.</p></div>
+            <input className="h-10 rounded-md border border-border bg-background px-3 text-sm" aria-label="관찰 종목 또는 사유 검색" placeholder="종목·대기 사유 검색" value={watchQuery} onChange={event => { setWatchQuery(event.target.value); setWatchPage(0); }} />
+          </div>
+          <div className="mt-4 space-y-2">
+            {watchRows.slice(currentWatchPage * 10, currentWatchPage * 10 + 10).map(row => (
+              <div className="grid gap-2 rounded-lg border border-border/60 p-3 sm:grid-cols-[1fr_1fr_2fr]" key={`${row.market}:${row.strategy}`}>
+                <div><strong className="text-sm">{row.koreanName}</strong><span className="ml-2 text-xs text-muted-foreground">{row.market}</span></div>
+                <div className="text-sm">{formatPrice(row.currentPrice)}<span className="ml-2 text-xs text-muted-foreground">24h {formatCompactKrw(row.quoteVolume24h)}</span></div>
+                <div><p className="text-sm text-warning">{row.reason}</p><p className="mt-1 text-xs text-muted-foreground">분석 {formatKst(row.analyzedAt)} KST</p></div>
+              </div>
+            ))}
+            {watchRows.length === 0 && <p className="py-4 text-sm text-muted-foreground">아직 표시할 관찰 결과가 없습니다. 분석 진행률을 확인해 주세요.</p>}
+          </div>
+          <div className="mt-3 flex items-center justify-end gap-3 text-sm">
+            <Button variant="outline" disabled={currentWatchPage === 0} onClick={() => setWatchPage(currentWatchPage - 1)}>이전</Button>
+            <span>{currentWatchPage + 1} / {pageCount}</span>
+            <Button variant="outline" disabled={currentWatchPage + 1 >= pageCount} onClick={() => setWatchPage(currentWatchPage + 1)}>다음</Button>
+          </div>
+        </section>
+
+        {data?.diagnostics && (
+          <details className="mt-4 rounded-xl border border-border p-4 text-sm">
+            <summary className="cursor-pointer font-semibold">조건별 대기 사유와 기준 비교</summary>
+            <p className="mt-3 text-xs text-muted-foreground">사유는 종목×전략별 첫 미충족 조건입니다. 한 종목이 단타·스윙에 각각 집계됩니다.</p>
+            <div className="mt-3 flex flex-wrap gap-2">{Object.entries(data.diagnostics).sort((a, b) => b[1] - a[1]).map(([code, count]) => <span className="reason-chip" key={code}>{REASONS[code] ?? code} · {count}</span>)}</div>
+            {data.comparison && <p className="mt-4">기존 기준 {data.comparison.legacy}개 / 개선 기준 {data.comparison.improved}개. {data.comparison.note}</p>}
+            <p className="mt-3 text-xs text-muted-foreground">모의 성과는 개선 배포 이후부터 축적됩니다. 매수가 접촉 이후 세 목표에서 1/3씩 청산하고 비용을 반영합니다. 동일 봉 진입·청산이나 목표·손절 동시 도달은 불명확으로 분리합니다. 과거 전체 기간 백테스트나 실제 체결 성과가 아닙니다.</p>
+            {(data.paper ?? []).map(stat => <p className="mt-2" key={stat.variant}>{stat.variant === 'legacy' ? '기존 기준' : '개선 기준'} · 모의 기록 {stat.total}건 · 진입 대기 {stat.pending} · 보유 {stat.open} · 종료 {stat.closed} · 불명확/누락 {stat.ambiguous} · 종료 평균 {stat.meanNetPct === null ? '집계 대기' : `${stat.meanNetPct.toFixed(2)}%`}</p>)}
+          </details>
+        )}
 
         <footer className="mt-8 border-t border-border py-5 text-xs leading-relaxed text-muted-foreground">
           추천 점수는 성공 확률이 아닌 후보 간 상대 순위입니다. 본 서비스는 투자 판단을 보조하며 수익을 보장하지 않습니다.

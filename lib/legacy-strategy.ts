@@ -173,28 +173,22 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   if (!(ema20_15! > ema50_15! && ema20_60! > ema50_60! && latest.close > ema20_15!)) {
     return reject('technicalConditions', 'TREND_MISMATCH');
   }
-  const previous = candles15.at(-2)!;
-  const isBreakout = latest.close > breakout! && relativeVolume! >= 1.2;
-  const isPullback = previous.low <= ema20_15! + atr14! * 0.25
-    && previous.close <= ema20_15! + atr14! * 0.25
-    && latest.close > previous.high && latest.close > ema20_15!
-    && latest.close - ema20_15! <= atr14! * 0.75 && relativeVolume! >= 0.8;
-  if (!isBreakout && !isPullback) return reject('technicalConditions', latest.close > breakout! ? 'LOW_RVOL' : 'NO_ENTRY_SETUP');
-  if (rsi14! < 45 || rsi14! > 78) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
+  if (!(latest.close > breakout!)) return reject('technicalConditions', 'NO_BREAKOUT');
+  if (relativeVolume! < 1.5) return reject('technicalConditions', 'LOW_RVOL');
+  if (rsi14! < 55 || rsi14! > 70) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
 
   const extensionAtr = (latest.close - breakout!) / atr14!;
   const currentRangeRatio = trueRanges(candles15).at(-1)! / previousAtr!;
-  if (isBreakout && extensionAtr > 0.75) return reject('technicalConditions', 'OVEREXTENDED');
+  if (extensionAtr > 0.5) return reject('technicalConditions', 'OVEREXTENDED');
   if (currentRangeRatio > 3) return reject('technicalConditions', 'PUMP_CANDLE');
 
   const pivot = lastConfirmedPivotLow(candles15.slice(-20));
   if (!pivot) return reject('technicalConditions', 'NO_CONFIRMED_SWING_LOW');
-  const anchor = isBreakout ? breakout! : ema20_15!;
-  const rawStop = isBreakout ? Math.min(pivot.price, breakout! - atr14! * 0.7) : pivot.price - atr14! * 0.2;
+  const rawStop = Math.min(pivot.price, breakout! - atr14! * 0.7);
   const plan = buildPricePlan({
-    entryLow: anchor,
-    entryAnchor: anchor + atr14! * 0.1,
-    entryHigh: anchor + atr14! * 0.3,
+    entryLow: breakout!,
+    entryAnchor: breakout! + atr14! * 0.1,
+    entryHigh: breakout! + atr14! * 0.2,
     rawStop,
     tickSize: input.execution.tickSize,
     tickSizeReferencePrice: input.execution.tickSizeReferencePrice,
@@ -209,9 +203,9 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
   }
   if (plan.netRewardRiskAtTarget2 < 1.5) return reject('technicalConditions', 'POOR_NET_RR');
 
-  const centeredRsi = clamp(1 - Math.abs(rsi14! - 60) / 20, 0, 1);
-  const rvolStrength = clamp((relativeVolume! - 0.8) / 2.2, 0, 1);
-  const extensionQuality = isBreakout ? clamp(1 - extensionAtr / 0.75, 0, 1) : 0.8;
+  const centeredRsi = clamp(1 - Math.abs(rsi14! - 62.5) / 7.5, 0, 1);
+  const rvolStrength = clamp((relativeVolume! - 1.5) / 1.5, 0, 1);
+  const extensionQuality = clamp(1 - extensionAtr / 0.5, 0, 1);
   const spreadQuality = clamp(1 - input.execution.spreadPct / 0.2, 0, 1);
   const slippageQuality = clamp(1 - input.execution.buySlippagePct / 0.15, 0, 1);
   const score = Math.round(
@@ -225,7 +219,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
       koreanName: input.market.koreanName,
       englishName: input.market.englishName,
       strategy: 'scalp',
-      setup: isBreakout ? 'breakout' : 'pullback',
+      setup: 'breakout',
       score: clamp(score, 0, 100),
       rank: 0,
       currentPrice: input.ticker.tradePrice,
@@ -234,7 +228,7 @@ export function evaluateScalp(input: StrategyInput): StrategyEvaluation {
       signalTime: latest.closeTime,
       reasons: [
         '1시간·15분 EMA 상승 배열',
-        `${isBreakout ? '20봉 고점 돌파' : 'EMA20 눌림 후 직전 봉 고가 회복'} · 거래대금 ${relativeVolume!.toFixed(1)}배`,
+        `20봉 고점 돌파 · 거래대금 ${relativeVolume!.toFixed(1)}배`,
         `RSI ${rsi14!.toFixed(1)} · 추격 제한 통과`,
       ],
       warnings: plan.riskPct > 1.5 ? ['손절 폭이 다소 넓습니다'] : [],
@@ -284,11 +278,11 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
     return reject('insufficientData', 'INDICATOR_WARMUP');
   }
   if (atr240! <= 0 || atr60! <= 0) return reject('insufficientData', 'ZERO_ATR');
-  if (!(ema20_240! > ema50_240! && latest240.close > ema50_240! && ema50_240! > ema50SlopeBase!)) {
+  if (!(ema20_240! > ema50_240! && ema50_240! > ema200_240! && ema50_240! > ema50SlopeBase!)) {
     return reject('technicalConditions', 'TREND_MISMATCH');
   }
-  if (!(adx240! >= 15 && plusDi! > minusDi!)) return reject('technicalConditions', 'WEAK_TREND');
-  if (rsi240! < 45 || rsi240! >= 78) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
+  if (!(adx240! >= 20 && plusDi! > minusDi!)) return reject('technicalConditions', 'WEAK_TREND');
+  if (rsi240! < 50 || rsi240! >= 75) return reject('technicalConditions', 'RSI_OUT_OF_RANGE');
   if (Math.abs(latest240.close - ema20_240!) / atr240! > 1.5) return reject('technicalConditions', 'OVEREXTENDED');
 
   const breakout = lastValue(donchianHigh(candles60, 20));
@@ -301,7 +295,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
     return reject('insufficientData', 'ENTRY_DATA_MISSING');
   }
 
-  const isBreakout = latest60.close > breakout! && relativeVolume! >= 1.2 && (latest60.close - breakout!) / atr60! <= 0.75;
+  const isBreakout = latest60.close > breakout! && relativeVolume! >= 1.5 && (latest60.close - breakout!) / atr60! <= 0.75;
   const supportLow = pivot.price - atr60! * 0.25;
   const supportHigh = pivot.price + atr60! * 0.25;
   const trendLow = Math.min(ema20_240!, ema50_240!);
@@ -347,7 +341,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
   const relativeQuality = clamp((relativeStrength + 0.02) / 0.06, 0, 1);
   const executionQuality = clamp(1 - input.execution.spreadPct / 0.35, 0, 1);
   const score = Math.round(
-    20 + (ema50_240! > ema200_240! ? 10 : 0) + 10 + clamp((adx240! - 15) / 10, 0, 1) * 10 + volumeQuality * 10 + flowQuality * 5 + rsiQuality * 8 + momentumQuality * 7 + relativeQuality * 10 + executionQuality * 5 + clamp(plan.netRewardRiskAtTarget2 / 2, 0, 1) * 5,
+    30 + 20 + volumeQuality * 10 + flowQuality * 5 + rsiQuality * 8 + momentumQuality * 7 + relativeQuality * 10 + executionQuality * 5 + clamp(plan.netRewardRiskAtTarget2 / 2, 0, 1) * 5,
   );
 
   return {
@@ -365,7 +359,7 @@ export function evaluateSwing(input: StrategyInput): StrategyEvaluation {
       quoteVolume24h: input.ticker.quoteVolume24h,
       signalTime: latest60.closeTime,
       reasons: [
-        `4시간 중기 상승 · ADX ${adx240!.toFixed(1)}${ema50_240! > ema200_240! ? ' · 장기 정배열' : ' · 장기 추세 회복 대기'}`,
+        '4시간 EMA 정배열·ADX 추세 확인',
         setup === 'breakout' ? `1시간 고점 돌파 · 거래대금 ${relativeVolume!.toFixed(1)}배` : '1시간 지지 구간 눌림 후 회복',
         `RSI ${rsi240!.toFixed(1)} · CMF ${flow.toFixed(2)}`,
       ],

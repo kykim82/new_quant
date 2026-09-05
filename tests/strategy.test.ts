@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import type { Candle, Candidate, Strategy } from '../lib/domain';
+import { evaluateScalp as evaluateLegacyScalp } from '../lib/legacy-strategy';
 import {
   deriveBtcRegime,
   evaluateScalp,
@@ -131,6 +132,24 @@ function rankedCandidate(market: string, strategy: Strategy, score: number, quot
   if (!accepted.accepted) throw new Error(`테스트 후보 생성 실패: ${accepted.code}`);
   return { ...accepted.candidate, market, strategy, score, quoteVolume24h };
 }
+
+test('거래대금 1.3배 돌파는 개선 전략에서 평가하고 기존 전략은 거절한다', () => {
+  const source = input();
+  source.candles['15'].at(-1)!.quoteVolume = 130;
+  assert.equal(evaluateLegacyScalp(source).accepted, false);
+  assert.equal(evaluateScalp(source).accepted, true);
+});
+
+test('단타는 EMA20 눌림 이후 직전 고가 회복도 진입 신호로 평가한다', () => {
+  const source = input();
+  Object.assign(source.candles['15'].at(-2)!, { open: 2069, close: 2068, high: 2070, low: 2065 });
+  Object.assign(source.candles['15'].at(-1)!, { open: 2068, close: 2076, high: 2077, low: 2066 });
+  source.candles['15'][77].low = 2058;
+  source.ticker.tradePrice = 2074;
+  const evaluation = evaluateScalp(source);
+  assert.equal(evaluation.accepted, true, evaluation.accepted ? undefined : evaluation.code);
+  if (evaluation.accepted) assert.equal(evaluation.candidate.setup, 'pullback');
+});
 
 test('후보 순위는 임계값과 최대 3개 제한을 적용하고 동점을 거래대금으로 정렬한다', () => {
   const ranked = rankCandidates([

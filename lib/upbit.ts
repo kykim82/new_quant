@@ -8,6 +8,7 @@ import type {
   OrderbookSnapshot,
 } from '@/lib/domain';
 import { krwTickSize } from '@/lib/tick-size';
+import { dueUnits, type CandleCache } from '@/lib/market-cycle';
 
 const API_BASE = 'https://api.upbit.com/v1';
 const BATCH_SIZE = 6;
@@ -253,6 +254,24 @@ export async function fetchCandlesForMarkets(
       record[String(unit) as '15' | '60' | '240'] = normalizeCandles(combined, unit, asOf);
     }
     result.set(market, record);
+  }
+  return result;
+}
+
+export async function updateCandleCache(market: string, cache: CandleCache, asOf: number): Promise<CandleCache> {
+  const result = { ...cache };
+  for (const unit of dueUnits(cache, asOf)) {
+    const key = String(unit) as keyof CandleCache;
+    const page = await fetchCandlePage(market, unit, boundaryFor(unit, asOf));
+    await delay(150);
+    const older = unit === 240 && cache['240'].length < 220 && page.length > 0
+      ? await fetchCandlePage(market, 240, parseUtc(page.at(-1)!.candle_date_time_utc)) : [];
+    if (older.length) await delay(150);
+    const normalized = normalizeCandles([...older, ...page], unit, asOf);
+    if (!normalized.length) { result[key] = []; continue; }
+    const combined = new Map(cache[key].map(candle => [candle.openTime, candle]));
+    for (const candle of normalized) combined.set(candle.openTime, candle);
+    result[key] = [...combined.values()].sort((a, b) => a.openTime - b.openTime).slice(-(unit === 240 ? 400 : 200));
   }
   return result;
 }

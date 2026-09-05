@@ -1,4 +1,4 @@
-// 웹 요청과 15분 주기 시장 분석을 함께 처리하는 Cloudflare Worker 진입점
+// 웹 요청과 매분 전체시장 분할 분석을 함께 처리하는 Cloudflare Worker 진입점
 import app from 'vinext/server/fetch-handler';
 
 import { refreshDashboard } from '@/lib/scanner';

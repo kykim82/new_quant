@@ -99,6 +99,7 @@ export interface Candidate {
     adx?: number;
     cmf?: number;
     ppoHistogram?: number;
+    activityRatio?: number;
     spreadPct: number;
     slippagePct: number;
   };
@@ -114,6 +115,12 @@ export interface RejectionSummary {
 }
 
 export interface DashboardPayload {
+  schemaVersion?: number;
+  priceUpdatedAt?: number;
+  watchlist?: Observation[];
+  diagnostics?: Record<string, number>;
+  comparison?: { legacy: number; improved: number; note: string };
+  paper?: Array<{ variant: string; total: number; pending: number; open: number; closed: number; ambiguous: number; meanNetPct: number | null }>;
   generatedAt: number;
   source: 'live' | 'cached';
   stale: boolean;
@@ -126,10 +133,26 @@ export interface DashboardPayload {
     eligibleMarketCount: number;
     analyzedMarketCount: number;
     completedMarketCount: number;
+    pendingMarketCount?: number;
+    freshMarketCount?: number;
+    delayedMarketCount?: number;
+    oldestAnalysisAt?: number;
   };
   scalp: Candidate[];
   swing: Candidate[];
   rejections: RejectionSummary;
   notice: string;
   error?: string;
+}
+
+export interface Observation {
+  market: string;
+  koreanName: string;
+  strategy: Strategy;
+  currentPrice: number;
+  quoteVolume24h: number;
+  analyzedAt: number;
+  code: string;
+  reason: string;
+  trendScore: number;
 }

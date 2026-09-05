@@ -12,14 +12,15 @@ const { d1, r2 } = hostingConfig;
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 
 const localBindingConfig = {
+  name: 'new-quant',
   main: './worker.ts',
   compatibility_flags: ['nodejs_compat'],
-  triggers: { crons: ['1,16,31,46 * * * *'] },
+  triggers: { crons: ['* * * * *'] },
   d1_databases: d1
     ? [
         {
           binding: d1,
-          database_name: 'site-creator-d1',
+          database_name: 'new-quant',
           database_id: D1_DATABASE_ID,
         },
       ]
