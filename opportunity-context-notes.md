@@ -10,3 +10,6 @@
 - 최근 1h 급증의 극소액 착시 방지를 위해 최소 1천만원 조건을 사용한다. 완성 1h와 순회에 기반하므로 실시간 체결 스트림 탐지는 아니다.
 - 운영 수집에서는 과거 800봉 재요청 대신 시간대별 최신 페이지 1회만 요청한다. TT는 기존 상태/이력을 활용하며 부족한 경우 준비 중 경고와 구조 목표로 진행한다.
 - 기존 가격 계획의 stop/targets/entry/ID 보존 테스트 유지. 넓은 손절(20%)에서도 기존 목표와 점수 유지 테스트 추가.
+- 배포 확인. 코드 커밋 43af290을 github/master:main으로 반영했고, 사용자 Worker의 dashboard-DaCe62gi.js와 schemaVersion 5를 확인했다. 2026-09-06 02:48:08 KST 분석 결과는 stale=false/error=null, 상세 대상 81개 중 47개 최신 분석/34개 첫 분석 대기/지연 0개였다. 그 시점 단타·스윙 후보는 0개이며 나머지 첫 순회는 계속 진행한다.
+- 배포 직후에는 이전 v4 캐시가 반환되었으나 이후 v5 갱신이 확인됐다. 정확한 이전 지연 원인은 원격 로그를 확보하지 않아 확정하지 않는다. 임의 잠금 해제나 원격 데이터 삭제는 하지 않았다.
+- 소스 ZIP은 release/upbit_recommender.zip이다. 이전 ZIP은 release/upbit_recommender-pre-opportunity-v5.zip으로 보존했다. 소스 ZIP에 환경 파일, node_modules, .git, .wrangler는 포함하지 않았다.
