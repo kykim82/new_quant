@@ -1,0 +1,2 @@
+streamlit==1.63.0
+nodejs-wheel==22.20.0
