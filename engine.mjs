@@ -2132,10 +2132,12 @@ async function main() {
       try {
         const payload = await refreshDashboard(db, { includeCharts: false });
         emit({ type: "snapshot", payload });
-        if (payload.error || payload.stale) {
-          emit({ type: "error", at: Date.now(), message: payload.error ?? "다른 분석이 실행 중이거나 잠금 만료를 기다립니다. Cloudflare 예약 분석 중지 여부를 확인해 주세요." });
+        if (payload.error) {
+          emit({ type: "error", at: Date.now(), message: payload.error });
         } else if (payload.source === "cached") {
-          emit({ type: "waiting", at: Date.now(), message: "중복 분석 방지를 위해 다음 실행 시각을 기다리고 있습니다." });
+          emit({ type: "waiting", at: Date.now(), message: payload.stale ? "분석 잠금·실행 간격 대기 중입니다. 저장된 결과도 오래되어 신규 추천을 중단하고 다음 실행에서 다시 확인합니다." : "중복 분석 방지를 위해 다음 실행 시각을 기다리고 있습니다. 최신 저장 결과를 표시합니다." });
+        } else if (payload.stale) {
+          emit({ type: "error", at: Date.now(), message: "분석 결과의 최신성을 확인하지 못했습니다. 다음 실행에서 다시 확인합니다." });
         } else {
           emit({ type: "completed", at: Date.now(), generatedAt: payload.generatedAt });
         }

@@ -16,13 +16,18 @@ def node_executable():
     return str(root / "node.exe" if os.name == "nt" else root / "bin" / "node")
 
 
+def fresh_payload(payload, now_ms):
+    return (not payload.get("stale") and not payload.get("error")
+            and 0 <= now_ms - payload["generatedAt"] <= 180_000)
+
+
 def public_snapshot(state, now_ms=None):
-    now_ms = now_ms or int(time.time() * 1000)
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     view = copy.deepcopy(state)
     payload = view.get("payload")
     if not payload:
         return view
-    stale = bool(payload.get("stale") or view.get("error") or now_ms - payload["generatedAt"] > 180_000)
+    stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
     for strategy in ("scalp", "swing"):
         payload[strategy] = [] if stale else [
@@ -68,13 +73,19 @@ class AnalysisWorker:
     def _accept(self, event):
         with self._lock:
             self._last_event = time.monotonic()
+            now_ms = int(time.time() * 1000)
             if event["type"] == "started":
                 self._state["running"] = True
                 self._state["started_at"] = event["at"]
+                self._state["waiting"] = None
             elif event["type"] == "snapshot":
-                self._state["payload"] = event["payload"]
+                payload = event["payload"]
+                self._state.update(payload=payload, received_at=now_ms)
+                # 다른 실행이 저장한 최신 정상 결과도 복구로 인정하되 자체 분석 완료로 기록하지 않는다.
+                if fresh_payload(payload, now_ms):
+                    self._state.update(error=None, error_at=None, waiting=None)
             elif event["type"] == "completed":
-                self._state.update(running=False, error=None, waiting=None, last_success=event["at"])
+                self._state.update(running=False, error=None, error_at=None, waiting=None, last_success=event["at"])
             elif event["type"] == "waiting":
                 self._state.update(running=False, waiting=event["message"])
             elif event["type"] == "error":
@@ -82,7 +93,7 @@ class AnalysisWorker:
                 token = self.credentials.get("CLOUDFLARE_API_TOKEN", "")
                 if token:
                     message = message.replace(token, "[숨김]")
-                self._state.update(running=False, error=message)
+                self._state.update(running=False, error=message, error_at=event.get("at", now_ms), waiting=None)
 
     def _read_events(self, process):
         for line in process.stdout:

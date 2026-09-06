@@ -110,11 +110,11 @@ def dashboard(worker):
         return
     if payload["stale"]:
         st.warning("분석 데이터가 오래되었거나 갱신에 실패했습니다. 신규 매수 추천을 숨겼습니다. 후보가 없다는 뜻은 아닙니다.")
-    elif state.get("waiting"):
+    if state.get("waiting"):
         st.info(state["waiting"])
     coverage = payload["coverage"]
     regime = {"BULLISH": "강세", "NEUTRAL": "중립", "RISK_OFF": "위험 회피"}.get(payload["marketRegime"], "확인 중")
-    status = "갱신 지연" if payload["stale"] else "분석 중 · 마지막 완료 결과 표시" if state["running"] else "자동 분석 정상"
+    status = "갱신 지연" if payload["stale"] else "분석 중 · 마지막 완료 결과 표시" if state["running"] else "다음 분석 대기" if state.get("waiting") else "자동 분석 정상"
     st.caption(f"{status} · BTC {regime} · 분석 {coverage['analyzedMarketCount']}/{coverage['eligibleMarketCount']}개 · 마지막 분석 {stamp(payload['generatedAt'])}")
     candidates = [*payload["scalp"], *payload["swing"]] if not payload["stale"] else []
     st.subheader("매수 후보 · 갱신 대기" if payload["stale"] else f"매수 후보 {len(candidates)}개")
@@ -141,6 +141,9 @@ def dashboard(worker):
                                    if not search or search in (o["koreanName"] + o["market"] + o["reason"]).lower()]),
                          hide_index=True, width="stretch")
     with st.expander("분석 범위·운영 상태"):
+        st.caption(f"최근 실행 시도 {stamp(state.get('started_at'))} · 결과 수신 {stamp(state.get('received_at'))} · 이 분석기 완료 {stamp(state.get('last_success'))}")
+        if state.get("error"):
+            st.caption(f"최근 오류 {stamp(state.get('error_at'))}")
         st.caption(f"전체 시세 {coverage['krwMarketCount']}개 · 기본 감시 {coverage.get('monitoringMarketCount', 0)}개 · 거래대금 증가 예외 {coverage.get('volumeGrowthMarketCount', 0)}개")
         st.caption("24시간 거래대금 10억 이상 또는 거래대금 증가 종목을 선별합니다. 분석은 서버에서 자동 실행되며 화면은 10초마다 결과를 확인합니다.")
         st.caption("단타는 15분 진입 봉, 스윙은 1시간 진입 봉과 4시간 추세를 사용합니다. 동일 종목의 두 계획은 독립적입니다.")
