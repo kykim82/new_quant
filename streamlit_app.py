@@ -21,6 +21,16 @@ def price(value):
     return f"{value:,.0f}원" if value >= 100 else f"{value:,.4f}".rstrip("0").rstrip(".") + "원"
 
 
+def current_quote(candidate):
+    value = candidate.get("currentPrice")
+    if value is None or not math.isfinite(value) or value <= 0:
+        return "미수신"
+    timestamp = candidate.get("currentPriceAt")
+    time_label = (datetime.fromtimestamp(timestamp / 1000, KST).strftime("%H:%M")
+                  if timestamp is not None and math.isfinite(timestamp) and timestamp > 0 else "시각 미수신")
+    return f"{price(value)} ({time_label})"
+
+
 def percent(value):
     return f"{value:+.2f}%"
 
@@ -69,7 +79,8 @@ def candidate_table(candidates, allow_entry=True):
             entry_status = "waiting"
         rows.append({"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})", "구분": strategy_name(c),
                      "진입 상태": {"ready": "진입 가능", "waiting": "대기", "stopped": "종료", "completed": "목표 완료"}.get(entry_status, "확인 중"),
-                     "매수가": price(p["entryAnchor"]), "손절가": f"{price(p['stop'])} ({percent(-p['riskPct'])})",
+                     "매수가": price(p["entryAnchor"]), "현재가": current_quote(c),
+                     "손절가": f"{price(p['stop'])} ({percent(-p['riskPct'])})",
                      **{f"{i + 1}차 목표가": f"{price(p['targets'][i])} ({percent((p['targets'][i] / p['entryAnchor'] - 1) * 100)})"
                         if i < len(p["targets"]) else "미산정" for i in range(3)},
                      "24h 거래대금": turnover(c.get("quoteVolume24h"))})
@@ -139,6 +150,7 @@ def dashboard(worker):
         st.warning("분석 갱신 대기 중입니다. 현재 매수 여부를 판단할 수 없습니다.")
     status = "갱신 지연" if stale else "분석 중 · 최근 결과 표시" if state["running"] else "자동 갱신 대기" if state.get("waiting") else "자동 분석 정상"
     st.caption(f"{status} · 마지막 분석 {stamp(payload['generatedAt'])}")
+    st.caption("현재가 괄호는 마지막으로 받은 업비트 시세의 기준 시각(KST)입니다.")
     candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
     tracking = payload.get("recommendations")
     shown = tracking["active"] if tracking is not None else candidates

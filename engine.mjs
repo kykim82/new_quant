@@ -1746,6 +1746,7 @@ async function recommendationDashboard(db, payload, now, tickers = []) {
     const current = live.get(record.candidate.plan.id);
     const ticker = prices.get(record.market);
     return { ...record.candidate, currentPrice: ticker?.tradePrice ?? current?.currentPrice,
+      currentPriceAt: ticker?.tradePrice != null ? ticker.timestamp : current?.currentPriceAt,
       quoteVolume24h: ticker?.quoteVolume24h ?? current?.quoteVolume24h,
       score: current?.rankingScore ?? current?.score ?? record.candidate.score,
       entryStatus: ready.has(record.candidate.plan.id) && !record.entryMissedAt ? "ready" : "waiting",
@@ -1863,6 +1864,7 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
         ...candidate,
         plan,
         currentPrice: ticker.tradePrice,
+        currentPriceAt: ticker.timestamp,
         quoteVolume24h: ticker.quoteVolume24h,
         entryStatus: observed.stoppedAt !== void 0 ? "stopped" : observed.completedAt !== void 0 ? "completed" : reason ? "waiting" : "ready",
         entryBlockReason: reason
@@ -1877,6 +1879,7 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
         accepted.push({
           ...candidate,
           currentPrice: ticker.tradePrice,
+          currentPriceAt: ticker.timestamp,
           quoteVolume24h: ticker.quoteVolume24h,
           signedChangeRate: ticker.signedChangeRate,
           warnings: withSpreadWarning(candidate.warnings, candidate.strategy, execution.spreadPct),
