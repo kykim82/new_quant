@@ -1,4 +1,4 @@
-# 단타·스윙의 진입 상태와 매수·손절·목표 가격 및 거래대금을 간결하게 표시한다.
+# 고정 추천의 가격·거래대금·종가 손절 상태와 DB 모의 추적 결과를 표시한다.
 import atexit
 import hashlib
 import math
@@ -68,7 +68,7 @@ def candidate_table(candidates, allow_entry=True):
         if not allow_entry and entry_status == "ready":
             entry_status = "waiting"
         rows.append({"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})", "구분": strategy_name(c),
-                     "진입 상태": {"ready": "진입 가능", "waiting": "대기", "stopped": "종료"}.get(entry_status, "확인 중"),
+                     "진입 상태": {"ready": "진입 가능", "waiting": "대기", "stopped": "종료", "completed": "목표 완료"}.get(entry_status, "확인 중"),
                      "매수가": price(p["entryAnchor"]), "손절가": f"{price(p['stop'])} ({percent(-p['riskPct'])})",
                      **{f"{i + 1}차 목표가": f"{price(p['targets'][i])} ({percent((p['targets'][i] / p['entryAnchor'] - 1) * 100)})"
                         if i < len(p["targets"]) else "미산정" for i in range(3)},
@@ -89,6 +89,42 @@ def observation_table(observations):
                          for row in grouped.values()], columns=["종목", "구분", "진입 상태", "24h 거래대금"])
 
 
+def tracking_status(candidate):
+    record = candidate["tracking"]
+    if candidate.get("trackingDelayed"):
+        return "추적 유지 · 갱신 대기"
+    if candidate.get("currentPrice") is not None and candidate["currentPrice"] < record["stop"]:
+        return "손절선 이탈 · 봉 마감 대기"
+    if record.get("entryMissedAt"):
+        return "미진입 · 목표 도달 추적"
+    if record["status"] == "open":
+        return f"{record['sold']}차 도달 · 모의 추적" if record["sold"] else "모의 진입 · 추적 중"
+    return "진입 가능 · 추적 중" if candidate.get("entryStatus") == "ready" else "추적 중 · 신규 진입 대기"
+
+
+def recommendation_table(candidates):
+    table = candidate_table(candidates).rename(columns={"진입 상태": "상태"})
+    if not table.empty:
+        table.insert(0, "순위", [c["rank"] for c in candidates])
+        table["상태"] = [tracking_status(c) for c in candidates]
+    return table
+
+
+def recommendation_history(records):
+    rows = []
+    for record in records:
+        candidate = record["candidate"]
+        result = ("평가 제외" if record.get("exclusions") else "체결 확인 대기" if record["status"] == "closing"
+                  else "미진입" if record["status"] == "unfilled" else percent(record["netPct"]))
+        rows.append({"최초 추천": stamp(record["createdAt"]), "종목": f"{candidate['koreanName']} ({record['market'].removeprefix('KRW-')})",
+                     "구분": strategy_name(candidate), "매수가": price(record["entry"]), "손절가": price(record["stop"]),
+                     "종료 시각": stamp(record.get("endedAt")),
+                     "종료 사유": "종가 손절" if record.get("exitReason") == "stop_close" else "3차 목표 도달",
+                     "모의 청산가": price(record["exitPrice"]) if record.get("exitPrice") is not None else "—",
+                     "비용 반영 모의 손익": result})
+    return pd.DataFrame(rows)
+
+
 @st.fragment(run_every="10s")
 def dashboard(worker):
     state = worker.snapshot()
@@ -104,16 +140,33 @@ def dashboard(worker):
     status = "갱신 지연" if stale else "분석 중 · 최근 결과 표시" if state["running"] else "자동 갱신 대기" if state.get("waiting") else "자동 분석 정상"
     st.caption(f"{status} · 마지막 분석 {stamp(payload['generatedAt'])}")
     candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
-    st.subheader("매수 후보 · 갱신 대기" if stale else f"매수 후보 {len(candidates)}개")
-    if candidates:
-        st.dataframe(candidate_table(candidates), hide_index=True, width="stretch", height=(len(candidates) + 1) * 35 + 3)
+    tracking = payload.get("recommendations")
+    shown = tracking["active"] if tracking is not None else candidates
+    st.subheader(f"추천 추적 {len(shown)}개" if tracking is not None else f"매수 후보 {len(shown)}개")
+    if shown:
+        table = recommendation_table(shown) if tracking is not None else candidate_table(shown)
+        st.dataframe(table, hide_index=True, width="stretch", height=min(738, (len(shown) + 1) * 35 + 3))
     elif not stale:
-        st.info("현재 진입 조건을 충족한 종목이 없습니다.")
-    active = {(c["market"], c["strategy"], c["plan"].get("id")) for c in candidates}
+        st.info("현재 추적 중인 추천이 없습니다.")
+    if tracking is not None:
+        st.caption("단타 15분·스윙 1시간 종가가 손절가 아래에서 마감하면 종료합니다. 장중 이탈·순위 하락만으로 제외하지 않습니다.")
+        with st.expander("추천 추적 이력 · 모의 성과"):
+            summary = tracking["summary"]
+            evaluated = summary.get("evaluated") or 0
+            st.caption(f"전체 기록 {summary.get('total', 0)}건 · 평가 완료 {evaluated}건 · 미진입 종료 {summary.get('unfilled') or 0}건 · 평가 제외 {summary.get('excluded') or 0}건")
+            if evaluated:
+                st.write(f"비용 반영 모의 수익 거래 비율 {(summary.get('wins') or 0) / evaluated * 100:.1f}% · 평균 손익 {percent(summary['meanNetPct'])}")
+            else:
+                st.info("평가가 완료된 모의 거래가 아직 없습니다.")
+            st.caption("실제 주문·체결이 아닙니다. 추천 이후 완료된 15분봉의 매수가 터치를 모의 진입으로 봅니다. 목표는 1/3씩 청산하고 종가 손절은 확인 이후 다음 관측 15분봉 시가로 계산합니다. 데이터 공백·체결 순서 불명은 통계에서 제외합니다.")
+            if tracking["history"]:
+                st.dataframe(recommendation_history(tracking["history"]), hide_index=True, width="stretch")
+            st.caption("종료 이력은 최근 100건과 청산 확인 대기 건을 표시합니다. 전체 기록과 최초 선별 지표는 DB에 보존하며 구형 손절 규칙 통계와 합산하지 않습니다.")
+    active = {(c["market"], c["strategy"], c["plan"].get("id")) for c in shown}
     plans = [p for p in payload.get("savedPlans", []) if (p["market"], p["strategy"], p["plan"].get("id")) not in active]
     if plans:
         with st.expander(f"기존 매매 계획 {len(plans)}개"):
-            st.caption("현재 매수 후보가 아닌 이전 계획입니다.")
+            st.caption("새 추천 추적 원장에 없는 이전 분석 계획입니다.")
             st.dataframe(candidate_table(plans, allow_entry=False), hide_index=True, width="stretch")
     observations = payload.get("watchlist", [])
     if observations:

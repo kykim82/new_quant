@@ -37,9 +37,17 @@ def public_snapshot(state, now_ms=None):
         ]
     # 원래 분석 시각·가격 계획은 유지하고 현재 시각으로 신규 진입만 막는다.
     for plan in payload.get("savedPlans", []):
-        if plan.get("entryStatus") != "stopped" and (stale or plan.get("entryValidUntil", 0) <= now_ms):
+        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or plan.get("entryValidUntil", 0) <= now_ms):
             plan["entryStatus"] = "waiting"
             plan["entryBlockReason"] = "최신 분석과 진입 조건 재확인 대기"
+    # 분석 지연이나 진입 만료는 추천 원장을 삭제하거나 종료시키지 않는다.
+    for recommendation in payload.get("recommendations", {}).get("active", []):
+        if stale or recommendation.get("entryValidUntil", 0) <= now_ms:
+            recommendation["entryStatus"] = "waiting"
+        record = recommendation["tracking"]
+        duration = record["stopTimeframe"] * 60_000
+        recommendation["trackingDelayed"] = (stale or now_ms // 900_000 * 900_000 > record["lastClose"]
+                                              or now_ms // duration * duration > record["stopCheckedThrough"])
     for row in payload.get("watchlist", []):
         if now_ms - row.get("analyzedAt", 0) > 1_200_000:
             row["reason"] = "분석 지연 · 재분석 대기"
