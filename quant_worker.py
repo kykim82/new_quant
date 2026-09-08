@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import threading
@@ -64,6 +65,8 @@ class AnalysisWorker:
         self._process = None
         self._last_event = time.monotonic()
         self._state = {"payload": None, "running": False, "error": None, "last_success": None}
+        self._detail_market = None
+        self._detail = {"market": None, "payload": None, "error": None, "running": False}
 
     def start(self):
         with self._lock:
@@ -78,11 +81,46 @@ class AnalysisWorker:
         with self._lock:
             return public_snapshot(self._state)
 
+    def request_detail(self, market):
+        if market is not None and not re.fullmatch(r"KRW-[A-Z0-9]{1,20}", market):
+            raise ValueError("종목 코드를 확인해 주세요.")
+        with self._lock:
+            if market == self._detail_market:
+                return
+            self._detail_market = market
+            self._detail = {"market": market, "payload": None, "error": None, "running": bool(market)}
+            self._send_detail()
+
+    def _send_detail(self):
+        # 호출자는 잠금을 보유한다. 자식 재시작 시에도 선택 종목을 다시 전달한다.
+        if self._process and self._process.poll() is None and self._process.stdin:
+            try:
+                self._process.stdin.write(json.dumps({"type": "detail", "market": self._detail_market}) + "\n")
+                self._process.stdin.flush()
+            except (OSError, ValueError):
+                self._detail["error"] = "분석기 재연결 대기 중입니다."
+
+    def detail_snapshot(self):
+        with self._lock:
+            return copy.deepcopy(self._detail)
+
     def _accept(self, event):
         with self._lock:
             self._last_event = time.monotonic()
             now_ms = int(time.time() * 1000)
-            if event["type"] == "started":
+            if event["type"].startswith("detail"):
+                market = event.get("payload", {}).get("market", event.get("market"))
+                if market != self._detail_market:
+                    return
+                if event["type"] == "detail":
+                    self._detail.update(payload=event["payload"], error=None, running=False)
+                elif event["type"] == "detail_started":
+                    self._detail["running"] = True
+                elif event["type"] == "detail_error":
+                    message = str(event["message"])
+                    token = self.credentials.get("CLOUDFLARE_API_TOKEN", "")
+                    self._detail.update(error=message.replace(token, "[숨김]") if token else message, running=False)
+            elif event["type"] == "started":
                 self._state["running"] = True
                 self._state["started_at"] = event["at"]
                 self._state["waiting"] = None
@@ -107,7 +145,7 @@ class AnalysisWorker:
         for line in process.stdout:
             try:
                 event = json.loads(line)
-                if isinstance(event, dict) and event.get("type") in {"started", "snapshot", "completed", "waiting", "error"}:
+                if isinstance(event, dict) and event.get("type") in {"started", "snapshot", "completed", "waiting", "error", "detail", "detail_started", "detail_error"}:
                     self._accept(event)
             except (ValueError, KeyError, TypeError):
                 # 라이브러리 경고는 서버 로그에만 남기며 비밀을 포함한 원문을 화면에 보내지 않는다.
@@ -119,12 +157,13 @@ class AnalysisWorker:
                 environment = os.environ.copy()
                 environment.update(self.credentials)
                 flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                process = subprocess.Popen(self.command, env=environment, stdout=subprocess.PIPE,
+                process = subprocess.Popen(self.command, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                                            creationflags=flags)
                 with self._lock:
                     self._process = process
                     self._last_event = time.monotonic()
+                    self._send_detail()
                 reader = threading.Thread(target=self._read_events, args=(process,), daemon=True)
                 reader.start()
                 while process.poll() is None and not self._stop.wait(1):
@@ -141,6 +180,7 @@ class AnalysisWorker:
                 process.wait()
                 reader.join(timeout=2)
                 process.stdout.close()
+                process.stdin.close()
                 with self._lock:
                     self._process = None
                     self._state["running"] = False
