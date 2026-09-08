@@ -22,6 +22,16 @@ def fresh_payload(payload, now_ms):
             and 0 <= now_ms - payload["generatedAt"] <= 180_000)
 
 
+def quality_current(quality, now_ms):
+    if not quality or quality.get("version") != 1 or not quality.get("ready"):
+        return False
+    frames = quality.get("frames", {})
+    return all(frames.get(str(unit), {}).get("ready") for unit in (60, 240, 1440)) and all(
+        q.get("ready") and q.get("latestActualClose") == now_ms // (int(unit) * 60_000) * (int(unit) * 60_000)
+        for unit, q in frames.items()
+    )
+
+
 def public_snapshot(state, now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     view = copy.deepcopy(state)
@@ -30,21 +40,26 @@ def public_snapshot(state, now_ms=None):
         return view
     stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
+    payload["promising"] = [] if stale else [c for c in payload.get("promising", [])
+        if c.get("dailyQuality", {}).get("ready")
+        and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
     for strategy in ("scalp", "swing"):
         payload[strategy] = [] if stale else [
             c for c in payload.get(strategy, [])
             if c.get("entryStatus", "ready") == "ready"
+            and quality_current(c.get("dataQuality"), now_ms)
             and c.get("entryValidUntil", c["plan"]["expiresAt"]) > now_ms
         ]
     # 원래 분석 시각·가격 계획은 유지하고 현재 시각으로 신규 진입만 막는다.
     for plan in payload.get("savedPlans", []):
-        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or plan.get("entryValidUntil", 0) <= now_ms):
+        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or not quality_current(plan.get("dataQuality"), now_ms) or plan.get("entryValidUntil", 0) <= now_ms):
             plan["entryStatus"] = "waiting"
             plan["entryBlockReason"] = "최신 분석과 진입 조건 재확인 대기"
     # 분석 지연이나 진입 만료는 추천 원장을 삭제하거나 종료시키지 않는다.
     for recommendation in payload.get("recommendations", {}).get("active", []):
-        if stale or recommendation.get("entryValidUntil", 0) <= now_ms:
+        if stale or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
             recommendation["entryStatus"] = "waiting"
+            recommendation["currentAssessment"] = None
         record = recommendation["tracking"]
         duration = record["stopTimeframe"] * 60_000
         recommendation["trackingDelayed"] = (stale or now_ms // 900_000 * 900_000 > record["lastClose"]

@@ -171,16 +171,29 @@ def ma_direction(averages, period):
 
 
 def render_detail(detail, stale=False):
+    now_ms = int(datetime.now(KST).timestamp() * 1000)
     trend_names = {"transition": "역배열 탈출 시도", "up": "상승 추세", "down": "하락 추세", "mixed": "방향 전환 관찰", "unknown": "이력 부족"}
     alignment_names = {"bullish": "정배열", "bearish": "역배열", "mixed": "혼합 배열", "unknown": "이력 부족"}
     st.write(f"{detail['koreanName']} · 현재가 {current_quote(detail)} · 24h 거래대금 {turnover(detail.get('quoteVolume24h'))}")
     st.caption(f"마지막 상세 분석 {stamp(detail['generatedAt'])} · 완료된 봉 기준입니다.")
     for tab, unit in zip(st.tabs(["15분", "1시간", "4시간", "일봉"]), ("15", "60", "240", "1440")):
         with tab:
-            frame = detail["frames"][unit]
+            frame = dict(detail["frames"][unit])
+            if frame["asOf"] != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
+                frame["valid"] = False
+                frame["ready"] = False
+            if unit in ("15", "60") and detail["frames"]["1440"]["asOf"] != now_ms // 86_400_000 * 86_400_000:
+                frame["ready"] = False
+                frame["reason"] = "최신 일봉 수집 대기"
             averages = frame["averages"]
             st.write(f"{trend_names[averages['state']]} · {alignment_names[averages['alignment']]}")
             st.caption(f"확인한 봉 마감 {stamp(frame['asOf'])}")
+            quality = frame.get("quality")
+            if quality:
+                st.caption(f"실제 봉 {quality['actualBars']}개 · 필요 이력 {quality['required']}개 · 공백 {quality['gapCount']}개 · {quality['reason']}")
+                st.caption(f"마지막 실제 봉 마감 {stamp(quality['latestActualClose'])}")
+                if quality.get("exhausted") and quality["actualBars"] < quality["required"]:
+                    st.caption("거래소 과거 이력의 끝을 확인했습니다. 존재하지 않는 장기 이평선은 계산하지 않습니다.")
             if stale or not frame["valid"]:
                 st.warning("최신 완료 봉 확인 대기 중입니다. 아래 값은 이전 분석 참고용입니다.")
             if unit in ("15", "60"):
@@ -298,6 +311,7 @@ def dashboard(worker):
     status = "갱신 지연" if stale else "분석 중 · 최근 결과 표시" if state["running"] else "자동 갱신 대기" if state.get("waiting") else "자동 분석 정상"
     st.caption(f"{status} · 마지막 분석 {stamp(payload['generatedAt'])}")
     st.caption("현재가 괄호는 마지막으로 받은 업비트 시세의 기준 시각(KST)입니다.")
+    st.caption("신규 추천은 최신 완료 일봉과 필수 시간대의 실제 봉·지표 이력 확인 후 표시합니다. 수집·복구 대기 중에도 기존 추천 기록은 보존합니다.")
     candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
     tracking = payload.get("recommendations")
     shown = tracking["active"] if tracking is not None else candidates
