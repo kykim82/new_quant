@@ -153,15 +153,21 @@ def normalize_symbol(value):
 
 
 def detail_price_table(frames):
-    def cell(value):
-        return price(value) if isinstance(value, (int, float)) and math.isfinite(value) and value > 0 else "—"
+    def cell(value, entry=None):
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            return "—"
+        label = price(value)
+        if isinstance(entry, (int, float)) and math.isfinite(entry) and entry > 0:
+            label += f" ({percent((value / entry - 1) * 100)})"
+        return label
 
     rows = []
     for unit, label in (("15", "15분"), ("60", "1시간"), ("240", "4시간"), ("1440", "일봉")):
         plan = frames.get(unit, {}).get("plan") or {}
+        entry = plan.get("entryAnchor")
         targets = plan.get("targets") or []
-        rows.append({"시간대": label, "매수가": cell(plan.get("entryAnchor")), "손절가": cell(plan.get("stop")),
-                     **{f"{i + 1}차 목표가": cell(targets[i]) if i < len(targets) else "—" for i in range(3)}})
+        rows.append({"시간대": label, "매수가": cell(entry), "손절가": cell(plan.get("stop"), entry),
+                     **{f"{i + 1}차 목표가": cell(targets[i], entry) if i < len(targets) else "—" for i in range(3)}})
     return pd.DataFrame(rows)
 
 
