@@ -152,89 +152,40 @@ def normalize_symbol(value):
     return code
 
 
-def detail_price_table(plan):
-    entry = plan["entryAnchor"]
-    return pd.DataFrame([{"항목": "매수가", "가격": price(entry)},
-                         {"항목": "손절가", "가격": f"{price(plan['stop'])} ({percent(-plan['riskPct'])})"},
-                         *[{"항목": f"{i + 1}차 목표가", "가격": f"{price(target)} ({percent((target / entry - 1) * 100)})"}
-                           for i, target in enumerate(plan["targets"])]])
+def detail_price_table(frames):
+    def cell(value):
+        return price(value) if isinstance(value, (int, float)) and math.isfinite(value) and value > 0 else "—"
 
-
-def ma_direction(averages, period):
-    changes = averages.get("previousBarChanges")
-    if changes is None:
-        return "갱신 대기"
-    change = changes.get(period)
-    if change is None or not math.isfinite(change):
-        return "이력 부족"
-    return "상승" if change > 0 else "하락" if change < 0 else "보합"
+    rows = []
+    for unit, label in (("15", "15분"), ("60", "1시간"), ("240", "4시간"), ("1440", "일봉")):
+        plan = frames.get(unit, {}).get("plan") or {}
+        targets = plan.get("targets") or []
+        rows.append({"시간대": label, "매수가": cell(plan.get("entryAnchor")), "손절가": cell(plan.get("stop")),
+                     **{f"{i + 1}차 목표가": cell(targets[i]) if i < len(targets) else "—" for i in range(3)}})
+    return pd.DataFrame(rows)
 
 
 def render_detail(detail, stale=False):
     now_ms = int(datetime.now(KST).timestamp() * 1000)
-    trend_names = {"transition": "역배열 탈출 시도", "up": "상승 추세", "down": "하락 추세", "mixed": "방향 전환 관찰", "unknown": "이력 부족"}
-    alignment_names = {"bullish": "정배열", "bearish": "역배열", "mixed": "혼합 배열", "unknown": "이력 부족"}
     st.write(f"{detail['koreanName']} · 현재가 {current_quote(detail)} · 24h 거래대금 {turnover(detail.get('quoteVolume24h'))}")
-    st.caption(f"마지막 상세 분석 {stamp(detail['generatedAt'])} · 완료된 봉 기준입니다.")
-    for tab, unit in zip(st.tabs(["15분", "1시간", "4시간", "일봉"]), ("15", "60", "240", "1440")):
-        with tab:
-            frame = dict(detail["frames"][unit])
-            if frame["asOf"] != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
-                frame["valid"] = False
-                frame["ready"] = False
-            if unit in ("15", "60") and detail["frames"]["1440"]["asOf"] != now_ms // 86_400_000 * 86_400_000:
-                frame["ready"] = False
-                frame["reason"] = "최신 일봉 수집 대기"
-            averages = frame["averages"]
-            st.write(f"{trend_names[averages['state']]} · {alignment_names[averages['alignment']]}")
-            st.caption(f"확인한 봉 마감 {stamp(frame['asOf'])}")
-            quality = frame.get("quality")
-            if quality:
-                st.caption(f"실제 봉 {quality['actualBars']}개 · 필요 이력 {quality['required']}개 · 공백 {quality['gapCount']}개 · {quality['reason']}")
-                st.caption(f"마지막 실제 봉 마감 {stamp(quality['latestActualClose'])}")
-                if quality.get("exhausted") and quality["actualBars"] < quality["required"]:
-                    st.caption("거래소 과거 이력의 끝을 확인했습니다. 존재하지 않는 장기 이평선은 계산하지 않습니다.")
-            if stale or not frame["valid"]:
-                st.warning("최신 완료 봉 확인 대기 중입니다. 아래 값은 이전 분석 참고용입니다.")
-            if unit in ("15", "60"):
-                st.write("신규 진입 조건 충족" if frame["ready"] and not stale and frame["valid"] else "신규 진입 대기")
-                st.caption("이전 분석입니다. 최신 조건 재확인을 기다려 주세요." if stale else frame.get("reason", ""))
-                if frame.get("plan"):
-                    st.dataframe(detail_price_table(frame["plan"]), hide_index=True, width="stretch")
-                    st.caption("현재 혼합 산식의 재계산 가격입니다. 진입 대기 중인 가격은 즉시 매수 추천이 아닙니다.")
-                else:
-                    st.info("현재 데이터로 유효한 매매 가격을 산정하지 못했습니다.")
-            elif unit == "240":
-                st.caption("스윙의 상위 추세를 확인합니다. 매수가·손절가·목표가는 1시간 탭에 있습니다.")
-            else:
-                st.caption("일봉은 종목 선별용 추세만 확인하며 매매 가격은 산정하지 않습니다.")
-                selection = frame.get("selection")
-                if selection and selection.get("version") == 2:
-                    st.write("일봉 근거 · " + " / ".join(selection["recommendation"]["labels"]) if selection["recommendation"]["labels"] else "일봉 매수 배경 확인 대기")
-                    for reason in selection["recommendation"]["reasons"]:
-                        st.caption(reason)
-                    preparation = selection["preparation"]
-                    if preparation.get("gain20Pct") is not None and preparation.get("extension20Pct") is not None:
-                        st.caption(f"유망 준비 범위 {'충족' if preparation['early'] else '초과'} · 최근 20일 저가 대비 {percent(preparation['gain20Pct'])} · SMA20 이격 {percent(preparation['extension20Pct'])}. 추천 배제 조건은 아닙니다.")
-                    st.caption("유망 준비 조건 충족" if selection["promising"] else "유망 준비 조건 미충족 · 추천 가능 여부와는 별개입니다.")
-            with st.expander("이평선·보조 지표 자세히"):
-                st.caption("이평선 방향은 직전 완료 봉 대비입니다. 진행 중인 봉의 실시간 움직임은 반영하지 않습니다.")
-                rows = [{"이평선": f"SMA {p}", "가격": price(averages["ma"][p]) if averages["ma"][p] is not None else "이력 부족",
-                         "방향 (직전봉 대비)": ma_direction(averages, p)}
-                        for p in averages["ma"]]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-                number = lambda n: f"{n:.1f}" if n is not None else "미산정"
-                st.write(f"RSI {number(frame['rsi'])} · 슈퍼트렌드 {'상승' if frame['supertrend'] == 1 else '하락' if frame['supertrend'] == -1 else '이력 준비'} · 타겟 트렌드 {'상승' if frame['targetTrend'] is True else '하락' if frame['targetTrend'] is False else '이력 준비'}")
-                st.write("트리플 스토캐스틱 K / D · " + " · ".join(f"{label} {number(s['k'])} / {number(s['d'])}"
-                         for label, s in zip(("단기", "중기", "장기"), frame["stochastic"])))
-                if averages["crosses"]:
-                    st.caption("최근 5봉 상향 돌파 이평선 · " + ", ".join(averages["crosses"]))
-                st.caption(f"계산 이력 {frame['bars']}봉 · Target Trend 원안 BigBeluga, CC BY-NC-SA 4.0. 초기 이력·무거래 봉 처리에 따라 TradingView 값과 다를 수 있습니다.")
+    st.caption(f"마지막 상세 분석 {stamp(detail['generatedAt'])}")
+    frames = detail.get("frames", {})
+    st.dataframe(detail_price_table(frames), hide_index=True, width="stretch", height=178)
+    delayed = []
+    for unit, label in (("15", "15분"), ("60", "1시간"), ("240", "4시간"), ("1440", "일봉")):
+        frame = frames.get(unit, {})
+        width = int(unit) * 60_000
+        if not frame.get("valid") or frame.get("asOf") != now_ms // width * width:
+            delayed.append(label)
+    if stale:
+        st.warning("갱신 지연 · 표시 가격은 이전 분석 참고값입니다.")
+    elif delayed:
+        st.warning(f"{'·'.join(delayed)} 데이터 확인 대기 · 해당 가격은 참고값입니다.")
 
 
 @st.fragment(run_every="10s")
 def symbol_panel(worker):
-    st.subheader("3. 종목 상세 분석")
+    st.subheader("4. 종목 상세 분석")
     with st.form("symbol-detail-form"):
         value = st.text_input("종목 코드", placeholder="예. SOPH, SUI, BTC")
         submitted = st.form_submit_button("분석·자동 갱신")
@@ -247,7 +198,6 @@ def symbol_panel(worker):
             st.error(str(error))
     market = st.session_state.get("detail_market")
     if not market:
-        st.caption("관심 종목이나 보유 종목 하나를 입력해 시간대별 상태를 확인하세요.")
         return
     if st.button("상세 자동 갱신 중지"):
         if worker.detail_snapshot()["market"] == market:
@@ -261,11 +211,12 @@ def symbol_panel(worker):
     if state["market"] != market:
         st.info("다른 접속에서 상세 종목이 변경되었습니다. 분석 버튼을 눌러 다시 선택해 주세요.")
         return
-    if state.get("error"):
-        st.warning(f"상세 갱신 대기. {state['error']}")
     detail = state.get("payload")
     if not detail:
-        st.info("추천 분석을 마친 뒤 순서대로 조회합니다. 첫 분석은 다음 주기까지 기다릴 수 있습니다.")
+        if state.get("error"):
+            st.warning(f"상세 갱신 대기. {state['error']}")
+        else:
+            st.info("상세 분석 준비 중입니다.")
         return
     stale = bool(state.get("error")) or datetime.now(KST).timestamp() * 1000 - detail["generatedAt"] > 180_000
     render_detail(detail, stale)
@@ -278,7 +229,6 @@ def symbol_panel(worker):
             if history:
                 st.dataframe(recommendation_history(history), hide_index=True, width="stretch")
             st.caption("추천 당시 가격과 모의 추적입니다. 실제 보유 여부나 실제 체결 내역은 아닙니다.")
-    st.caption("초기 지표 이력은 순차 보충합니다. 선택 종목은 분석기 실행 중 약 1분 간격으로 갱신하며 앱 휴면·종료 동안 실시간 감시는 보장되지 않습니다.")
 
 
 def recommendation_history(records):
@@ -354,9 +304,16 @@ def main():
     key = hashlib.sha256(json_settings(settings).encode() + revision).hexdigest()
     worker = get_worker(key, settings)
     dashboard(worker)
+    surge_panel()
     symbol_panel(worker)
     st.divider()
     st.caption("자동 주문 없음 · 표시 수익률은 매수가 기준이며 비용 차감 전입니다.")
+    st.caption("Target Trend 원안 BigBeluga · [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)")
+
+
+def surge_panel():
+    st.subheader("3. 급등 코인")
+    st.caption("급등 전 패턴 유사 종목 · 준비 중")
 
 
 def json_settings(settings):
