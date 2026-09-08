@@ -150,6 +150,16 @@ def detail_price_table(plan):
                            for i, target in enumerate(plan["targets"])]])
 
 
+def ma_direction(averages, period):
+    changes = averages.get("previousBarChanges")
+    if changes is None:
+        return "갱신 대기"
+    change = changes.get(period)
+    if change is None or not math.isfinite(change):
+        return "이력 부족"
+    return "상승" if change > 0 else "하락" if change < 0 else "보합"
+
+
 def render_detail(detail, stale=False):
     trend_names = {"transition": "역배열 탈출 시도", "up": "상승 추세", "down": "하락 추세", "mixed": "방향 전환 관찰", "unknown": "이력 부족"}
     alignment_names = {"bullish": "정배열", "bearish": "역배열", "mixed": "혼합 배열", "unknown": "이력 부족"}
@@ -176,8 +186,9 @@ def render_detail(detail, stale=False):
             else:
                 st.caption("일봉은 종목 선별용 추세만 확인하며 매매 가격은 산정하지 않습니다.")
             with st.expander("이평선·보조 지표 자세히"):
+                st.caption("이평선 방향은 직전 완료 봉 대비입니다. 진행 중인 봉의 실시간 움직임은 반영하지 않습니다.")
                 rows = [{"이평선": f"SMA {p}", "가격": price(averages["ma"][p]) if averages["ma"][p] is not None else "이력 부족",
-                         "방향": "상승" if (averages["slopes"][p] or 0) > 0 else "하락" if (averages["slopes"][p] or 0) < 0 else "보합·미확인"}
+                         "방향 (직전봉 대비)": ma_direction(averages, p)}
                         for p in averages["ma"]]
                 st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
                 number = lambda n: f"{n:.1f}" if n is not None else "미산정"

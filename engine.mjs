@@ -658,6 +658,9 @@ function movingAverageState(candles) {
   const at = (offset = 0) => Object.fromEntries(MA_PERIODS.map((p) => [p, simpleAverage(offset ? closes.slice(0, -offset) : closes, p)]));
   const ma = at(), previous = at(3);
   const slopes = Object.fromEntries(MA_PERIODS.map((p) => [p, ma[p] !== null && previous[p] !== null ? ma[p] - previous[p] : null]));
+  // 표시는 직전 완료 봉 대비, 선별용 slopes는 기존 3봉 대비를 유지한다.
+  const previousBarChanges = Object.fromEntries(MA_PERIODS.map((p) => [p,
+    ma[p] !== null && closes.length > p && Number.isFinite(closes.at(-p - 1)) ? (closes.at(-1) - closes.at(-p - 1)) / p : null]));
   const available = MA_PERIODS.filter((p) => ma[p] !== null);
   const pairs = available.slice(1).map((p, i) => [available[i], p]);
   const alignment = pairs.length < 2 ? "unknown" : pairs.every(([a, b]) => ma[a] > ma[b]) ? "bullish" : pairs.every(([a, b]) => ma[a] < ma[b]) ? "bearish" : "mixed";
@@ -673,7 +676,7 @@ function movingAverageState(candles) {
   const turning = reverseRecently && ma[7] > ma[20] && closes.at(-1) > ma[20] && slopes[7] > 0 && slopes[20] > 0 && (compressing || crosses.length > 0);
   const up = ma[60] !== null && closes.at(-1) > ma[20] && ma[20] > ma[60] && slopes[20] > 0 && slopes[60] > 0;
   const state = ma[60] === null || previous[60] === null ? "unknown" : turning ? "transition" : up ? "up" : closes.at(-1) < ma[20] && slopes[20] < 0 ? "down" : "mixed";
-  return { state, alignment, ma, slopes, available, crosses: [...new Set(crosses)], compressing, reverseRecently };
+  return { state, alignment, ma, slopes, previousBarChanges, available, crosses: [...new Set(crosses)], compressing, reverseRecently };
 }
 function dailySelection(candles = [], now) {
   const bars = candles.filter((c) => c.closeTime <= boundaryFor(1440, now));
