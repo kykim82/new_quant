@@ -120,7 +120,17 @@ def recommendation_table(candidates):
     if not table.empty:
         table.insert(0, "순위", [c["rank"] for c in candidates])
         table["상태"] = [tracking_status(c) for c in candidates]
+        table.insert(3, "현재 판단", [recommendation_reason(c) for c in candidates])
     return table
+
+
+def recommendation_reason(candidate):
+    assessment = candidate.get("currentAssessment")
+    if not assessment or assessment.get("version") != 2:
+        return "근거 갱신 대기 · 기존 추적"
+    labels = "·".join(assessment.get("labels", [])) or "일봉 배경 확인 대기"
+    status = "신규 진입 가능" if candidate.get("entryStatus") == "ready" else "신규 진입 대기"
+    return f"{labels} · {status}"
 
 
 def strategy_rows(candidates, strategy):
@@ -185,6 +195,15 @@ def render_detail(detail, stale=False):
                 st.caption("스윙의 상위 추세를 확인합니다. 매수가·손절가·목표가는 1시간 탭에 있습니다.")
             else:
                 st.caption("일봉은 종목 선별용 추세만 확인하며 매매 가격은 산정하지 않습니다.")
+                selection = frame.get("selection")
+                if selection and selection.get("version") == 2:
+                    st.write("일봉 근거 · " + " / ".join(selection["recommendation"]["labels"]) if selection["recommendation"]["labels"] else "일봉 매수 배경 확인 대기")
+                    for reason in selection["recommendation"]["reasons"]:
+                        st.caption(reason)
+                    preparation = selection["preparation"]
+                    if preparation.get("gain20Pct") is not None and preparation.get("extension20Pct") is not None:
+                        st.caption(f"유망 준비 범위 {'충족' if preparation['early'] else '초과'} · 최근 20일 저가 대비 {percent(preparation['gain20Pct'])} · SMA20 이격 {percent(preparation['extension20Pct'])}. 추천 배제 조건은 아닙니다.")
+                    st.caption("유망 준비 조건 충족" if selection["promising"] else "유망 준비 조건 미충족 · 추천 가능 여부와는 별개입니다.")
             with st.expander("이평선·보조 지표 자세히"):
                 st.caption("이평선 방향은 직전 완료 봉 대비입니다. 진행 중인 봉의 실시간 움직임은 반영하지 않습니다.")
                 rows = [{"이평선": f"SMA {p}", "가격": price(averages["ma"][p]) if averages["ma"][p] is not None else "이력 부족",
@@ -282,7 +301,10 @@ def dashboard(worker):
     candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
     tracking = payload.get("recommendations")
     shown = tracking["active"] if tracking is not None else candidates
+    if stale:
+        shown = [{**c, "currentAssessment": None, "entryStatus": "waiting"} for c in shown]
     st.subheader("1. 추천 종목")
+    st.caption("돌파·추세 유지·눌림의 현재 매수 근거를 평가합니다. 과거 상승폭만으로 제외하지 않으며, 신규 진입 가능 여부와 최신 점수 순으로 표시합니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
@@ -300,7 +322,7 @@ def dashboard(worker):
         st.dataframe(promising_table(promising), hide_index=True, width="stretch")
     else:
         st.info("현재 유망 조건을 충족한 종목이 없거나 일봉 이력을 수집 중입니다.")
-    st.caption("추천과 겹치지 않는 일봉 추세 개선·거래량 증가 종목입니다. 아직 매수 추천은 아닙니다.")
+    st.caption("상승 전 역배열 해소 준비·장기 이평선 부근 유지 종목입니다. 최근 20일 저가 대비 +20% 이내, SMA20 위 이격 +8% 이내를 초기 기준으로 사용하며 추천에는 이 제한을 적용하지 않습니다. 추천 중복은 숨깁니다.")
 
 
 def main():

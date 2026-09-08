@@ -678,6 +678,45 @@ function movingAverageState(candles) {
   const state = ma[60] === null || previous[60] === null ? "unknown" : turning ? "transition" : up ? "up" : closes.at(-1) < ma[20] && slopes[20] < 0 ? "down" : "mixed";
   return { state, alignment, ma, slopes, previousBarChanges, available, crosses: [...new Set(crosses)], compressing, reverseRecently };
 }
+function dailySetups(bars, trend) {
+  const closes = bars.map((c) => c.close), close = closes.at(-1), ma = trend.ma;
+  const range = lastValue(atr(bars, 14));
+  const valueAt = (period, offset) => simpleAverage(offset ? closes.slice(0, -offset) : closes, period);
+  // 과거 각 봉 당시의 이평선을 사용한다. 미래 지지 성공이나 진입 필수 조건이 아니다.
+  const supports = [7, 20, 60, 100, 200].filter((p) => {
+    if (!(range > 0) || ma[p] === null || trend.slopes[p] === null || trend.slopes[p] < 0 || close < ma[p]) return false;
+    let holds = 0, approaches = 0;
+    for (let offset = 0; offset < 5; offset++) {
+      const b = bars.at(-offset - 1), level = valueAt(p, offset);
+      if (!b || level === null) continue;
+      if (b.close >= level) {
+        holds++;
+        if (b.low <= level + range * 0.35 && b.low >= level - range * 0.5) approaches++;
+      }
+    }
+    return holds >= 4 && approaches > 0;
+  });
+  const breakouts = [60, 100, 200].filter((p) => ma[p] !== null && close > ma[p] && [0, 1, 2].some((offset) => {
+    const current = valueAt(p, offset), past = valueAt(p, offset + 1);
+    return current !== null && past !== null && closes.at(-offset - 1) > current && closes.at(-offset - 2) <= past;
+  }));
+  const healthy = ma[20] !== null && close >= ma[20] && trend.slopes[20] > 0;
+  const maintaining = healthy && supports.includes(7) && close - ma[7] <= range;
+  const pullback = healthy && close < ma[7] && close - ma[20] <= range;
+  const labels = [], reasons = [];
+  if (breakouts.length) { labels.push("돌파·전환형"); reasons.push(`${breakouts.join("·")}일선 최근 3봉 내 상향 돌파`); }
+  if (maintaining) { labels.push("추세 유지형"); reasons.push("상승 7일선 위 가격 유지 · 최근 5봉 중 4봉 이상"); }
+  if (pullback) { labels.push("눌림형"); reasons.push("상승 20일선 부근 눌림 · 지지 성공 확정 아님"); }
+  if (!labels.length && trend.state === "transition") { labels.push("돌파·전환형"); reasons.push("일봉 역배열 간격 축소·단기선 상승 전환"); }
+  if (!labels.length && trend.state === "up") { labels.push("상승 추세형"); reasons.push("일봉 상승 배열 유지"); }
+  if (!labels.length) reasons.push("일봉 매수 배경 확인 대기");
+  const gain20Pct = bars.length >= 20 ? (close / Math.min(...bars.slice(-20).map((c) => c.low)) - 1) * 100 : null;
+  const extension20Pct = ma[20] > 0 ? (close / ma[20] - 1) * 100 : null;
+  const early = gain20Pct !== null && extension20Pct !== null && gain20Pct <= 20 && extension20Pct <= 8;
+  const reversalPreparing = trend.reverseRecently && trend.compressing && ma[7] >= ma[20] && trend.slopes[7] > 0 && close >= ma[20];
+  return { supports, breakouts, maintaining, pullback, labels, reasons,
+    preparation: { early, gain20Pct, extension20Pct, reversalPreparing, supports: supports.filter((p) => p >= 60) } };
+}
 function dailySelection(candles = [], now) {
   const bars = candles.filter((c) => c.closeTime <= boundaryFor(1440, now));
   const trend = movingAverageState(bars);
@@ -692,18 +731,40 @@ function dailySelection(candles = [], now) {
   const burst = ready && averageVolume > 0 && recent.some((c) => c.baseVolume >= averageVolume * 2 && c.quoteVolume >= 1e7);
   const increasing = ready && last3.length === 3 && last3[0].baseVolume > 0 && last3[1].baseVolume > last3[0].baseVolume && last3[2].baseVolume > last3[1].baseVolume && last3[2].baseVolume >= last3[0].baseVolume * 1.5;
   const growth = burst || increasing || ratio >= 1.5;
-  const reasons = [trend.state === "transition" ? "일봉 역배열 탈출 시도" : trend.state === "up" ? "일봉 상승 배열 유지" : "일봉 추세 회복 대기",
-    increasing ? "3일 거래량 연속 증가" : burst ? "최근 5일 거래량 급증" : ratio >= 1.5 ? "최근 3일 거래량 증가" : "거래량 증가 대기"];
-  return { version: 1, ready, candleClose: bars.at(-1)?.closeTime ?? 0, trend, ratio, turnoverRatio, burst, increasing,
-    promising: ready && ["transition", "up"].includes(trend.state) && growth,
-    score: ready ? (trend.state === "transition" ? 50 : trend.state === "up" ? 40 : 0) + (increasing ? 20 : 0) + (burst ? 15 : 0) + Math.min(15, Math.max(0, (ratio ?? 0) - 1) * 5) : 0,
-    bonus: ready ? (trend.state === "transition" ? 8 : trend.state === "up" ? 4 : 0) + (growth ? 5 : 0) : 0,
-    reasons };
+  const setups = dailySetups(bars, trend);
+  const contracting = ready && last3.every((c, i) => !i || c.baseVolume < last3[i - 1].baseVolume);
+  const concentrated = ready && last3.some((c) => averageVolume > 0 && c.baseVolume >= averageVolume * 2 && c.quoteVolume >= 1e7)
+    && last3.reduce((n, c) => n + c.baseVolume, 0) > 0
+    && Math.max(...last3.map((c) => c.baseVolume)) / last3.reduce((n, c) => n + c.baseVolume, 0) >= 0.7;
+  const flow = concentrated && burst ? { type: "burst", reason: "최근 거래량 하루 급증 집중" }
+    : increasing ? { type: "increasing", reason: "3일 거래량 연속 증가" }
+    : contracting ? { type: "contracting", reason: "최근 3일 거래량 감소 · 눌림/추세와 함께 판단" }
+    : burst ? { type: "burst", reason: "최근 5일 거래량 급증 이력" }
+    : ratio >= 1.5 ? { type: "increasing", reason: "최근 3일 평균 거래량 증가" }
+    : { type: "neutral", reason: "거래량 뚜렷한 증가 없음" };
+  const preparation = setups.preparation;
+  const promising = ready && preparation.early && (preparation.reversalPreparing && growth || preparation.supports.length > 0);
+  const reasons = [preparation.supports.length ? `${preparation.supports.join("·")}일선 부근 유지·상승 준비`
+    : preparation.reversalPreparing ? "역배열 간격 축소·상승 준비" : "상승 준비 구조 확인 대기", flow.reason];
+  const bonus = ready ? (setups.maintaining || setups.pullback || setups.breakouts.length ? 8 : trend.state === "transition" ? 8 : trend.state === "up" ? 4 : 0)
+    + (flow.type === "increasing" ? 5 : flow.type === "burst" ? 3 : 0) : 0;
+  return { version: 2, ready, candleClose: bars.at(-1)?.closeTime ?? 0, trend, ratio, turnoverRatio, burst, increasing,
+    promising, preparation, flow, recommendation: { labels: ready ? setups.labels : [], reasons: ready ? [...setups.reasons, flow.reason] : ["완료 일봉 이력 확인 대기"] },
+    score: promising ? 50 + (preparation.reversalPreparing ? 10 : 0) + (preparation.supports.length ? 10 : 0)
+      + (flow.type === "increasing" ? 15 : flow.type === "burst" ? 8 : 0) : 0,
+    bonus, reasons };
+}
+function applyDailySelection(candidate, selection, now) {
+  return { ...candidate, score: Math.min(100, candidate.score + selection.bonus), selectionVersion: 2, rankingAt: now,
+    metrics: { ...candidate.metrics, dailySelection: selection },
+    reasons: [...candidate.reasons, ...selection.recommendation.reasons],
+    currentAssessment: { version: 2, asOf: now, candleClose: selection.candleClose,
+      labels: selection.recommendation.labels, reasons: selection.recommendation.reasons, flow: selection.flow } };
 }
 function promisingMarkets(results, markets, tickers, excluded, now) {
   const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m]));
   const quotes = new Map(tickers.map((t) => [t.market, t]));
-  return results.filter((r) => safe.has(r.market) && !excluded.has(r.market) && r.selection?.promising
+  return results.filter((r) => safe.has(r.market) && !excluded.has(r.market) && r.selection?.version === 2 && r.selection.promising
     && r.selection.candleClose === boundaryFor(1440, now) && quotes.get(r.market)?.timestamp >= now - 180000
     && quotes.get(r.market)?.quoteVolume24h >= 1e7)
     .map((r) => ({ market: r.market, koreanName: safe.get(r.market).koreanName, currentPrice: quotes.get(r.market).tradePrice,
@@ -1815,15 +1876,20 @@ async function recommendationDashboard(db, payload, now, tickers = []) {
   const rows = active.filter((r) => !r.endedAt).map((record) => {
     const current = live.get(record.candidate.plan.id);
     const ticker = prices.get(record.market);
+    const assessmentFresh = !payload.stale && current?.selectionVersion === 2 && current.currentAssessment?.version === 2
+      && current.rankingAt <= now && now - current.rankingAt <= SIGNAL_FRESH_MS;
     return { ...record.candidate, currentPrice: ticker?.tradePrice ?? current?.currentPrice,
       currentPriceAt: ticker?.tradePrice != null ? ticker.timestamp : current?.currentPriceAt,
       quoteVolume24h: ticker?.quoteVolume24h ?? current?.quoteVolume24h,
-      score: current?.rankingScore ?? current?.score ?? record.candidate.score,
-      entryStatus: ready.has(record.candidate.plan.id) && !record.entryMissedAt ? "ready" : "waiting",
+      score: assessmentFresh ? current.rankingScore ?? current.score : 0,
+      currentAssessment: assessmentFresh ? current.currentAssessment : null,
+      rankingAt: assessmentFresh ? current.rankingAt : null,
+      entryStatus: assessmentFresh && ready.has(record.candidate.plan.id) && !record.entryMissedAt ? "ready" : "waiting",
       entryValidUntil: current?.entryValidUntil ?? 0,
       trackingDelayed: Math.floor(now / 9e5) * 9e5 > record.lastClose || Math.floor(now / (record.stopTimeframe * 6e4)) * record.stopTimeframe * 6e4 > record.stopCheckedThrough,
       tracking: record };
-  }).sort((a, b) => b.score - a.score || (b.quoteVolume24h ?? 0) - (a.quoteVolume24h ?? 0) || a.market.localeCompare(b.market) || a.strategy.localeCompare(b.strategy));
+  }).sort((a, b) => Number(b.entryStatus === "ready") - Number(a.entryStatus === "ready") || b.score - a.score
+    || (b.quoteVolume24h ?? 0) - (a.quoteVolume24h ?? 0) || a.market.localeCompare(b.market) || a.strategy.localeCompare(b.strategy));
   rows.forEach((r, i) => { r.rank = i + 1; });
   return { rule: RECOMMENDATION_VERSION, updatedAt: now, active: rows,
     history: [...active.filter((r) => r.endedAt), ...queries[1].results.map((r) => JSON.parse(r.payload_json))],
@@ -1922,20 +1988,22 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
       diagnostics.ENGINE_WARMUP = (diagnostics.ENGINE_WARMUP ?? 0) + 2;
       continue;
     }
-    const isFresh = result.engineVersion === 5 && now - result.analyzedAt <= SIGNAL_FRESH_MS;
+    const isFresh = result.engineVersion === 5 && result.selection?.version === 2 && now - result.analyzedAt <= SIGNAL_FRESH_MS;
     if (isFresh && eligible.has(result.market)) fresh++;
     for (const saved of result.plans ?? []) {
       const observed = advanceSavedPlan(saved, [], ticker.tradePrice, now);
       const candidate = observed.candidate;
       const execution = executions.get(candidate.market);
       const plan = execution ? costedPlan(candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct) : candidate.plan;
-      const reason = planBlockReason(observed) ?? (!isFresh ? REASONS.DATA_DELAYED : regime === "RISK_OFF" ? REASONS.BTC_RISK_OFF : !eligible.has(candidate.market) ? REASONS.LOW_LIQUIDITY : !execution?.sufficientDepth || execution.buySlippagePct > (candidate.strategy === "scalp" ? 0.15 : 0.25) || (plan.netReturns?.[0] ?? -1) <= 0 ? REASONS.POOR_EXECUTION : candidate.entryStatus !== "ready" ? candidate.entryBlockReason ?? "신규 진입 조건 재확인 대기" : !entryStillValid(candidate, ticker.tradePrice, now) ? REASONS.CURRENT_PRICE_OUTSIDE_ENTRY : void 0);
+      const reason = planBlockReason(observed) ?? (!isFresh || candidate.selectionVersion !== 2 ? REASONS.DATA_DELAYED : regime === "RISK_OFF" ? REASONS.BTC_RISK_OFF : !eligible.has(candidate.market) ? REASONS.LOW_LIQUIDITY : !execution?.sufficientDepth || execution.buySlippagePct > (candidate.strategy === "scalp" ? 0.15 : 0.25) || (plan.netReturns?.[0] ?? -1) <= 0 ? REASONS.POOR_EXECUTION : candidate.entryStatus !== "ready" ? candidate.entryBlockReason ?? "신규 진입 조건 재확인 대기" : !entryStillValid(candidate, ticker.tradePrice, now) ? REASONS.CURRENT_PRICE_OUTSIDE_ENTRY : void 0);
       savedPlans.push({
         ...candidate,
         plan,
         currentPrice: ticker.tradePrice,
         currentPriceAt: ticker.timestamp,
         quoteVolume24h: ticker.quoteVolume24h,
+        currentAssessment: isFresh ? candidate.currentAssessment : null,
+        rankingAt: isFresh ? candidate.rankingAt : null,
         entryStatus: observed.stoppedAt !== void 0 ? "stopped" : observed.completedAt !== void 0 ? "completed" : reason ? "waiting" : "ready",
         entryBlockReason: reason
       });
@@ -1945,7 +2013,7 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
       const execution = executions.get(candidate.market);
       const plan = execution ? costedPlan(candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct) : candidate.plan;
       const executionOk = execution?.sufficientDepth && execution.buySlippagePct <= (candidate.strategy === "scalp" ? 0.15 : 0.25) && (plan.netReturns?.[0] ?? -1) > 0;
-      if ((!saved || saved.entryStatus === "ready") && isFresh && regime !== "RISK_OFF" && eligible.has(candidate.market) && executionOk && entryStillValid(candidate, ticker.tradePrice, now)) {
+      if ((!saved || saved.entryStatus === "ready") && isFresh && candidate.selectionVersion === 2 && regime !== "RISK_OFF" && eligible.has(candidate.market) && executionOk && entryStillValid(candidate, ticker.tradePrice, now)) {
         accepted.push({
           ...candidate,
           currentPrice: ticker.tradePrice,
@@ -2117,7 +2185,7 @@ async function refreshDashboard(db, options = {}) {
       if (prepared.length >= MARKET_BATCH || Date.now() - startedAt > 4e4) break;
       const previous = results.get(market.market);
       const boundary = Math.floor(now / 9e5) * 9e5;
-      if (previous?.engineVersion === 5 && previous.selection && previous.analyzedAt >= boundary && now - previous.analyzedAt < 3e5) continue;
+      if (previous?.engineVersion === 5 && previous.selection?.version === 2 && previous.analyzedAt >= boundary && now - previous.analyzedAt < 3e5) continue;
       try {
         const existing = await load(market.market);
         const upperCost = [60, 240].filter((u) => candleUnitDue(existing, u, now)).length;
@@ -2208,11 +2276,9 @@ async function refreshDashboard(db, options = {}) {
         let saved = previousPlan ? advanceSavedPlan(previousPlan, candles[strategy === "scalp" ? "15" : "60"], ticker.tradePrice, now) : void 0;
         const fixed = saved && saved.stoppedAt === void 0 && saved.completedAt === void 0 ? saved.candidate.plan : void 0;
         const evaluation = strategy === "scalp" ? evaluateScalp(input, fixed) : evaluateSwing(input, fixed);
+        const assessed = applyDailySelection(evaluation.accepted ? evaluation.candidate : { score: 0, metrics: {}, reasons: [] }, result.selection, now);
         if (evaluation.accepted) {
-          evaluation.candidate.score = Math.min(100, evaluation.candidate.score + result.selection.bonus);
-          evaluation.candidate.metrics.dailySelection = result.selection;
-          evaluation.candidate.selectionVersion = 1;
-          if (result.selection.ready) evaluation.candidate.reasons.push(...result.selection.reasons);
+          evaluation.candidate = assessed;
         }
         const activity = activityRatio(candles["60"], ticker.quoteVolume24h);
         if (evaluation.accepted && activity !== null) {
@@ -2240,7 +2306,10 @@ async function refreshDashboard(db, options = {}) {
           saved = describeSavedPlan(saved, qualified ? evaluation.candidate : void 0, observation.reason, now, SIGNAL_FRESH_MS);
           const candidate = {
             ...saved.candidate,
-            rankingScore: evaluation.accepted ? evaluation.candidate.score : 0,
+            rankingScore: qualified ? evaluation.candidate.score : 0,
+            rankingAt: now,
+            selectionVersion: 2,
+            currentAssessment: assessed.currentAssessment,
             currentPrice: ticker.tradePrice,
             charts: chartSet(input),
             plan: costedPlan(saved.candidate.plan, ASSUMED_FEE_RATE, execution.buySlippagePct)
@@ -2306,6 +2375,7 @@ function symbolDetailAnalysis(input, now) {
       averages: movingAverageState(bars), rsi: lastValue(rsi(bars.map((c) => c.close), 14)),
       stochastic: tripleStochasticLatest(bars), supertrend: trend.atr10 !== null ? trend.stDirection : null,
       targetTrend: trend.ttDirection, plan: null, ready: false };
+    if (unit === 1440) frame.selection = daily;
     if (unit === 15 || unit === 60) {
       const evaluate = unit === 15 ? evaluateScalp : evaluateSwing;
       const evaluated = evaluate(input);
