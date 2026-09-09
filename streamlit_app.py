@@ -105,7 +105,7 @@ def observation_table(observations):
 def tracking_status(candidate):
     record = candidate["tracking"]
     if candidate.get("trackingDelayed"):
-        return "추적 유지 · 갱신 대기"
+        return "기존 추천 · 최신 봉 확인 대기"
     if candidate.get("currentPrice") is not None and candidate["currentPrice"] < record["stop"]:
         return "손절선 이탈 · 봉 마감 대기"
     if record.get("entryMissedAt"):
@@ -173,7 +173,15 @@ def recommendation_timing_table(candidates):
 
 
 def strategy_rows(candidates, strategy):
-    rows = [c for c in candidates if c["strategy"] == strategy]
+    rows = []
+    for c in candidates:
+        if c["strategy"] != strategy or c.get("entryStatus") != "ready" or c.get("trackingDelayed"):
+            continue
+        record = c.get("tracking") or {}
+        if record.get("status") in {"closing", "closed", "unfilled"} or any(
+                record.get(key) for key in ("reached", "sold", "entryMissedAt", "endedAt")):
+            continue
+        rows.append(c)
     return [{**c, "rank": index + 1} for index, c in enumerate(rows[:10])]
 
 
@@ -326,7 +334,7 @@ def dashboard(worker):
     if stale:
         shown = [{**c, "currentAssessment": None, "entryStatus": "waiting"} for c in shown]
     st.subheader("1. 추천 종목")
-    st.caption("새 매수 후보와 이전 추천을 함께 보여줍니다. 상위 순위가 상승 전 추천을 뜻하지는 않습니다.")
+    st.caption("지금 신규 진입 조건을 충족한 종목만 표시합니다. 1차 목표 도달 이력이 있거나 진입·최신 봉 확인을 기다리는 기존 추천은 제외합니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
@@ -343,7 +351,7 @@ def dashboard(worker):
                         st.caption("최초 추천은 해당 추천 기록의 분석 회차 시각(KST)입니다. 다시 추천된 종목은 새 기록으로 비교하며, 당시 시세의 기준 시각은 가격 옆에 표시합니다.")
             else:
                 st.info("현재 조건에 맞는 추천이 없습니다.")
-    st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 순위 밖 추천도 DB 추적은 유지하며 종목 상세에서 확인할 수 있습니다.")
+    st.caption("추천 표에서 빠져도 기존 기록은 DB에 남아 목표가·단타 15분·스윙 1시간 종가 손절을 계속 추적합니다. 4. 종목 상세 분석에서 기존 추천 기록을 확인할 수 있습니다.")
     st.subheader("2. 유망 종목")
     active_markets = {c["market"] for c in shown}
     promising = [] if stale else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
