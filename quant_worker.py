@@ -62,7 +62,9 @@ def public_snapshot(state, now_ms=None):
             recommendation["currentAssessment"] = None
         record = recommendation["tracking"]
         duration = record["stopTimeframe"] * 60_000
-        recommendation["trackingDelayed"] = (stale or now_ms // 900_000 * 900_000 > record["lastClose"]
+        # 추천 전에 시작된 부분 봉 제외는 추적 누락이 아니다. 종가 손절 검사는 유지한다.
+        first_entry_open = ((record.get("createdAt") or 0) + 899_999) // 900_000 * 900_000
+        recommendation["trackingDelayed"] = (stale or now_ms // 900_000 * 900_000 > max(record["lastClose"], first_entry_open)
                                               or now_ms // duration * duration > record["stopCheckedThrough"])
     for row in payload.get("watchlist", []):
         if now_ms - row.get("analyzedAt", 0) > 1_200_000:

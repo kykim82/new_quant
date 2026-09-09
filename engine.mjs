@@ -1941,6 +1941,8 @@ async function recommendationDashboard(db, payload, now, tickers = []) {
     const ticker = prices.get(record.market);
     const assessmentFresh = !payload.stale && qualityCurrent(current?.dataQuality, now) && current?.selectionVersion === 2 && current.currentAssessment?.version === 2
       && current.rankingAt <= now && now - current.rankingAt <= SIGNAL_FRESH_MS;
+    // 추천 전에 시작된 부분 봉은 모의 진입·목표 평가 대상에서 제외된다.
+    const firstEntryOpen = Math.ceil((record.createdAt ?? 0) / 9e5) * 9e5;
     return { ...record.candidate, currentPrice: ticker?.tradePrice ?? current?.currentPrice,
       currentPriceAt: ticker?.tradePrice != null ? ticker.timestamp : current?.currentPriceAt,
       quoteVolume24h: ticker?.quoteVolume24h ?? current?.quoteVolume24h,
@@ -1950,7 +1952,7 @@ async function recommendationDashboard(db, payload, now, tickers = []) {
       rankingAt: assessmentFresh ? current.rankingAt : null,
       entryStatus: assessmentFresh && ready.has(record.candidate.plan.id) && !record.entryMissedAt ? "ready" : "waiting",
       entryValidUntil: current?.entryValidUntil ?? 0,
-      trackingDelayed: Math.floor(now / 9e5) * 9e5 > record.lastClose || Math.floor(now / (record.stopTimeframe * 6e4)) * record.stopTimeframe * 6e4 > record.stopCheckedThrough,
+      trackingDelayed: Math.floor(now / 9e5) * 9e5 > Math.max(record.lastClose, firstEntryOpen) || Math.floor(now / (record.stopTimeframe * 6e4)) * record.stopTimeframe * 6e4 > record.stopCheckedThrough,
       tracking: record };
   }).sort((a, b) => Number(b.entryStatus === "ready") - Number(a.entryStatus === "ready") || b.score - a.score
     || (b.quoteVolume24h ?? 0) - (a.quoteVolume24h ?? 0) || a.market.localeCompare(b.market) || a.strategy.localeCompare(b.strategy));

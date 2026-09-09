@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-from quant_worker import AnalysisWorker, SECRET_KEYS
+from quant_worker import AnalysisWorker, SECRET_KEYS, quality_current
 
 KST = timezone(timedelta(hours=9))
 
@@ -185,6 +185,27 @@ def strategy_rows(candidates, strategy):
     return [{**c, "rank": index + 1} for index, c in enumerate(rows[:10])]
 
 
+def recommendation_empty_message(payload, strategy, stale, now_ms):
+    coverage = payload.get("coverage") or {}
+    observations = [o for o in payload.get("watchlist", []) if o.get("strategy") == strategy]
+    rows = [c for c in [*(payload.get("recommendations") or {}).get("active", []),
+                       *payload.get("savedPlans", [])] if c.get("strategy") == strategy]
+    pending = stale or any(coverage.get(key, 0) > 0 for key in ("pendingMarketCount", "delayedMarketCount"))
+    pending = pending or any(o.get("code") in {"DATA_DELAYED", "ENGINE_WARMUP", "INSUFFICIENT_DATA"} for o in observations)
+    for c in rows:
+        record = c.get("tracking") or {}
+        if c.get("entryStatus") in {"stopped", "completed"} or any(
+                record.get(key) for key in ("reached", "sold", "entryMissedAt", "endedAt")):
+            continue
+        pending = pending or c.get("trackingDelayed") or not quality_current(c.get("dataQuality"), now_ms)
+        pending = pending or 0 < c.get("entryValidUntil", 0) <= now_ms
+    if pending:
+        return "최신 분석·추적 확인 중입니다. 확인이 끝난 종목부터 추천을 표시합니다."
+    if not rows and not observations and not coverage.get("freshMarketCount"):
+        return "분석 결과 확인 중입니다. 아직 추천 여부를 확정할 수 없습니다."
+    return "현재 확인된 분석 결과에서 매수 조건을 충족한 종목이 없습니다."
+
+
 def promising_table(candidates):
     selected = candidates[:10]
     table = pd.DataFrame([{"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})",
@@ -350,7 +371,7 @@ def dashboard(worker):
                         st.caption("당시 당일 등락은 추천 때의 업비트 전일 종가 대비입니다. 추천 후 등락은 당시 실제 시세에서 현재가까지의 변화이며, 최고 상승률이나 실제 매매 수익률은 아닙니다.")
                         st.caption("최초 추천은 해당 추천 기록의 분석 회차 시각(KST)입니다. 다시 추천된 종목은 새 기록으로 비교하며, 당시 시세의 기준 시각은 가격 옆에 표시합니다.")
             else:
-                st.info("현재 조건에 맞는 추천이 없습니다.")
+                st.info(recommendation_empty_message(payload, strategy, stale, int(datetime.now(KST).timestamp() * 1000)))
     st.caption("추천 표에서 빠져도 기존 기록은 DB에 남아 목표가·단타 15분·스윙 1시간 종가 손절을 계속 추적합니다. 4. 종목 상세 분석에서 기존 추천 기록을 확인할 수 있습니다.")
     st.subheader("2. 유망 종목")
     active_markets = {c["market"] for c in shown}
