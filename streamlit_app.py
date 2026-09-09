@@ -123,6 +123,26 @@ def recommendation_table(candidates):
     return table
 
 
+def sortable_candidate_table(candidates, table):
+    amounts = pd.DataFrame([{"매수가": c["plan"]["entryAnchor"], "현재가": c.get("currentPrice"),
+                             "손절가": c["plan"]["stop"],
+                             **{f"{i + 1}차 목표가": c["plan"]["targets"][i] if i < len(c["plan"]["targets"]) else None
+                                for i in range(3)},
+                             "24h 거래대금": c.get("quoteVolume24h")} for c in candidates], index=table.index)
+    numeric = table.copy()
+    for column in amounts:
+        values = pd.to_numeric(amounts[column], errors="coerce").astype(float)
+        valid = values >= 0 if column == "24h 거래대금" else values > 0
+        numeric[column] = values.where(values.map(math.isfinite) & valid)
+    # 정렬에는 원본 금액만 사용하고, 각 행의 등락률·시세 시각은 기존 표시값을 보존한다.
+    styled = numeric.style
+    for index in table.index:
+        for column in amounts:
+            label = table.at[index, column]
+            styled.format(lambda value, label=label: label, subset=([index], [column]))
+    return styled
+
+
 def recommendation_timing_table(candidates):
     def valid(value, positive=False):
         return type(value) in (int, float) and math.isfinite(value) and (not positive or value > 0)
@@ -262,7 +282,8 @@ def symbol_panel(worker):
     if tracked or history:
         with st.expander("이 종목의 기존 추천 고정 가격"):
             if tracked:
-                st.dataframe(recommendation_table(tracked), hide_index=True, width="stretch")
+                st.dataframe(sortable_candidate_table(tracked, recommendation_table(tracked)),
+                             hide_index=True, width="stretch", key=f"detail-recommendations-{market}")
             if history:
                 st.dataframe(recommendation_history(history), hide_index=True, width="stretch")
             st.caption("추천 당시 가격과 모의 추적입니다. 실제 보유 여부나 실제 체결 내역은 아닙니다.")
@@ -312,7 +333,9 @@ def dashboard(worker):
             st.caption(f"{label} {len(selected)}종목 · 최대 10종목")
             if selected:
                 table = recommendation_table(selected) if tracking is not None else candidate_table(selected)
-                st.dataframe(table.drop(columns=["구분"]), hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3)
+                st.dataframe(sortable_candidate_table(selected, table.drop(columns=["구분"])),
+                             hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3,
+                             key=f"recommendations-{strategy}")
                 if tracking is not None:
                     with st.expander("추천 전후 비교"):
                         st.dataframe(recommendation_timing_table(selected), hide_index=True, width="stretch")
