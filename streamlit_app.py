@@ -120,17 +120,36 @@ def recommendation_table(candidates):
     if not table.empty:
         table.insert(0, "순위", [c["rank"] for c in candidates])
         table["상태"] = [tracking_status(c) for c in candidates]
-        table.insert(3, "현재 판단", [recommendation_reason(c) for c in candidates])
     return table
 
 
-def recommendation_reason(candidate):
-    assessment = candidate.get("currentAssessment")
-    if not assessment or assessment.get("version") != 2:
-        return "근거 갱신 대기 · 기존 추적"
-    labels = "·".join(assessment.get("labels", [])) or "일봉 배경 확인 대기"
-    status = "신규 진입 가능" if candidate.get("entryStatus") == "ready" else "신규 진입 대기"
-    return f"{labels} · {status}"
+def recommendation_timing_table(candidates):
+    def valid(value, positive=False):
+        return type(value) in (int, float) and math.isfinite(value) and (not positive or value > 0)
+
+    rows = []
+    for c in candidates:
+        record = c.get("tracking") or {}
+        original = record.get("candidate") or {}
+        created = record.get("createdAt")
+        first_price, first_at = original.get("currentPrice"), original.get("currentPriceAt")
+        latest, latest_at = c.get("currentPrice"), c.get("currentPriceAt")
+        day_change = original.get("signedChangeRate")
+        first_quote = "기록 없음"
+        if valid(first_price, True):
+            quote_time = datetime.fromtimestamp(first_at / 1000, KST).strftime("%m.%d %H:%M:%S") if valid(first_at, True) else "시각 없음"
+            first_quote = f"{price(first_price)} ({quote_time})"
+        change = "기록 없음"
+        if valid(created, True) and valid(first_price, True) and valid(latest, True):
+            change = percent((latest / first_price - 1) * 100)
+            if valid(first_at, True) and valid(latest_at, True) and latest_at < first_at:
+                change = "시세 확인 대기"
+        rows.append({"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})",
+                     "최초 추천": stamp(created) if valid(created, True) else "기록 없음",
+                     "추천 당시 시세": first_quote,
+                     "당시 당일 등락": percent(day_change * 100) if valid(day_change) else "기록 없음",
+                     "추천 후 등락": change})
+    return pd.DataFrame(rows, columns=["종목", "최초 추천", "추천 당시 시세", "당시 당일 등락", "추천 후 등락"])
 
 
 def strategy_rows(candidates, strategy):
@@ -139,9 +158,21 @@ def strategy_rows(candidates, strategy):
 
 
 def promising_table(candidates):
-    return pd.DataFrame([{"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})",
-                          "현재가": current_quote(c), "24h 거래대금": turnover(c.get("quoteVolume24h")),
-                          "선정 이유": c["reason"]} for c in candidates[:10]])
+    selected = candidates[:10]
+    table = pd.DataFrame([{"종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})",
+                           "현재가": c.get("currentPrice"), "24h 거래대금": c.get("quoteVolume24h"),
+                           "선정 이유": c["reason"]} for c in selected],
+                         columns=["종목", "현재가", "24h 거래대금", "선정 이유"])
+    for column in ("현재가", "24h 거래대금"):
+        values = pd.to_numeric(table[column], errors="coerce").astype(float)
+        nonnegative = values > 0 if column == "현재가" else values >= 0
+        table[column] = values.where(values.map(math.isfinite) & nonnegative)
+    # 숫자는 정렬용 원본으로 유지하고 원·억원·시각은 표시값에만 붙인다.
+    styled = table.style.format({"24h 거래대금": turnover})
+    for index, c in enumerate(selected):
+        quote = current_quote({**c, "currentPrice": table.at[index, "현재가"]})
+        styled.format(lambda value, label=quote: label, subset=([index], ["현재가"]))
+    return styled
 
 
 def normalize_symbol(value):
@@ -274,7 +305,7 @@ def dashboard(worker):
     if stale:
         shown = [{**c, "currentAssessment": None, "entryStatus": "waiting"} for c in shown]
     st.subheader("1. 추천 종목")
-    st.caption("돌파·추세 유지·눌림의 현재 매수 근거를 평가합니다. 과거 상승폭만으로 제외하지 않으며, 신규 진입 가능 여부와 최신 점수 순으로 표시합니다.")
+    st.caption("새 매수 후보와 이전 추천을 함께 보여줍니다. 상위 순위가 상승 전 추천을 뜻하지는 않습니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
@@ -282,6 +313,11 @@ def dashboard(worker):
             if selected:
                 table = recommendation_table(selected) if tracking is not None else candidate_table(selected)
                 st.dataframe(table.drop(columns=["구분"]), hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3)
+                if tracking is not None:
+                    with st.expander("추천 전후 비교"):
+                        st.dataframe(recommendation_timing_table(selected), hide_index=True, width="stretch")
+                        st.caption("당시 당일 등락은 추천 때의 업비트 전일 종가 대비입니다. 추천 후 등락은 당시 실제 시세에서 현재가까지의 변화이며, 최고 상승률이나 실제 매매 수익률은 아닙니다.")
+                        st.caption("최초 추천은 해당 추천 기록의 분석 회차 시각(KST)입니다. 다시 추천된 종목은 새 기록으로 비교하며, 당시 시세의 기준 시각은 가격 옆에 표시합니다.")
             else:
                 st.info("현재 조건에 맞는 추천이 없습니다.")
     st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 순위 밖 추천도 DB 추적은 유지하며 종목 상세에서 확인할 수 있습니다.")
@@ -289,7 +325,7 @@ def dashboard(worker):
     active_markets = {c["market"] for c in shown}
     promising = [] if stale else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
     if promising:
-        st.dataframe(promising_table(promising), hide_index=True, width="stretch")
+        st.dataframe(promising_table(promising), hide_index=True, width="stretch", key="promising-table")
     else:
         st.info("현재 유망 조건을 충족한 종목이 없거나 일봉 이력을 수집 중입니다.")
     st.caption("상승 전 역배열 해소 준비·장기 이평선 부근 유지 종목입니다. 최근 20일 저가 대비 +20% 이내, SMA20 위 이격 +8% 이내를 초기 기준으로 사용하며 추천에는 이 제한을 적용하지 않습니다. 추천 중복은 숨깁니다.")
@@ -313,7 +349,7 @@ def main():
     surge_panel()
     symbol_panel(worker)
     st.divider()
-    st.caption("자동 주문 없음 · 표시 수익률은 매수가 기준이며 비용 차감 전입니다.")
+    st.caption("자동 주문 없음 · 목표·손절 등락률은 매수가 기준이며 비용 차감 전입니다.")
     st.caption("Target Trend 원안 BigBeluga · [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)")
 
 
