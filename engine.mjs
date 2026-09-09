@@ -2184,7 +2184,7 @@ async function refreshDashboard(db, options = {}) {
     const markets = await fetchKrwMarkets();
     let tickers = await fetchKrwTickers();
     const rows = await marketRows(db);
-    const tracked = await activeRecommendations(db);
+    let tracked = await activeRecommendations(db);
     const trackedMarkets = new Set(tracked.map((r) => r.market));
     const checked = new Map(rows.map((row) => [row.market, row.checked_at]));
     const results = new Map(rows.map((row) => [row.market, JSON.parse(row.result_json)]));
@@ -2202,10 +2202,11 @@ async function refreshDashboard(db, options = {}) {
       if (!cached.has(market)) cached.set(market, await readCandles(db, market) ?? emptyCandles());
       return cached.get(market);
     };
-    const collect = async (market, units) => {
+    const collect = async (market, units, latestOnly = false) => {
       let cache = await load(market);
       for (const unit of units) {
-        for (let page = 0; page < 3 && candleUnitDue(cache, unit, now); page++) {
+        for (let page = 0; page < (latestOnly ? 1 : 3) && candleUnitDue(cache, unit, now); page++) {
+          if (latestOnly && candleRequest(cache, unit, now)?.kind !== "latest") break;
           if (budget <= 0 || Date.now() - startedAt > 4e4) return false;
           budget--;
           cache = await refreshCandleUnit(market, unit, cache, now);
@@ -2215,6 +2216,38 @@ async function refreshDashboard(db, options = {}) {
       }
       return true;
     };
+    // 시장 위험도에 필요한 최신 BTC 봉은 과거 이력 보충 없이 먼저 확인한다.
+    await collect("KRW-BTC", [60, 240], true);
+    // 기존 추천의 목표·종가 손절 확인은 과거 이력 보충과 재분석 생략 여부에 종속시키지 않는다.
+    const trackingQueue = [...new Set(tracked.filter((r) => r.status === "closing"
+      || boundaryFor(15, now) > Math.max(r.lastClose, Math.ceil((r.createdAt ?? 0) / 9e5) * 9e5)
+      || boundaryFor(r.stopTimeframe, now) > r.stopCheckedThrough).sort((a, b) => a.lastClose - b.lastClose
+      || a.stopCheckedThrough - b.stopCheckedThrough).map((r) => r.market))];
+    for (const market of trackingQueue) {
+      if (Date.now() - startedAt > 4e4) break;
+      let cache = await load(market);
+      const units = [...new Set([15, ...tracked.filter((r) => r.market === market).map((r) => r.stopTimeframe)])];
+      for (const unit of units) {
+        if (budget <= 0 || Date.now() - startedAt > 4e4) break;
+        if (candleRequest(cache, unit, now)?.kind !== "latest") continue;
+        try {
+          budget--;
+          cache = await refreshCandleUnit(market, unit, cache, now);
+          cached.set(market, cache);
+          await writeCandles(db, market, cache);
+        } catch (error) {
+          if (error instanceof UpbitApiError && [418, 429].includes(error.status)) throw error;
+          console.warn("추천 최신 봉 수집 실패", market, unit, error);
+        }
+      }
+    }
+    // 이후 신규 분석이 실패해도 이미 확인한 추적 내역은 DB에 남긴다.
+    if (trackingQueue.length) {
+      await saveRecommendations(db, tracked, cached, { scalp: [], swing: [] }, now);
+      tracked = await activeRecommendations(db);
+    }
+    const refreshedTracking = new Set(trackingQueue.filter((m) => cached.get(m)?.[15]?.at(-1)?.closeTime === boundaryFor(15, now)
+      && !cached.get(m)[15].at(-1).synthetic));
     await collect("KRW-BTC", [60, 240]);
     const btcCandles = await load("KRW-BTC");
     if (btcCandles["60"].length < 55 || btcCandles["240"].length < 200 || [60, 240].some((unit) => btcCandles[unit].at(-1)?.closeTime !== boundaryFor(unit, now) || btcCandles[unit].slice(-200).some((b) => b.synthetic))) {
@@ -2250,7 +2283,7 @@ async function refreshDashboard(db, options = {}) {
       }
     }
     const trackingOnly = markets.filter((m) => m.warned && trackedMarkets.has(m.market) && tickerByCode.has(m.market));
-    const queue = [...nextMarkets(markets, tickers, checked), ...trackingOnly].filter((m) => priority(m.market)).sort((a, b) => Math.floor((checked.get(a.market) ?? 0) / 3e5) - Math.floor((checked.get(b.market) ?? 0) / 3e5) || Number(activePlan(results.get(b.market))) - Number(activePlan(results.get(a.market))) || tickerByCode.get(b.market).quoteVolume24h - tickerByCode.get(a.market).quoteVolume24h);
+    const queue = [...nextMarkets(markets, tickers, checked), ...trackingOnly].filter((m) => priority(m.market)).sort((a, b) => Number(refreshedTracking.has(b.market)) - Number(refreshedTracking.has(a.market)) || Math.floor((checked.get(a.market) ?? 0) / 3e5) - Math.floor((checked.get(b.market) ?? 0) / 3e5) || Number(activePlan(results.get(b.market))) - Number(activePlan(results.get(a.market))) || tickerByCode.get(b.market).quoteVolume24h - tickerByCode.get(a.market).quoteVolume24h);
     for (const market of queue) {
       if (prepared.length >= MARKET_BATCH || Date.now() - startedAt > 4e4) break;
       const previous = results.get(market.market);
