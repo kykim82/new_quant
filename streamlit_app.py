@@ -317,20 +317,28 @@ def dashboard(worker):
     if stale and not state.get("error"):
         st.warning("분석 갱신 대기 중입니다. 현재 매수 여부를 판단할 수 없습니다.")
     status = "갱신 지연" if stale else "분석 중 · 최근 결과 표시" if state["running"] else "자동 갱신 대기" if state.get("waiting") else "자동 분석 정상"
+    if not payload.get("primaryCoverage") or not payload.get("marketExclusions"):
+        status = "새 ST 분석 결과 대기"
     st.caption(f"{status} · 마지막 분석 {stamp(payload['generatedAt'])}")
     st.caption("현재가 괄호는 마지막으로 받은 업비트 시세의 기준 시각(KST)입니다.")
     st.caption("신규 추천은 최신 완료 일봉과 필수 시간대의 실제 봉·지표 이력 확인 후 표시합니다. 수집·복구 대기 중에도 기존 추천 기록은 보존합니다.")
-    candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
+    exclusions = payload.get("marketExclusions", {})
+    primary = payload.get("primaryCoverage", {})
+    candidates = [*payload["scalp"], *payload["swing"]] if not stale and exclusions.get("ready") and primary else []
     tracking = payload.get("recommendations")
     shown = candidates
-    exclusions = payload.get("marketExclusions", {})
-    if exclusions.get("ready") is False:
+    if not primary or not exclusions:
+        st.warning("현재 저장 결과에는 새 ST 검사 정보가 없습니다. 새 분석 결과를 기다리고 있으며 추천 유무를 판단할 수 없습니다.")
+    elif exclusions.get("ready") is not True:
         st.warning("유의·거래지원 종료 정보 확인 대기 중입니다. 신규 추천을 잠시 보류하고 기존 기록을 추적합니다.")
-    st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · 유의·거래지원 종료 제외 {len(exclusions.get('excluded', []))}종목")
+    exclusion_label = f"유의·거래지원 종료 제외 {len(exclusions['excluded'])}종목" if exclusions.get("ready") and "excluded" in exclusions else "유의·거래지원 종료 제외 종목 확인 대기"
+    st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · {exclusion_label}")
     for unit, label in (("15", "15분"), ("60", "1시간")):
-        coverage = payload.get("primaryCoverage", {}).get(unit)
+        coverage = primary.get(unit)
         if coverage:
             st.caption(f"{label} ST · 대상 {coverage['total']}종목 · Buy {coverage['buy']} · Sell {coverage['sell']} · 확인 대기 {coverage['pending']} · 검사 이력 {coverage['checked']}/{coverage['total']} · 완료봉 {stamp(coverage['candleClose'])}")
+        else:
+            st.caption(f"{label} ST · 새 검사 결과 확인 대기")
     st.subheader("1. 추천 종목")
     st.caption("단타는 15분, 스윙은 1시간 완료봉 ST Buy에서 신규 진입 조건을 충족한 종목입니다. ST Sell과 이전 추천 추적은 이 표에 포함하지 않습니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
@@ -343,7 +351,25 @@ def dashboard(worker):
                              hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3,
                              key=f"recommendations-{strategy}")
             else:
-                st.info("현재 조건에 맞는 추천이 없습니다.")
+                coverage = primary.get("15" if strategy == "scalp" else "60")
+                if stale:
+                    st.info("최신 분석 갱신을 기다리는 중입니다. 현재 추천 유무를 판단할 수 없습니다.")
+                elif not coverage:
+                    st.info("새 ST 분석 결과를 기다리는 중입니다. 현재 추천 유무를 판단할 수 없습니다.")
+                elif not exclusions.get("ready"):
+                    st.info("유의·거래지원 종료 제외 정보 확인 후 신규 추천을 표시합니다.")
+                elif coverage["pending"]:
+                    st.info(f"ST Buy {coverage['buy']}종목 · {coverage['pending']}종목 확인 대기입니다. 현재까지 신규 진입 조건을 통과한 추천은 없습니다.")
+                elif coverage["buy"] == 0:
+                    st.info("최신 완료봉 검사 결과 ST Buy 0종목입니다. ST Sell은 신규 추천에서 제외합니다.")
+                else:
+                    st.info(f"ST Buy {coverage['buy']}종목이 확인됐지만 현재까지 신규 진입 조건을 통과한 추천은 없습니다. 정밀 분석·데이터 확인이 필요한 종목은 계속 검사합니다.")
+                reasons = {}
+                for row in payload.get("watchlist", []):
+                    if row.get("strategy") == strategy and row.get("reason"):
+                        reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
+                if reasons and not stale and coverage and exclusions.get("ready"):
+                    st.caption("최근 분석 보류 사유 · " + " · ".join(f"{reason} {count}건" for reason, count in sorted(reasons.items(), key=lambda item: -item[1])[:3]))
     st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 추천에서 제외된 종목도 과거 기록과 추적을 유지합니다.")
     if tracking and tracking.get("active"):
         with st.expander("과거 추천 추적 · 신규 추천과 별도"):
@@ -354,7 +380,7 @@ def dashboard(worker):
             st.dataframe(recommendation_timing_table(previous), hide_index=True, width="stretch")
     st.subheader("2. 유망 종목")
     active_markets = {c["market"] for c in shown}
-    promising = [] if stale else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
+    promising = [] if stale or not exclusions.get("ready") else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
     if promising:
         st.dataframe(promising_table(promising), hide_index=True, width="stretch", key="promising-table")
     else:
