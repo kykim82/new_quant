@@ -72,6 +72,24 @@ def strategy_name(candidate):
     return "단타" if candidate["strategy"] == "scalp" else "스윙"
 
 
+def st_recommendation_table(candidates):
+    def trend_label(value, new_listing):
+        return {"up": "상승", "down": "하락"}.get(value, "신규 상장" if new_listing else "분석 중")
+    rows = []
+    for c in candidates:
+        plan = c.get("plan") or {}
+        rows.append({"순위": c["rank"], "종목": f"{c['koreanName']} ({c['market'].removeprefix('KRW-')})",
+                     "현재가": current_quote(c), "3일 평균 거래대금": turnover(c["averageTurnover3d"]),
+                     "ST": "Buy", "점수": c["score"],
+                     "4시간 추세": trend_label(c.get("upper4h"), c.get("newListing")),
+                     "일봉 추세": trend_label(c.get("dailyTrend"), c.get("newListing")),
+                     "구분": "신규 상장" if c.get("newListing") else "일반",
+                     "매수가": price(plan["entryAnchor"]) if plan else "산출 대기",
+                     "손절가": price(plan["stop"]) if plan else "산출 대기",
+                     "1차 목표가": price(plan["targets"][0]) if plan.get("targets") else "산출 대기"})
+    return pd.DataFrame(rows)
+
+
 def candidate_table(candidates, allow_entry=True):
     rows = []
     for c in candidates:
@@ -321,10 +339,11 @@ def dashboard(worker):
         status = "새 ST 분석 결과 대기"
     st.caption(f"{status} · 마지막 분석 {stamp(payload['generatedAt'])}")
     st.caption("현재가 괄호는 마지막으로 받은 업비트 시세의 기준 시각(KST)입니다.")
-    st.caption("신규 추천은 최신 완료 일봉과 필수 시간대의 실제 봉·지표 이력 확인 후 표시합니다. 수집·복구 대기 중에도 기존 추천 기록은 보존합니다.")
+    st.caption("3일 평균 거래대금 10억 원 이상에서 단타는 15분, 스윙은 1시간 ST Buy를 추천합니다. 상위봉과 기타 지표는 순위에 반영합니다.")
     exclusions = payload.get("marketExclusions", {})
     primary = payload.get("primaryCoverage", {})
-    candidates = [*payload["scalp"], *payload["swing"]] if not stale and exclusions.get("ready") and primary else []
+    candidates = payload.get("stRecommendations", []) if payload.get("stRecommendationVersion") == 1 else [*payload["scalp"], *payload["swing"]]
+    candidates = candidates if not stale and exclusions.get("ready") and primary else []
     tracking = payload.get("recommendations")
     shown = candidates
     if not primary or not exclusions:
@@ -337,19 +356,39 @@ def dashboard(worker):
     st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · {exclusion_label}")
     if exclusions.get("source") == "upbit-open-api":
         st.caption("제외 기준 · 공식 API의 유의 지정·거래지원 상태·종료일을 확인합니다.")
+    turnover_coverage = payload.get("turnoverCoverage")
+    if turnover_coverage:
+        st.caption(f"최근 완료 72시간 거래대금 합계 ÷ 3 · 10억 원 이상 {turnover_coverage['high']}종목 · 미만 {turnover_coverage['low']}종목 · 분류 중 {turnover_coverage['pending']}종목")
     for unit, label in (("15", "15분"), ("60", "1시간")):
         coverage = primary.get(unit)
         if coverage:
-            st.caption(f"{label} ST · 대상 {coverage['total']}종목 · Buy {coverage['buy']} · Sell {coverage['sell']} · 확인 대기 {coverage['pending']} · 검사 이력 {coverage['checked']}/{coverage['total']} · 완료봉 {stamp(coverage['candleClose'])}")
+            if "inspected" in coverage:
+                st.caption(f"{label} ST · 최신 봉 검사 {coverage['inspected']}/{coverage['total']} · Buy {coverage['buy']} · Sell {coverage['sell']} · 검사 대기 {coverage['waiting']} · 판정 불가 {coverage['unavailable']} · 완료봉 {stamp(coverage['candleClose'])}")
+                st.caption(f"{label} Buy 정밀 심사 {coverage['detailChecked']}/{coverage['buy']}종목 · 추천 조건 미충족·자료 부족으로 보류된 심사도 포함합니다.")
+                labels = {"buy": "Buy", "sell": "Sell", "unscanned": "미검사", "recheck": "최신 봉 재검사 대기",
+                          "missing_latest": "최신 실제 봉 없음", "history_short": "ST 계산 초기 이력 부족",
+                          "api_error": "수집 오류", "indicator": "지표 계산 불가"}
+                with st.expander(f"{label} 전체 종목 검사 내역·대기 사유"):
+                    st.dataframe([{"종목": f"{d.get('name') or d['market']} ({d['market']})",
+                                   "상태": labels.get(d["status"], d["status"]),
+                                   "확인된 ST 방향": "Buy" if d.get("lastDirection") == 1 else "Sell" if d.get("lastDirection") == -1 else "계산 준비",
+                                   "실제 봉 수": d["actualBars"], "최근 실제 완료봉": stamp(d["latestActualClose"]) if d["latestActualClose"] else "없음",
+                                   "정밀 심사": "검사함" if d.get("detailChecked") else "대기" if d["status"] == "buy" else "—",
+                                   "오류": d.get("error") or ""} for d in coverage.get("details", [])], hide_index=True, width="stretch")
+            else:
+                st.caption(f"{label} ST · 대상 {coverage['total']}종목 · Buy {coverage['buy']} · Sell {coverage['sell']} · 확인 대기 {coverage['pending']} · 검사 이력 {coverage['checked']}/{coverage['total']} · 완료봉 {stamp(coverage['candleClose'])}")
         else:
             st.caption(f"{label} ST · 새 검사 결과 확인 대기")
     st.subheader("1. 추천 종목")
-    st.caption("단타는 15분, 스윙은 1시간 완료봉 ST Buy에서 신규 진입 조건을 충족한 종목입니다. ST Sell과 이전 추천 추적은 이 표에 포함하지 않습니다.")
+    st.caption("거래대금 기준을 통과한 ST Buy 순위입니다. 신규 상장은 확보된 지표로 평가하며, 매수·손절·목표 가격은 계산된 경우에만 표시합니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
             st.caption(f"{label} {len(selected)}종목 · 최대 10종목")
-            if selected:
+            if selected and payload.get("stRecommendationVersion") == 1:
+                st.dataframe(st_recommendation_table(selected), hide_index=True, width="stretch",
+                             height=(len(selected) + 1) * 35 + 3, key=f"recommendations-{strategy}")
+            elif selected:
                 table = candidate_table(selected)
                 st.dataframe(sortable_candidate_table(selected, table.drop(columns=["구분"])),
                              hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3,
@@ -362,6 +401,8 @@ def dashboard(worker):
                     st.info("새 ST 분석 결과를 기다리는 중입니다. 현재 추천 유무를 판단할 수 없습니다.")
                 elif not exclusions.get("ready"):
                     st.info("유의·거래지원 종료 제외 정보 확인 후 신규 추천을 표시합니다.")
+                elif payload.get("stRecommendationVersion") == 1:
+                    st.info("현재 거래대금 기준과 최신 ST Buy를 함께 충족한 추천이 없습니다. 분류와 봉 갱신 진행 상황은 위 검사 내역에서 확인할 수 있습니다.")
                 elif coverage["pending"]:
                     st.info(f"ST Buy {coverage['buy']}종목 · {coverage['pending']}종목 확인 대기입니다. 현재까지 신규 진입 조건을 통과한 추천은 없습니다.")
                 elif coverage["buy"] == 0:
@@ -372,9 +413,9 @@ def dashboard(worker):
                 for row in payload.get("watchlist", []):
                     if row.get("strategy") == strategy and row.get("reason"):
                         reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
-                if reasons and not stale and coverage and exclusions.get("ready"):
+                if reasons and not payload.get("stRecommendationVersion") and not stale and coverage and exclusions.get("ready"):
                     st.caption("최근 분석 보류 사유 · " + " · ".join(f"{reason} {count}건" for reason, count in sorted(reasons.items(), key=lambda item: -item[1])[:3]))
-    st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 추천에서 제외된 종목도 과거 기록과 추적을 유지합니다.")
+    st.caption("가격 계획이 생성된 추천은 단타 15분·스윙 1시간 종가 손절을 추적합니다. 과거 기록과 추적은 계속 유지합니다.")
     if tracking and tracking.get("active"):
         with st.expander("과거 추천 추적 · 신규 추천과 별도"):
             previous = tracking["active"]
@@ -382,14 +423,20 @@ def dashboard(worker):
             st.dataframe(sortable_candidate_table(previous, recommendation_table(previous)),
                          hide_index=True, width="stretch", key="past-recommendation-tracking")
             st.dataframe(recommendation_timing_table(previous), hide_index=True, width="stretch")
-    st.subheader("2. 유망 종목")
-    active_markets = {c["market"] for c in shown}
-    promising = [] if stale or not exclusions.get("ready") else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
-    if promising:
-        st.dataframe(promising_table(promising), hide_index=True, width="stretch", key="promising-table")
+    st.subheader("2. 거래대금 모니터링")
+    st.caption("3일 평균 거래대금 10억 원 미만은 거래대금 증가만 확인합니다. 기준을 넘으면 ST 검사 대상으로 이동합니다.")
+    monitor = payload.get("volumeMonitor", [])
+    if monitor:
+        st.dataframe([{"종목": f"{m['name']} ({m['market'].removeprefix('KRW-')})",
+                       "3일 평균 거래대금": turnover(m["average3d"]),
+                       "최근 24시간 거래대금": turnover(m["lastDay"]),
+                       "직전 24시간 대비": "증가" if m["increasing"] else "유지·감소",
+                       "확인 시각": stamp(m["checkedAt"])}
+                      for m in sorted(monitor, key=lambda m: (not m["increasing"], -m["average3d"]))],
+                     hide_index=True, width="stretch", key="volume-monitor")
     else:
-        st.info("현재 유망 조건을 충족한 종목이 없거나 일봉 이력을 수집 중입니다.")
-    st.caption("상승 전 역배열 해소 준비·장기 이평선 부근 유지 종목입니다. 최근 20일 저가 대비 +20% 이내, SMA20 위 이격 +8% 이내를 초기 기준으로 사용하며 추천에는 이 제한을 적용하지 않습니다. 추천 중복은 숨깁니다.")
+        st.info("거래대금 분류 결과를 기다리고 있습니다.")
+
 
 
 def main():

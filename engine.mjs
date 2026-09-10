@@ -890,10 +890,75 @@ function chartSet(input) {
   }
   return charts;
 }
+function turnoverClass(cache, now) {
+  const end = boundaryFor(60, now), start = end - 72 * 3600000;
+  const bars = (cache[60] ?? []).filter((b) => b.closeTime <= end), first = bars[0];
+  const exhausted = cache.collection?.[60]?.exhausted === true;
+  const recent = bars.filter((b) => b.openTime >= start);
+  const covered = !!first && (first.openTime <= start || exhausted) && bars.at(-1)?.closeTime === end;
+  const valid = recent.every((b, i) => Number.isFinite(b.quoteVolume) && b.quoteVolume >= 0
+    && b.closeTime === b.openTime + 3600000 && (!i || b.openTime === recent[i - 1].closeTime));
+  let total = 0, correction = 0;
+  for (const bar of recent) {
+    const value = bar.quoteVolume - correction, next = total + value;
+    correction = (next - total) - value;
+    total = next;
+  }
+  const average3d = covered && valid ? total / 3 : null;
+  const previousDay = recent.filter((b) => b.openTime >= end - 48 * 3600000 && b.openTime < end - 24 * 3600000).reduce((sum, b) => sum + b.quoteVolume, 0);
+  const lastDay = recent.filter((b) => b.openTime >= end - 24 * 3600000).reduce((sum, b) => sum + b.quoteVolume, 0);
+  return { version: 1, checkedAt: now, candleClose: end, ready: average3d !== null, average3d,
+    group: average3d === null ? "pending" : average3d >= TURNOVER_MIN ? "high" : "low",
+    increasing: average3d !== null && lastDay > previousDay, lastDay, previousDay,
+    newListing: exhausted && !!first && first.openTime > end - 30 * 86400000 };
+}
+function highTurnover(result, now) {
+  const t = result?.turnover;
+  return t?.ready && t.group === "high" && t.candleClose === boundaryFor(60, now);
+}
+function stAnalysis(cache, now) {
+  const frames = Object.fromEntries([240, 1440].map((u) => {
+    const bars = (cache[u] ?? []).filter((b) => !b.synthetic && b.closeTime <= boundaryFor(u, now));
+    const closes = bars.map((b) => b.close), average = lastValue(ema(closes, 20));
+    const fresh = bars.at(-1)?.closeTime === boundaryFor(u, now);
+    return [u, { checkedAt: fresh ? now : cache.collection?.[u]?.checkedAt ?? 0, closeTime: bars.at(-1)?.closeTime ?? 0, bars: bars.length,
+      state: !fresh || average === null ? "pending" : closes.at(-1) >= average ? "up" : "down" }];
+  }));
+  const daily = (cache[1440] ?? []).filter((b) => !b.synthetic);
+  return { checkedAt: now, primaryClose: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now).closeTime])), frames, rsi: Object.fromEntries([15, 60].map((u) => [u, lastValue(rsi((cache[u] ?? []).filter((b) => !b.synthetic).map((b) => b.close), 14))])),
+    newListing: turnoverClass(cache, now).newListing || cache.collection?.[1440]?.exhausted === true
+      && !!daily.length && daily[0].openTime > now - 30 * 86400000 };
+}
+function rankedStRecommendations(results, markets, prices, now) {
+  if (markets.exclusionStatus?.ready === false) return [];
+  const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m])), candidates = [];
+  for (const result of results) {
+    const market = safe.get(result.market), ticker = prices.get(result.market);
+    if (!market || !ticker || !highTurnover(result, now)) continue;
+    for (const [strategy, unit] of [["scalp", 15], ["swing", 60]]) {
+      const gate = result.primary?.[unit];
+      if (!entryGateCurrent({ strategy, entryGate: gate }, now)) continue;
+      const analysis = result.stAnalysis, frames = analysis?.frames ?? {};
+      const frame = (u) => frames[u]?.closeTime === boundaryFor(u, now) ? frames[u].state : "pending";
+      const momentum = analysis?.checkedAt >= boundaryFor(unit, now) ? analysis.rsi?.[unit] : null;
+      const score = 50 + (frame(240) === "up" ? 15 : 0) + (frame(1440) === "up" ? 15 : 0)
+        + (momentum !== null && momentum !== undefined && momentum >= 40 && momentum <= 70 ? 10 : 0) + (result.turnover.increasing ? 10 : 0);
+      const technical = result.candidates.find((c) => c.strategy === strategy && entryGateCurrent(c, now) && entryStillValid(c, ticker.tradePrice, now));
+      candidates.push({ market: result.market, koreanName: market.koreanName, strategy, score,
+        currentPrice: ticker.tradePrice, currentPriceAt: ticker.timestamp, quoteVolume24h: ticker.quoteVolume24h,
+        averageTurnover3d: result.turnover.average3d, turnover: result.turnover, entryGate: gate,
+        newListing: !!(analysis?.newListing || result.turnover.newListing), upper4h: frame(240), dailyTrend: frame(1440),
+        rsi: momentum, plan: technical?.plan ?? null, analyzedAt: analysis?.checkedAt ?? 0 });
+    }
+  }
+  return ["scalp", "swing"].flatMap((strategy) => candidates.filter((c) => c.strategy === strategy)
+    .sort((a, b) => b.score - a.score || b.averageTurnover3d - a.averageTurnover3d || a.market.localeCompare(b.market))
+    .slice(0, 10).map((c, i) => ({ ...c, rank: i + 1 })));
+}
 function primaryTrend(candles, unit, now) {
   const end = boundaryFor(unit, now), bars = (candles ?? []).filter((b) => b.closeTime <= end);
   const real = bars.filter((b) => !b.synthetic), trend = advanceTrends(bars, undefined, now);
-  const ready = real.length >= 200 && Number.isFinite(trend.atr10) && real.at(-1)?.closeTime === end;
+  const ready = real.length >= 10 && Number.isFinite(trend.atr10) && trend.atr10 > 0 && real.at(-1)?.closeTime === end;
   return { version: 1, unit, checkedAt: now, closeTime: end, latestActualClose: real.at(-1)?.closeTime ?? 0,
     actualBars: real.length, direction: Number.isFinite(trend.atr10) ? trend.stDirection : null, ready,
     state: ready ? trend.stDirection === 1 ? "buy" : "sell" : "unknown" };
@@ -1616,11 +1681,11 @@ function normalizeCandles(rows, unit, asOf) {
   }
   return filled;
 }
-async function fetchCandlePage(market, unit, to) {
+async function fetchCandlePage(market, unit, to, count = 200) {
   const query = new URLSearchParams({
     market,
     to: new Date(to).toISOString(),
-    count: "200"
+    count: String(count)
   });
   return requestJson(`/candles/${unit === 1440 ? "days" : `minutes/${unit}`}?${query}`);
 }
@@ -1656,7 +1721,11 @@ function candleRequest(cache, unit, now) {
   const bars = cache[unit] ?? [], state = cache.collection?.[unit] ?? {};
   if (state.retryAt > now) return null;
   const end = boundaryFor(unit, now), last = bars.at(-1);
-  if (!last || last.closeTime < end || last.synthetic) return { to: end, kind: "latest" };
+  if (!last || last.closeTime < end || last.synthetic) {
+    const actual = bars.findLast((b) => !b.synthetic);
+    const count = actual ? Math.min(200, Math.max(2, Math.ceil((end - actual.closeTime) / (unit * 60000)) + 1)) : 200;
+    return { to: end, kind: "latest", count };
+  }
   const required = unit === 1440 ? 370 : 400;
   const gaps = bars.slice(-HISTORY_BARS).filter((b, i, recent) => b.synthetic || i > 0 && b.openTime !== recent[i - 1].closeTime);
   const gap = gaps.findLast((b) => b.openTime < (state.gapBefore ?? Infinity)) ?? gaps.at(-1);
@@ -1673,9 +1742,14 @@ async function refreshCandleUnit(market, unit, cache, asOf) {
   const request = candleRequest(cache, unit, asOf);
   if (!request) return cache;
   const existing = cache[String(unit)] ?? [];
-  const page = await fetchCandlePage(market, unit, request.to);
+  const page = await fetchCandlePage(market, unit, request.to, request.count ?? 200);
   await delay(150);
-  if (!page.length && request.kind === "latest") throw new Error(`${market} ${unit}분 최신 캔들 응답 없음`);
+  if (!page.length && request.kind === "latest") {
+    if (existing.length) throw new Error(`${market} ${unit}분 최신 캔들 응답 없음`);
+    return { ...cache, [unit]: [], collection: { ...cache.collection, [unit]: {
+      ...cache.collection?.[unit], exhausted: true, checkedAt: asOf, retryAt: boundaryFor(unit, asOf) + unit * 60000
+    } } };
+  }
   if (page.some((r) => r.market !== market || !Number.isFinite(parseUtc(r.candle_date_time_utc)) || parseUtc(r.candle_date_time_utc) >= request.to
     || ![r.opening_price, r.high_price, r.low_price, r.trade_price, r.candle_acc_trade_volume, r.candle_acc_trade_price].every(Number.isFinite)
     || r.low_price <= 0 || r.low_price > Math.min(r.opening_price, r.trade_price) || r.high_price < Math.max(r.opening_price, r.trade_price)
@@ -1700,7 +1774,7 @@ async function refreshCandleUnit(market, unit, cache, asOf) {
   const progress = candles.filter((b) => !b.synthetic).length > existing.filter((b) => !b.synthetic).length || changed;
   return { ...cache, [key]: candles, collection: { ...cache.collection, [unit]: {
     checkedAt: asOf, revision: (state.revision ?? 0) + Number(changed),
-    exhausted: state.exhausted || request.kind === "history" && page.length === 0,
+    exhausted: state.exhausted || (request.count ?? 200) === 200 && page.length < 200,
     gapBefore: request.kind === "gap" ? page.length ? Math.min(...page.map((r) => parseUtc(r.candle_date_time_utc))) : request.to - unit * 60000 : state.gapBefore,
     retryAt: request.kind === "gap" && !progress || candles.at(-1)?.synthetic ? asOf + 60000 : 0
   } } };
@@ -2090,13 +2164,14 @@ function describeSavedPlan(saved, candidate, reason, now, validFor) {
 // lib/scanner.ts
 var ANALYSIS_NOTIONAL_KRW = 1e6;
 var ASSUMED_FEE_RATE = 5e-4;
-var CANDLE_BUDGET = 80;
-var MARKET_BATCH = 40;
+var CANDLE_BUDGET = 240;
+// 정밀 결과 저장 시간을 확보하고 다음 대기 검사 회차가 밀리지 않게 한다.
+var MARKET_BATCH = 20;
 function summarizeMarkets(results, markets, tickers, regime, now, executions = /* @__PURE__ */ new Map()) {
   const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m]));
   const prices = new Map(tickers.map((t) => [t.market, t]));
   const valid = results.filter((r) => safe.has(r.market));
-  const eligible = new Set(tickers.filter((t) => safe.has(t.market) && liquidityEligible(t, results.find((r) => r.market === t.market)?.screen, now)).map((t) => t.market));
+  const eligible = new Set(tickers.filter((t) => safe.has(t.market) && highTurnover(results.find((r) => r.market === t.market), now)).map((t) => t.market));
   const analyzed = valid.filter((r) => eligible.has(r.market) && r.engineVersion === 5 && r.analyzedAt > 0);
   const observations = [];
   const accepted = [];
@@ -2186,6 +2261,17 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
   const btc = prices.get("KRW-BTC");
   return {
     schemaVersion: 5,
+    stRecommendationVersion: 1,
+    stRecommendations: rankedStRecommendations(results, markets, prices, now),
+    turnoverCoverage: [...safe.values()].reduce((a, m) => {
+      const t = results.find((r) => r.market === m.market)?.turnover;
+      const group = t?.ready && t.candleClose === boundaryFor(60, now) ? t.group : "pending";
+      a[group]++; return a;
+    }, { high: 0, low: 0, pending: 0, total: safe.size }),
+    volumeMonitor: [...safe.values()].flatMap((m) => {
+      const t = results.find((r) => r.market === m.market)?.turnover;
+      return t?.ready && t.group === "low" ? [{ market: m.market, name: m.koreanName, ...t }] : [];
+    }),
     generatedAt: now,
     priceUpdatedAt: now,
     source: "live",
@@ -2197,9 +2283,23 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
     btcChangeRate: btc?.signedChangeRate ?? null,
     marketExclusions: { ...(markets.exclusionStatus ?? { ready: true }), excluded: markets.filter((m) => m.warned).map((m) => ({ market: m.market, reason: m.exclusionReason ?? "거래 유의 종목" })) },
     primaryCoverage: Object.fromEntries([15, 60].map((unit) => {
-      const all = [...safe.keys()].map((market) => results.find((r) => r.market === market)?.primary?.[unit]);
-      const current = all.filter((p) => p?.ready && p.closeTime === boundaryFor(unit, now));
-      return [unit, { total: safe.size, checked: all.filter(Boolean).length, buy: current.filter((p) => p.direction === 1).length, sell: current.filter((p) => p.direction === -1).length, pending: safe.size - current.length, candleClose: boundaryFor(unit, now) }];
+      const end = boundaryFor(unit, now);
+      const details = [...safe.values()].map((market) => {
+        const r = results.find((r) => r.market === market.market), p = r?.primary?.[unit];
+        const status = !highTurnover(r, now) ? "volume_monitor" : !p ? "unscanned" : boundaryFor(unit, p.checkedAt ?? 0) !== end ? "recheck"
+          : p.error ? "api_error" : p.ready && p.closeTime === end ? p.direction === 1 ? "buy" : "sell"
+          : p.latestActualClose !== end ? "missing_latest" : p.actualBars < 10 ? "history_short" : "indicator";
+        return { market: market.market, name: market.koreanName, status, lastDirection: p?.direction ?? null, checkedAt: p?.checkedAt ?? 0,
+          latestActualClose: p?.latestActualClose ?? 0, actualBars: p?.actualBars ?? 0, error: p?.error,
+          detailChecked: status === "buy" && r?.entryGateVersion === 1 && r.analyzedAt >= end };
+      });
+      const counts = details.reduce((a, r) => (a[r.status] = (a[r.status] ?? 0) + 1, a), {});
+      const buy = counts.buy ?? 0, sell = counts.sell ?? 0, waiting = (counts.unscanned ?? 0) + (counts.recheck ?? 0);
+      const total = details.length - (counts.volume_monitor ?? 0);
+      return [unit, { total, checked: details.filter((p) => p.status !== "volume_monitor" && p.checkedAt > 0).length,
+        inspected: total - waiting, buy, sell, pending: total - buy - sell, waiting,
+        unavailable: total - buy - sell - waiting, counts, details: details.filter((p) => p.status !== "volume_monitor"),
+        detailChecked: details.filter((p) => p.detailChecked).length, candleClose: end }];
     })),
     coverage: {
       krwMarketCount: markets.length,
@@ -2232,6 +2332,7 @@ function cachedPayload(payload, now, error) {
   const stale = payload.schemaVersion !== 5 || now - payload.generatedAt > 3 * 6e4 || Boolean(error);
   return {
     ...payload,
+    stRecommendations: stale || !payload.marketExclusions?.ready ? [] : (payload.stRecommendations ?? []).filter((c) => entryGateCurrent(c, now) && c.turnover?.candleClose === boundaryFor(60, now) && c.turnover?.average3d >= TURNOVER_MIN),
     source: "cached",
     stale,
     promising: stale || !payload.marketExclusions?.ready ? [] : (payload.promising ?? []).filter((c) => c.dailyQuality?.ready && c.dailyQuality.latestActualClose === boundaryFor(1440, now)),
@@ -2271,17 +2372,17 @@ async function refreshDashboard(db, options = {}) {
         result.plans = result.plans?.map((saved) => ({ ...saved, candidate: compact(saved.candidate) }));
       }
     }
-    let budget = CANDLE_BUDGET;
+    let budget = CANDLE_BUDGET, collectionDeadline = startedAt + 100000, budgetFloor = 0;
     const cached = /* @__PURE__ */ new Map();
     const load = async (market) => {
       if (!cached.has(market)) cached.set(market, await readCandles(db, market) ?? emptyCandles());
       return cached.get(market);
     };
-    const collect = async (market, units, maxPages = 3, persist = true) => {
+    const collect = async (market, units, maxPages = 3, persist = true, primaryOnly = false) => {
       let cache = await load(market);
       for (const unit of units) {
-        for (let page = 0; page < maxPages && candleUnitDue(cache, unit, now); page++) {
-          if (budget <= 0 || Date.now() - startedAt > 4e4) return false;
+        for (let page = 0; page < maxPages && (primaryOnly === "turnover" ? !turnoverClass(cache, now).ready : primaryOnly ? !primaryTrend(cache[unit], unit, now).ready : candleUnitDue(cache, unit, now)); page++) {
+          if (budget <= budgetFloor || Date.now() > collectionDeadline) return false;
           budget--;
           cache = await refreshCandleUnit(market, unit, cache, now);
           cached.set(market, cache);
@@ -2313,13 +2414,91 @@ async function refreshDashboard(db, options = {}) {
       results.set(market, result);
       await writeMarket(db, result, await load(market), checked.get(market) ?? 0);
     }
+    const volumeChecked = new Map([...results.values()].map((r) => [r.market, r.turnover?.checkedAt ?? 0]));
+    const volumeQueue = nextMarkets(markets, tickers, volumeChecked).filter((m) =>
+      !results.get(m.market)?.turnover?.ready || results.get(m.market).turnover.candleClose !== boundaryFor(60, now));
+    for (let offset = 0; offset < volumeQueue.length; offset += 4) {
+      if (budget <= 80 || Date.now() - startedAt > 45000) break;
+      const group = volumeQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
+      if (missing.length) {
+        const loaded = await db.batch(missing.map((m) => db.prepare("SELECT COALESCE((SELECT candles_json FROM candle_cache WHERE market = ?), (SELECT candles_json FROM market_analysis WHERE market = ?)) AS candles_json").bind(m.market, m.market)));
+        missing.forEach((m, i) => cached.set(m.market, loaded[i].results[0]?.candles_json ? JSON.parse(loaded[i].results[0].candles_json) : emptyCandles()));
+      }
+      const writes = []; let rateError;
+      for (const m of group) {
+        const result = { ...baseResult(m.market) };
+        try {
+          await collect(m.market, [60], 1, false, "turnover");
+          result.turnover = turnoverClass(await load(m.market), now);
+        } catch (error) {
+          result.turnover = { ready: false, group: "pending", checkedAt: now, candleClose: boundaryFor(60, now), error: error.message };
+          if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+        }
+        results.set(m.market, result);
+        const json = JSON.stringify(await load(m.market));
+        writes.push(db.prepare("INSERT INTO candle_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json").bind(m.market, json),
+          db.prepare("INSERT INTO market_analysis VALUES (?, ?, ?, ?) ON CONFLICT(market) DO UPDATE SET checked_at=excluded.checked_at, result_json=excluded.result_json, candles_json=excluded.candles_json").bind(m.market, checked.get(m.market) ?? 0, JSON.stringify(result), json));
+        if (rateError) break;
+      }
+      if (writes.length) await db.batch(writes);
+      if (rateError) throw rateError;
+    }
+    const prepared = [], detailAttempted = new Set();
+    const hasCurrentBuy = (result) => highTurnover(result, now) && [15, 60].some((u) => result?.primary?.[u]?.ready
+      && result.primary[u].direction === 1 && result.primary[u].closeTime === boundaryFor(u, now));
+    const detailDue = (r) => hasCurrentBuy(r) && (!r.stAnalysis
+      || [15, 60].some((u) => r.primary?.[u]?.ready && r.primary[u].direction === 1 && r.primary[u].closeTime === boundaryFor(u, now) && r.stAnalysis.primaryClose?.[u] !== boundaryFor(u, now))
+      || [240, 1440].some((u) => (r.stAnalysis.frames?.[u]?.checkedAt ?? 0) < boundaryFor(u, now)));
+    const prepareMarket = async (market) => {
+      const previous = baseResult(market.market), primary = previous.primary, buy = hasCurrentBuy(previous);
+      detailAttempted.add(market.market);
+      // 실패·일부 수집도 시도 시각을 남겨 같은 종목이 나머지 시장을 계속 가리지 않게 한다.
+      const result = { ...previous };
+      let rateError;
+      try {
+        if (buy) await collect(market.market, [60, 240], 3, false);
+        await collect(market.market, [1440], 3, false);
+        if (primary?.[15]?.ready && primary[15].direction === 1 && primary[15].closeTime === boundaryFor(15, now)) await collect(market.market, [15], 3, false);
+        const cache = await load(market.market);
+        result.screen = screenLiquidity(cache[60], now);
+        result.stAnalysis = stAnalysis(cache, now);
+        result.selection = dailySelection(cache[1440], now);
+        result.dailyQuality = candleQuality(cache, 1440, now);
+        if (buy) prepared.push({ market, candles: cache });
+      } catch (error) {
+        if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+        result.candidates = [];
+        console.warn("정밀 분석 자료 대기", market.market, error.message);
+      }
+      results.set(market.market, result);
+      const candlesJson = JSON.stringify(await load(market.market));
+      await db.batch([
+        db.prepare("INSERT INTO candle_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json").bind(market.market, candlesJson),
+        db.prepare("INSERT INTO market_analysis VALUES (?, ?, ?, ?) ON CONFLICT(market) DO UPDATE SET checked_at=excluded.checked_at, result_json=excluded.result_json, candles_json=excluded.candles_json").bind(market.market, now, JSON.stringify(result), candlesJson)
+      ]);
+      if (rateError) throw rateError;
+      checked.set(market.market, now);
+    };
+    // 확인된 Buy부터 정밀 자료를 준비하되 대기 종목의 순환 검사 예산을 남긴다.
+    const priorityBuy = nextMarkets(markets, tickers, checked).filter((m) => detailDue(results.get(m.market))).slice(0, 2);
+    collectionDeadline = Math.min(startedAt + 60000, Date.now() + 8000);
+    budgetFloor = Math.max(20, budget - 12);
+    try {
+      for (const market of priorityBuy) {
+        if (budget <= budgetFloor || Date.now() > collectionDeadline) break;
+        await prepareMarket(market);
+      }
+    } finally {
+      collectionDeadline = startedAt + 100000;
+      budgetFloor = 0;
+    }
     // 거래대금에 관계없이 전체 대상의 15분·1시간 ST를 오래된 검사부터 순환한다.
     const primaryChecked = new Map([...results.values()].map((r) => [r.market, r.primaryCheckedAt ?? 0]));
     const primaryQueue = nextMarkets(markets, tickers, primaryChecked).filter((market) =>
-      ![15, 60].every((u) => results.get(market.market)?.primary?.[u]?.ready
-        && results.get(market.market).primary[u].closeTime === boundaryFor(u, now))).slice(0, 24);
+      highTurnover(results.get(market.market), now) && ![15, 60].every((u) => results.get(market.market)?.primary?.[u]?.ready
+        && results.get(market.market).primary[u].closeTime === boundaryFor(u, now)));
     for (let offset = 0; offset < primaryQueue.length; offset += 4) {
-      if (budget <= 20 || Date.now() - startedAt > 32000) break;
+      if (budget <= 20 || Date.now() - startedAt > 80000) break;
       const group = primaryQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
       if (missing.length) {
         const loaded = await db.batch(missing.map((m) => db.prepare("SELECT COALESCE((SELECT candles_json FROM candle_cache WHERE market = ?), (SELECT candles_json FROM market_analysis WHERE market = ?)) AS candles_json").bind(m.market, m.market)));
@@ -2329,16 +2508,18 @@ async function refreshDashboard(db, options = {}) {
       let rateError;
       try {
         for (const market of group) {
-          if (budget <= 20 || Date.now() - startedAt > 32000) break;
+          if (budget <= 20 || Date.now() - startedAt > 80000) break;
           const previous = baseResult(market.market);
-          let primary;
-          try {
-            await collect(market.market, [15, 60], 1, false);
-            const cache = await load(market.market);
-            primary = Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now)]));
-          } catch (error) {
-            primary = Object.fromEntries([15, 60].map((u) => [u, { version: 1, unit: u, checkedAt: now, ready: false, state: "unknown", error: error.message }]));
-            if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+          const primary = { ...previous.primary };
+          for (const u of [15, 60]) {
+            try {
+              const collected = await collect(market.market, [u], 1, false, true);
+              if (collected) primary[u] = primaryTrend((await load(market.market))[u], u, now);
+            } catch (error) {
+              primary[u] = { ...previous.primary?.[u], version: 1, unit: u, checkedAt: now, closeTime: boundaryFor(u, now), ready: false, state: "unknown", error: error.message };
+              if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+            }
+            if (rateError) break;
           }
           const result = { ...previous, primary, primaryCheckedAt: now }, candlesJson = JSON.stringify(await load(market.market));
           results.set(market.market, result);
@@ -2359,33 +2540,15 @@ async function refreshDashboard(db, options = {}) {
     if (btcCandles["60"].length < 55 || btcCandles["240"].length < 200 || [60, 240].some((unit) => btcCandles[unit].at(-1)?.closeTime !== boundaryFor(unit, now) || btcCandles[unit].slice(-200).some((b) => b.synthetic))) {
       throw new Error("BTC 시장 위험도를 판단할 최신 캔들이 부족합니다.");
     }
-    const regime = deriveBtcRegime(btcCandles["60"], btcCandles["240"]), prepared = [];
-    const queue = nextMarkets(markets, tickers, checked);
+    const regime = deriveBtcRegime(btcCandles["60"], btcCandles["240"]);
+    // 대기 검사에서 새로 확인된 Buy도 일봉 전용 수집보다 먼저 심사한다.
+    const queue = nextMarkets(markets, tickers, checked).sort((a, b) => Number(hasCurrentBuy(results.get(b.market))) - Number(hasCurrentBuy(results.get(a.market))));
     for (const market of queue) {
-      if (budget <= 0 || prepared.length >= MARKET_BATCH || Date.now() - startedAt > 40000) break;
-      const previous = baseResult(market.market), primary = previous.primary;
-      const buy = [15, 60].some((u) => primary?.[u]?.ready && primary[u].direction === 1 && primary[u].closeTime === boundaryFor(u, now));
-      const dailyDue = !previous.dailyQuality?.ready || previous.dailyQuality.latestActualClose !== boundaryFor(1440, now);
-      if (!buy && !activePlan(previous) && !dailyDue) continue;
-      // 실패·일부 수집도 시도 시각을 남겨 같은 종목이 나머지 시장을 계속 가리지 않게 한다.
-      const result = { ...previous };
-      try {
-        if (buy || activePlan(previous)) await collect(market.market, [60, 240]);
-        await collect(market.market, [1440]);
-        if (primary?.[15]?.direction === 1 || activePlan(previous)) await collect(market.market, [15]);
-        const cache = await load(market.market);
-        result.screen = screenLiquidity(cache[60], now);
-        result.selection = dailySelection(cache[1440], now);
-        result.dailyQuality = candleQuality(cache, 1440, now);
-        if (buy || activePlan(previous)) prepared.push({ market, candles: cache });
-      } catch (error) {
-        if (error instanceof UpbitApiError && [418, 429].includes(error.status)) throw error;
-        result.candidates = [];
-        console.warn("정밀 분석 자료 대기", market.market, error.message);
-      }
-      results.set(market.market, result);
-      await writeMarket(db, result, await load(market.market), now);
-      checked.set(market.market, now);
+      if (budget <= 0 || prepared.length >= MARKET_BATCH || Date.now() - startedAt > 100000) break;
+      if (detailAttempted.has(market.market)) continue;
+      const previous = baseResult(market.market), buy = hasCurrentBuy(previous);
+      if (!buy || !detailDue(previous)) continue;
+      await prepareMarket(market);
     }
     tickers = await fetchKrwTickers();
     const tickerMap = new Map(tickers.map((t) => [t.market, t]));
@@ -2431,7 +2594,7 @@ async function refreshDashboard(db, options = {}) {
         btcChangeRate: tickerMap.get("KRW-BTC")?.signedChangeRate ?? 0,
         feeRate: ASSUMED_FEE_RATE,
         trends,
-        liquidityQualified: liquidityEligible(ticker, previous?.screen, now)
+        liquidityQualified: highTurnover(previous, now)
       };
       const result = {
         market: market.market,
@@ -2440,6 +2603,8 @@ async function refreshDashboard(db, options = {}) {
         entryGateVersion: 1,
         primaryCheckedAt: now,
         trackingCheckedAt: previous?.trackingCheckedAt,
+        turnover: previous?.turnover,
+        stAnalysis: stAnalysis(candles, now),
         primary: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(candles[u], u, now)])),
         trends,
         screen: previous?.screen,

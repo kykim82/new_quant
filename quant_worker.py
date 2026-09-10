@@ -50,9 +50,23 @@ def public_snapshot(state, now_ms=None):
     stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
     exclusions_ready = payload.get("marketExclusions", {}).get("ready", False)
+    payload["stRecommendations"] = [] if stale or not exclusions_ready else [
+        c for c in payload.get("stRecommendations", [])
+        if entry_gate_current(c, now_ms)
+        and c.get("turnover", {}).get("ready")
+        and c["turnover"].get("average3d", 0) >= 1_000_000_000
+        and c["turnover"].get("candleClose") == now_ms // 3_600_000 * 3_600_000
+    ]
     for unit, coverage in payload.get("primaryCoverage", {}).items():
         if coverage.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
-            coverage.update(buy=0, sell=0, pending=coverage["total"])
+            coverage.update(buy=0, sell=0, pending=coverage["total"], inspected=0,
+                            waiting=coverage["total"], unavailable=0, detailChecked=0)
+            for detail in coverage.get("details", []):
+                detail["status"] = "recheck" if detail.get("checkedAt") else "unscanned"
+                detail["detailChecked"] = False
+            coverage["counts"] = {"unscanned": coverage["total"] - coverage["checked"],
+                                  "recheck": coverage["checked"]}
+            coverage["candleClose"] = now_ms // (int(unit) * 60_000) * (int(unit) * 60_000)
     payload["promising"] = [] if stale or not exclusions_ready else [c for c in payload.get("promising", [])
         if c.get("dailyQuality", {}).get("ready")
         and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
