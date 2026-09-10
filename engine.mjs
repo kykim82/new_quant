@@ -319,9 +319,12 @@ var REASONS = {
   ENGINE_WARMUP: "새 지표 이력 준비 · 순차 재분석 대기",
   SAVED_PLAN_WAITING: "가격 계획 보존 · 신규 진입 대기"
 };
+function isAnalysisMarket(market) {
+  return !market.warned && market.market !== "KRW-USDT";
+}
 function nextMarkets(markets, tickers, checked) {
   const volumes = new Map(tickers.map((t) => [t.market, t.quoteVolume24h]));
-  return markets.filter((m) => !m.warned && volumes.has(m.market)).sort((a, b) => (checked.get(a.market) ?? 0) - (checked.get(b.market) ?? 0) || (volumes.get(b.market) ?? 0) - (volumes.get(a.market) ?? 0) || a.market.localeCompare(b.market));
+  return markets.filter((m) => isAnalysisMarket(m) && volumes.has(m.market)).sort((a, b) => (checked.get(a.market) ?? 0) - (checked.get(b.market) ?? 0) || (volumes.get(b.market) ?? 0) - (volumes.get(a.market) ?? 0) || a.market.localeCompare(b.market));
 }
 function emptyCandles() {
   return { "15": [], "60": [], "240": [] };
@@ -785,7 +788,7 @@ function applyDailySelection(candidate, selection, now) {
       labels: selection.recommendation.labels, reasons: selection.recommendation.reasons, flow: selection.flow } };
 }
 function promisingMarkets(results, markets, tickers, excluded, now) {
-  const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m]));
+  const safe = new Map(markets.filter(isAnalysisMarket).map((m) => [m.market, m]));
   const quotes = new Map(tickers.map((t) => [t.market, t]));
   return results.filter((r) => safe.has(r.market) && !excluded.has(r.market) && r.selection?.version === 2 && r.selection.promising
     && r.dailyQuality?.ready && r.dailyQuality.latestActualClose === boundaryFor(1440, now)
@@ -964,7 +967,7 @@ function recommendationRisk(result, ticker, now) {
 }
 function rankedStRecommendations(results, markets, prices, now) {
   if (markets.exclusionStatus?.ready === false) return [];
-  const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m])), candidates = [];
+  const safe = new Map(markets.filter(isAnalysisMarket).map((m) => [m.market, m])), candidates = [];
   for (const result of results) {
     const market = safe.get(result.market), ticker = prices.get(result.market);
     if (!market || !ticker || !highTurnover(result, now)) continue;
@@ -2212,7 +2215,7 @@ var CANDLE_BUDGET = 240;
 // 정밀 결과 저장 시간을 확보하고 다음 대기 검사 회차가 밀리지 않게 한다.
 var MARKET_BATCH = 20;
 function summarizeMarkets(results, markets, tickers, regime, now, executions = /* @__PURE__ */ new Map()) {
-  const safe = new Map(markets.filter((m) => !m.warned).map((m) => [m.market, m]));
+  const safe = new Map(markets.filter(isAnalysisMarket).map((m) => [m.market, m]));
   const prices = new Map(tickers.map((t) => [t.market, t]));
   const valid = results.filter((r) => safe.has(r.market));
   const eligible = new Set(tickers.filter((t) => safe.has(t.market) && highTurnover(results.find((r) => r.market === t.market), now)).map((t) => t.market));
@@ -2327,6 +2330,7 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
     marketRegime: regime,
     btcPrice: btc?.tradePrice ?? null,
     btcChangeRate: btc?.signedChangeRate ?? null,
+    userExcludedMarkets: markets.filter((m) => m.market === "KRW-USDT").map((m) => ({ market: m.market, name: m.koreanName, reason: "사용자 지정 제외" })),
     marketExclusions: { ...(markets.exclusionStatus ?? { ready: true }), excluded: markets.filter((m) => m.warned).map((m) => ({ market: m.market, reason: m.exclusionReason ?? "거래 유의 종목" })) },
     primaryCoverage: Object.fromEntries([15, 60].map((unit) => {
       const end = boundaryFor(unit, now);
@@ -2375,6 +2379,10 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
   };
 }
 function cachedPayload(payload, now, error) {
+  payload = { ...payload };
+  for (const key of ["stRecommendations", "scalp", "swing", "promising", "watchlist", "volumeMonitor"]) {
+    if (payload[key]) payload[key] = payload[key].filter((c) => c.market !== "KRW-USDT");
+  }
   const stale = payload.schemaVersion !== 5 || now - payload.generatedAt > 3 * 6e4 || Boolean(error);
   return {
     ...payload,
@@ -2644,7 +2652,7 @@ async function refreshDashboard(db, options = {}) {
         await writeStoredPlans(db, result);
       }
     }
-    const safeCodes = new Set(markets.filter((m) => !m.warned).map((m) => m.market));
+    const safeCodes = new Set(markets.filter(isAnalysisMarket).map((m) => m.market));
     const executionCodes = [.../* @__PURE__ */ new Set([
       ...prepared.map((p) => p.market.market),
       ...[...results.values()].filter((r) => safeCodes.has(r.market) && now - r.analyzedAt <= SIGNAL_FRESH_MS && (r.candidates.length > 0 || r.plans?.some((p) => p.candidate.entryStatus === "ready"))).map((r) => r.market)

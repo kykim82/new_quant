@@ -47,6 +47,9 @@ def public_snapshot(state, now_ms=None):
     payload = view.get("payload")
     if not payload:
         return view
+    for key in ("stRecommendations", "scalp", "swing", "promising", "watchlist", "volumeMonitor"):
+        if key in payload:
+            payload[key] = [c for c in payload[key] if c.get("market") != "KRW-USDT"]
     stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
     exclusions_ready = payload.get("marketExclusions", {}).get("ready", False)
@@ -88,7 +91,7 @@ def public_snapshot(state, now_ms=None):
             plan["entryBlockReason"] = "최신 분석과 진입 조건 재확인 대기"
     # 분석 지연이나 진입 만료는 추천 원장을 삭제하거나 종료시키지 않는다.
     for recommendation in payload.get("recommendations", {}).get("active", []):
-        if stale or not exclusions_ready or not entry_gate_current(recommendation, now_ms) or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
+        if recommendation.get("market") == "KRW-USDT" or stale or not exclusions_ready or not entry_gate_current(recommendation, now_ms) or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
             recommendation["entryStatus"] = "waiting"
             recommendation["currentAssessment"] = None
         record = recommendation["tracking"]

@@ -365,6 +365,7 @@ def dashboard(worker):
         st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · {exclusion_label}")
         if exclusions.get("source") == "upbit-open-api":
             st.caption("제외 기준 · 공식 API의 유의 지정·거래지원 상태·종료일을 확인합니다.")
+        st.caption("추가 제외 · 테더(USDT)")
         turnover_coverage = payload.get("turnoverCoverage")
         if turnover_coverage:
             st.caption(f"최근 완료 72시간 거래대금 합계 ÷ 3 · 10억 원 이상 {turnover_coverage['high']}종목 · 미만 {turnover_coverage['low']}종목 · 분류 중 {turnover_coverage['pending']}종목")
