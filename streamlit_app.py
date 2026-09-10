@@ -322,28 +322,36 @@ def dashboard(worker):
     st.caption("신규 추천은 최신 완료 일봉과 필수 시간대의 실제 봉·지표 이력 확인 후 표시합니다. 수집·복구 대기 중에도 기존 추천 기록은 보존합니다.")
     candidates = [*payload["scalp"], *payload["swing"]] if not stale else []
     tracking = payload.get("recommendations")
-    shown = tracking["active"] if tracking is not None else candidates
-    if stale:
-        shown = [{**c, "currentAssessment": None, "entryStatus": "waiting"} for c in shown]
+    shown = candidates
+    exclusions = payload.get("marketExclusions", {})
+    if exclusions.get("ready") is False:
+        st.warning("유의·거래지원 종료 정보 확인 대기 중입니다. 신규 추천을 잠시 보류하고 기존 기록을 추적합니다.")
+    st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · 유의·거래지원 종료 제외 {len(exclusions.get('excluded', []))}종목")
+    for unit, label in (("15", "15분"), ("60", "1시간")):
+        coverage = payload.get("primaryCoverage", {}).get(unit)
+        if coverage:
+            st.caption(f"{label} ST · 대상 {coverage['total']}종목 · Buy {coverage['buy']} · Sell {coverage['sell']} · 확인 대기 {coverage['pending']} · 검사 이력 {coverage['checked']}/{coverage['total']} · 완료봉 {stamp(coverage['candleClose'])}")
     st.subheader("1. 추천 종목")
-    st.caption("새 매수 후보와 이전 추천을 함께 보여줍니다. 상위 순위가 상승 전 추천을 뜻하지는 않습니다.")
+    st.caption("단타는 15분, 스윙은 1시간 완료봉 ST Buy에서 신규 진입 조건을 충족한 종목입니다. ST Sell과 이전 추천 추적은 이 표에 포함하지 않습니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
             st.caption(f"{label} {len(selected)}종목 · 최대 10종목")
             if selected:
-                table = recommendation_table(selected) if tracking is not None else candidate_table(selected)
+                table = candidate_table(selected)
                 st.dataframe(sortable_candidate_table(selected, table.drop(columns=["구분"])),
                              hide_index=True, width="stretch", height=(len(selected) + 1) * 35 + 3,
                              key=f"recommendations-{strategy}")
-                if tracking is not None:
-                    with st.expander("추천 전후 비교"):
-                        st.dataframe(recommendation_timing_table(selected), hide_index=True, width="stretch")
-                        st.caption("당시 당일 등락은 추천 때의 업비트 전일 종가 대비입니다. 추천 후 등락은 당시 실제 시세에서 현재가까지의 변화이며, 최고 상승률이나 실제 매매 수익률은 아닙니다.")
-                        st.caption("최초 추천은 해당 추천 기록의 분석 회차 시각(KST)입니다. 다시 추천된 종목은 새 기록으로 비교하며, 당시 시세의 기준 시각은 가격 옆에 표시합니다.")
             else:
                 st.info("현재 조건에 맞는 추천이 없습니다.")
-    st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 순위 밖 추천도 DB 추적은 유지하며 종목 상세에서 확인할 수 있습니다.")
+    st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 추천에서 제외된 종목도 과거 기록과 추적을 유지합니다.")
+    if tracking and tracking.get("active"):
+        with st.expander("과거 추천 추적 · 신규 추천과 별도"):
+            previous = tracking["active"]
+            st.caption("최초 추천의 고정 가격 계획입니다. 이 표에 있다는 이유로 현재 신규 매수 가능한 것은 아닙니다.")
+            st.dataframe(sortable_candidate_table(previous, recommendation_table(previous)),
+                         hide_index=True, width="stretch", key="past-recommendation-tracking")
+            st.dataframe(recommendation_timing_table(previous), hide_index=True, width="stretch")
     st.subheader("2. 유망 종목")
     active_markets = {c["market"] for c in shown}
     promising = [] if stale else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]

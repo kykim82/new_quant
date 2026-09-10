@@ -32,6 +32,15 @@ def quality_current(quality, now_ms):
     )
 
 
+def entry_gate_current(candidate, now_ms):
+    gate = candidate.get("entryGate") or {}
+    unit = 15 if candidate.get("strategy") == "scalp" else 60
+    end = now_ms // (unit * 60_000) * (unit * 60_000)
+    return (gate.get("version") == 1 and gate.get("unit") == unit and gate.get("ready")
+            and gate.get("direction") == 1 and gate.get("closeTime") == end
+            and gate.get("latestActualClose") == end)
+
+
 def public_snapshot(state, now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     view = copy.deepcopy(state)
@@ -40,24 +49,29 @@ def public_snapshot(state, now_ms=None):
         return view
     stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
-    payload["promising"] = [] if stale else [c for c in payload.get("promising", [])
+    exclusions_ready = payload.get("marketExclusions", {}).get("ready", False)
+    for unit, coverage in payload.get("primaryCoverage", {}).items():
+        if coverage.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
+            coverage.update(buy=0, sell=0, pending=coverage["total"])
+    payload["promising"] = [] if stale or not exclusions_ready else [c for c in payload.get("promising", [])
         if c.get("dailyQuality", {}).get("ready")
         and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
     for strategy in ("scalp", "swing"):
-        payload[strategy] = [] if stale else [
+        payload[strategy] = [] if stale or not exclusions_ready else [
             c for c in payload.get(strategy, [])
             if c.get("entryStatus", "ready") == "ready"
+            and entry_gate_current(c, now_ms)
             and quality_current(c.get("dataQuality"), now_ms)
             and c.get("entryValidUntil", c["plan"]["expiresAt"]) > now_ms
         ]
     # 원래 분석 시각·가격 계획은 유지하고 현재 시각으로 신규 진입만 막는다.
     for plan in payload.get("savedPlans", []):
-        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or not quality_current(plan.get("dataQuality"), now_ms) or plan.get("entryValidUntil", 0) <= now_ms):
+        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or not exclusions_ready or not entry_gate_current(plan, now_ms) or not quality_current(plan.get("dataQuality"), now_ms) or plan.get("entryValidUntil", 0) <= now_ms):
             plan["entryStatus"] = "waiting"
             plan["entryBlockReason"] = "최신 분석과 진입 조건 재확인 대기"
     # 분석 지연이나 진입 만료는 추천 원장을 삭제하거나 종료시키지 않는다.
     for recommendation in payload.get("recommendations", {}).get("active", []):
-        if stale or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
+        if stale or not exclusions_ready or not entry_gate_current(recommendation, now_ms) or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
             recommendation["entryStatus"] = "waiting"
             recommendation["currentAssessment"] = None
         record = recommendation["tracking"]
