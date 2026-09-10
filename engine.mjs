@@ -2277,7 +2277,7 @@ async function refreshDashboard(db, options = {}) {
       if (!cached.has(market)) cached.set(market, await readCandles(db, market) ?? emptyCandles());
       return cached.get(market);
     };
-    const collect = async (market, units, maxPages = 3) => {
+    const collect = async (market, units, maxPages = 3, persist = true) => {
       let cache = await load(market);
       for (const unit of units) {
         for (let page = 0; page < maxPages && candleUnitDue(cache, unit, now); page++) {
@@ -2285,7 +2285,7 @@ async function refreshDashboard(db, options = {}) {
           budget--;
           cache = await refreshCandleUnit(market, unit, cache, now);
           cached.set(market, cache);
-          await writeCandles(db, market, cache);
+          if (persist) await writeCandles(db, market, cache);
         }
       }
       return true;
@@ -2315,21 +2315,44 @@ async function refreshDashboard(db, options = {}) {
     }
     // 거래대금에 관계없이 전체 대상의 15분·1시간 ST를 오래된 검사부터 순환한다.
     const primaryChecked = new Map([...results.values()].map((r) => [r.market, r.primaryCheckedAt ?? 0]));
-    for (const market of nextMarkets(markets, tickers, primaryChecked).slice(0, 24)) {
-      if (budget <= 20 || Date.now() - startedAt > 22000) break;
-      const previous = baseResult(market.market);
-      let primary;
-      try {
-        await collect(market.market, [15, 60], 1);
-        const cache = await load(market.market);
-        primary = Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now)]));
-      } catch (error) {
-        if (error instanceof UpbitApiError && [418, 429].includes(error.status)) throw error;
-        primary = Object.fromEntries([15, 60].map((u) => [u, { version: 1, unit: u, checkedAt: now, ready: false, state: "unknown", error: error.message }]));
+    const primaryQueue = nextMarkets(markets, tickers, primaryChecked).filter((market) =>
+      ![15, 60].every((u) => results.get(market.market)?.primary?.[u]?.ready
+        && results.get(market.market).primary[u].closeTime === boundaryFor(u, now))).slice(0, 24);
+    for (let offset = 0; offset < primaryQueue.length; offset += 4) {
+      if (budget <= 20 || Date.now() - startedAt > 32000) break;
+      const group = primaryQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
+      if (missing.length) {
+        const loaded = await db.batch(missing.map((m) => db.prepare("SELECT COALESCE((SELECT candles_json FROM candle_cache WHERE market = ?), (SELECT candles_json FROM market_analysis WHERE market = ?)) AS candles_json").bind(m.market, m.market)));
+        missing.forEach((m, i) => cached.set(m.market, loaded[i].results[0]?.candles_json ? JSON.parse(loaded[i].results[0].candles_json) : emptyCandles()));
       }
-      const result = { ...previous, primary, primaryCheckedAt: now };
-      results.set(market.market, result);
-      await writeMarket(db, result, await load(market.market), checked.get(market.market) ?? 0);
+      const writes = [];
+      let rateError;
+      try {
+        for (const market of group) {
+          if (budget <= 20 || Date.now() - startedAt > 32000) break;
+          const previous = baseResult(market.market);
+          let primary;
+          try {
+            await collect(market.market, [15, 60], 1, false);
+            const cache = await load(market.market);
+            primary = Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now)]));
+          } catch (error) {
+            primary = Object.fromEntries([15, 60].map((u) => [u, { version: 1, unit: u, checkedAt: now, ready: false, state: "unknown", error: error.message }]));
+            if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+          }
+          const result = { ...previous, primary, primaryCheckedAt: now }, candlesJson = JSON.stringify(await load(market.market));
+          results.set(market.market, result);
+          writes.push(
+            db.prepare("INSERT INTO candle_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json").bind(market.market, candlesJson),
+            db.prepare("INSERT INTO market_analysis VALUES (?, ?, ?, ?) ON CONFLICT(market) DO UPDATE SET checked_at=excluded.checked_at, result_json=excluded.result_json, candles_json=excluded.candles_json").bind(market.market, checked.get(market.market) ?? 0, JSON.stringify(result), candlesJson)
+          );
+          if (rateError) break;
+        }
+      } finally {
+        // 연결 오류·요청 제한에도 이 묶음에서 이미 받은 실제 봉과 검사 결과를 함께 저장한다.
+        if (writes.length) await db.batch(writes);
+      }
+      if (rateError) throw rateError;
     }
     await collect("KRW-BTC", [60, 240]);
     const btcCandles = await load("KRW-BTC");
