@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-from quant_worker import AnalysisWorker, SECRET_KEYS, quality_current
+from quant_worker import AnalysisWorker, SECRET_KEYS
 
 KST = timezone(timedelta(hours=9))
 
@@ -173,41 +173,8 @@ def recommendation_timing_table(candidates):
 
 
 def strategy_rows(candidates, strategy):
-    rows = []
-    for c in candidates:
-        if c["strategy"] != strategy or c.get("entryStatus") != "ready" or c.get("trackingDelayed"):
-            continue
-        record = c.get("tracking") or {}
-        if record.get("status") in {"closing", "closed", "unfilled"} or any(
-                record.get(key) for key in ("reached", "sold", "entryMissedAt", "endedAt")):
-            continue
-        rows.append(c)
+    rows = [c for c in candidates if c["strategy"] == strategy]
     return [{**c, "rank": index + 1} for index, c in enumerate(rows[:10])]
-
-
-def recommendation_empty_message(payload, strategy, stale, now_ms):
-    coverage = payload.get("coverage") or {}
-    observations = [o for o in payload.get("watchlist", []) if o.get("strategy") == strategy]
-    rows = [c for c in [*(payload.get("recommendations") or {}).get("active", []),
-                       *payload.get("savedPlans", [])] if c.get("strategy") == strategy]
-    pending = stale or any(coverage.get(key, 0) > 0 for key in ("pendingMarketCount", "delayedMarketCount"))
-    pending = pending or any(o.get("code") in {"DATA_DELAYED", "ENGINE_WARMUP", "INSUFFICIENT_DATA"} for o in observations)
-    for c in rows:
-        record = c.get("tracking") or {}
-        if c.get("entryStatus") in {"stopped", "completed"} or any(
-                record.get(key) for key in ("reached", "sold", "entryMissedAt", "endedAt")):
-            continue
-        pending = pending or c.get("trackingDelayed") or not quality_current(c.get("dataQuality"), now_ms)
-        pending = pending or 0 < c.get("entryValidUntil", 0) <= now_ms
-    if pending:
-        summary = ""
-        if all(key in coverage for key in ("freshMarketCount", "eligibleMarketCount", "pendingMarketCount", "delayedMarketCount")):
-            summary = (f"최근 분석 {coverage['freshMarketCount']}/{coverage['eligibleMarketCount']}종목 · "
-                       f"첫 분석 대기 {coverage['pendingMarketCount']}종목 · 재분석 지연 {coverage['delayedMarketCount']}종목. ")
-        return f"현재 표시 가능한 추천이 없습니다. {summary}일부 데이터·추적 확인 중입니다."
-    if not rows and not observations and not coverage.get("freshMarketCount"):
-        return "분석 결과 확인 중입니다. 아직 추천 여부를 확정할 수 없습니다."
-    return "현재 확인된 분석 결과에서 매수 조건을 충족한 종목이 없습니다."
 
 
 def promising_table(candidates):
@@ -359,7 +326,7 @@ def dashboard(worker):
     if stale:
         shown = [{**c, "currentAssessment": None, "entryStatus": "waiting"} for c in shown]
     st.subheader("1. 추천 종목")
-    st.caption("지금 신규 진입 조건을 충족한 종목만 표시합니다. 1차 목표 도달 이력이 있거나 진입·최신 봉 확인을 기다리는 기존 추천은 제외합니다.")
+    st.caption("새 매수 후보와 이전 추천을 함께 보여줍니다. 상위 순위가 상승 전 추천을 뜻하지는 않습니다.")
     for tab, strategy, label in zip(st.tabs(["단타 · 15분", "스윙 · 1시간"]), ("scalp", "swing"), ("단타", "스윙")):
         with tab:
             selected = strategy_rows(shown, strategy)
@@ -375,8 +342,8 @@ def dashboard(worker):
                         st.caption("당시 당일 등락은 추천 때의 업비트 전일 종가 대비입니다. 추천 후 등락은 당시 실제 시세에서 현재가까지의 변화이며, 최고 상승률이나 실제 매매 수익률은 아닙니다.")
                         st.caption("최초 추천은 해당 추천 기록의 분석 회차 시각(KST)입니다. 다시 추천된 종목은 새 기록으로 비교하며, 당시 시세의 기준 시각은 가격 옆에 표시합니다.")
             else:
-                st.info(recommendation_empty_message(payload, strategy, stale, int(datetime.now(KST).timestamp() * 1000)))
-    st.caption("추천 표에서 빠져도 기존 기록은 DB에 남아 목표가·단타 15분·스윙 1시간 종가 손절을 계속 추적합니다. 4. 종목 상세 분석에서 기존 추천 기록을 확인할 수 있습니다.")
+                st.info("현재 조건에 맞는 추천이 없습니다.")
+    st.caption("단타 15분·스윙 1시간 종가 손절을 추적합니다. 순위 밖 추천도 DB 추적은 유지하며 종목 상세에서 확인할 수 있습니다.")
     st.subheader("2. 유망 종목")
     active_markets = {c["market"] for c in shown}
     promising = [] if stale else [c for c in payload.get("promising", []) if c["market"] not in active_markets][:10]
