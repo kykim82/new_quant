@@ -200,7 +200,11 @@ def recommendation_empty_message(payload, strategy, stale, now_ms):
         pending = pending or c.get("trackingDelayed") or not quality_current(c.get("dataQuality"), now_ms)
         pending = pending or 0 < c.get("entryValidUntil", 0) <= now_ms
     if pending:
-        return "최신 분석·추적 확인 중입니다. 확인이 끝난 종목부터 추천을 표시합니다."
+        summary = ""
+        if all(key in coverage for key in ("freshMarketCount", "eligibleMarketCount", "pendingMarketCount", "delayedMarketCount")):
+            summary = (f"최근 분석 {coverage['freshMarketCount']}/{coverage['eligibleMarketCount']}종목 · "
+                       f"첫 분석 대기 {coverage['pendingMarketCount']}종목 · 재분석 지연 {coverage['delayedMarketCount']}종목. ")
+        return f"현재 표시 가능한 추천이 없습니다. {summary}일부 데이터·추적 확인 중입니다."
     if not rows and not observations and not coverage.get("freshMarketCount"):
         return "분석 결과 확인 중입니다. 아직 추천 여부를 확정할 수 없습니다."
     return "현재 확인된 분석 결과에서 매수 조건을 충족한 종목이 없습니다."

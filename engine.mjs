@@ -727,7 +727,7 @@ function dailySelection(candles = [], now) {
   const bars = candles.filter((c) => c.closeTime <= boundaryFor(1440, now));
   const trend = movingAverageState(bars);
   const ready = bars.length >= 63 && bars.at(-1).closeTime === boundaryFor(1440, now)
-    && bars.slice(-25).every((c, i, recent) => !c.synthetic && (!i || c.openTime === recent[i - 1].closeTime));
+    && bars.slice(-25).every((c, i, recent) => !unverifiedGap(c) && (!i || c.openTime === recent[i - 1].closeTime));
   const baseline = bars.slice(-25, -5);
   const averageVolume = simpleAverage(baseline.map((c) => c.baseVolume), 20);
   const averageTurnover = simpleAverage(baseline.map((c) => c.quoteVolume), 20);
@@ -806,7 +806,7 @@ function liquidityEligible(ticker, screen, now) {
 function frameStructure(candles, previousTrend) {
   if (candles.length < 60) return { ready: false, alive: false, early: false, score: 0, reason: "추세 이력 준비" };
   const recent = candles.slice(-12);
-  if (recent.some((c, i) => c.synthetic || i > 0 && c.openTime !== recent[i - 1].closeTime)) {
+  if (recent.some((c, i) => unverifiedGap(c) || i > 0 && c.openTime !== recent[i - 1].closeTime)) {
     return { ready: false, alive: false, early: false, score: 0, reason: "최근 누락 봉 확인 필요" };
   }
   const closes = candles.map((c) => c.close);
@@ -872,7 +872,7 @@ function trendSet(input) {
   return input.trends ?? { "15": advanceTrends(input.candles["15"]), "60": advanceTrends(input.candles["60"]), "240": advanceTrends(input.candles["240"]) };
 }
 function hasRecentSynthetic(candles, count) {
-  return candles.slice(-count).some((candle) => candle.synthetic);
+  return candles.slice(-count).some(unverifiedGap);
 }
 function chartSet(input) {
   if (input.includeCharts === false) return { "15": [], "60": [], "240": [] };
@@ -1556,21 +1556,25 @@ async function fetchCandlePage(market, unit, to) {
 function candleUnitDue(cache, unit, now) {
   return candleRequest(cache, unit, now) !== null;
 }
+function unverifiedGap(candle) {
+  return candle.synthetic && candle.noTrade !== true;
+}
 function candleQuality(cache, unit, now) {
   const required = unit === 1440 ? 370 : 400;
   const bars = (cache[unit] ?? []).filter((b) => b.closeTime <= boundaryFor(unit, now));
   const recent = bars.slice(-required), actual = bars.filter((b) => !b.synthetic);
-  const gapCount = recent.filter((b, i) => b.synthetic || i > 0 && b.openTime !== recent[i - 1].closeTime).length;
+  const gapCount = recent.filter((b, i) => unverifiedGap(b) || i > 0 && b.openTime !== recent[i - 1].closeTime).length;
+  const noTradeBars = recent.filter((b) => b.synthetic && b.noTrade === true).length;
   const exhausted = cache.collection?.[unit]?.exhausted === true;
-  const enough = bars.length >= required || unit === 1440 && exhausted && bars.length >= 63;
+  const enough = actual.length >= required || unit === 1440 && exhausted && actual.length >= 63;
   const latestActualClose = actual.at(-1)?.closeTime ?? 0;
   const valid = recent.every((b) => [b.open, b.high, b.low, b.close, b.baseVolume, b.quoteVolume].every(Number.isFinite)
     && b.low > 0 && b.low <= Math.min(b.open, b.close) && b.high >= Math.max(b.open, b.close)
     && b.baseVolume >= 0 && b.quoteVolume >= 0 && b.closeTime === b.openTime + unit * 60000);
   const ready = enough && valid && !gapCount && latestActualClose === boundaryFor(unit, now);
-  return { ready, actualBars: actual.length, required, gapCount, exhausted, latestActualClose,
+  return { ready, actualBars: actual.length, required, gapCount, noTradeBars, exhausted, latestActualClose,
     expectedClose: boundaryFor(unit, now), reason: ready ? "완료 봉·이력 확인" : !valid ? "봉 값 오류 확인 대기"
-      : gapCount || latestActualClose !== boundaryFor(unit, now) ? "누락·최신 실제 봉 복구 대기" : "지표 과거 이력 보충 중" };
+      : !gapCount && bars.at(-1)?.noTrade ? "최근 완료 구간 거래 없음" : gapCount || latestActualClose !== boundaryFor(unit, now) ? "누락·최신 실제 봉 복구 대기" : "지표 과거 이력 보충 중" };
 }
 function recommendationQuality(cache, strategy, now) {
   const units = strategy === "scalp" ? [15, 60, 240, 1440] : [60, 240, 1440];
@@ -1585,12 +1589,16 @@ function candleRequest(cache, unit, now) {
   const bars = cache[unit] ?? [], state = cache.collection?.[unit] ?? {};
   if (state.retryAt > now) return null;
   const end = boundaryFor(unit, now), last = bars.at(-1);
-  if (!last || last.closeTime < end || last.synthetic) return { to: end, kind: "latest" };
+  if (!last || last.closeTime < end || unverifiedGap(last)) return { to: end, kind: "latest" };
   const required = unit === 1440 ? 370 : 400;
-  const gaps = bars.slice(-HISTORY_BARS).filter((b, i, recent) => b.synthetic || i > 0 && b.openTime !== recent[i - 1].closeTime);
+  const gaps = bars.slice(-HISTORY_BARS).filter((b, i, recent) => unverifiedGap(b) || i > 0 && b.openTime !== recent[i - 1].closeTime);
   const gap = gaps.findLast((b) => b.openTime < (state.gapBefore ?? Infinity)) ?? gaps.at(-1);
-  if (gap) return { to: gap.synthetic ? gap.closeTime : gap.openTime, kind: "gap" };
-  if (bars.length < required && !state.exhausted) return { to: bars[0].openTime, kind: "history" };
+  if (gap) {
+    // 빈 구간 다음의 실제 봉까지 함께 조회해야 양쪽 경계로 무체결을 확인할 수 있다.
+    const following = bars.find((b) => !b.synthetic && b.openTime >= gap.closeTime);
+    return { to: following?.closeTime ?? (gap.synthetic ? gap.closeTime : gap.openTime), kind: "gap" };
+  }
+  if (bars.filter((b) => !b.synthetic).length < required && !state.exhausted) return { to: bars[0].openTime, kind: "history" };
   return null;
 }
 function cachedTrends(cache, unit, previous, now) {
@@ -1623,15 +1631,21 @@ async function refreshCandleUnit(market, unit, cache, asOf) {
   }));
   const candles = normalizeCandles([...retained, ...page], unit, asOf).slice(-HISTORY_BARS);
   const old = new Map(existing.map((b) => [b.openTime, b])), lastClose = existing.at(-1)?.closeTime ?? 0;
+  // 성공 응답이 실제로 덮는 범위만 무체결로 확인한다. 페이지 사이의 미수집 구간은 그대로 남긴다.
+  const coveredFrom = page.length && page.every((r) => r.market === market && parseUtc(r.candle_date_time_utc) % (unit * 60000) === 0)
+    ? Math.min(...page.map((r) => parseUtc(r.candle_date_time_utc))) : Infinity;
+  const coveredThrough = page.length ? Math.max(...page.map((r) => parseUtc(r.candle_date_time_utc))) + unit * 60000 : 0;
+  for (const b of candles) if (b.synthetic && (old.get(b.openTime)?.noTrade === true
+    || b.openTime >= coveredFrom && b.closeTime <= Math.min(request.to, coveredThrough))) b.noTrade = true;
   const changed = candles.some((b) => b.closeTime <= lastClose && (!old.has(b.openTime)
-    || ["open", "high", "low", "close", "baseVolume", "quoteVolume", "synthetic"].some((k) => b[k] !== old.get(b.openTime)[k])));
+    || ["open", "high", "low", "close", "baseVolume", "quoteVolume", "synthetic", "noTrade"].some((k) => b[k] !== old.get(b.openTime)[k])));
   const state = cache.collection?.[unit] ?? {};
   const progress = candles.filter((b) => !b.synthetic).length > existing.filter((b) => !b.synthetic).length || changed;
   return { ...cache, [key]: candles, collection: { ...cache.collection, [unit]: {
     checkedAt: asOf, revision: (state.revision ?? 0) + Number(changed),
     exhausted: state.exhausted || request.kind === "history" && page.length === 0,
     gapBefore: request.kind === "gap" ? page.length ? Math.min(...page.map((r) => parseUtc(r.candle_date_time_utc))) : request.to - unit * 60000 : state.gapBefore,
-    retryAt: request.kind === "gap" && !progress || candles.at(-1)?.synthetic ? asOf + 60000 : 0
+    retryAt: request.kind === "gap" && !progress || candles.length && unverifiedGap(candles.at(-1)) ? asOf + 60000 : 0
   } } };
 }
 async function fetchExecutionQualities(markets, notionalKrw, asOf) {
@@ -1846,7 +1860,7 @@ function advanceRecommendation(original, candles, now) {
   for (const stopBar of stops) byTime.set(stopBar.closeTime, { ...byTime.get(stopBar.closeTime), stopBar });
   for (const [at, { bar, stopBar }] of [...byTime].sort((a, b) => a[0] - b[0])) {
     if (bar) {
-      if (bar.openTime > Math.ceil(trade.lastClose / 9e5) * 9e5 || bar.synthetic) {
+      if (bar.openTime > Math.ceil(trade.lastClose / 9e5) * 9e5 || unverifiedGap(bar)) {
         excludeRecommendation(trade, "candle_data_gap", at);
       }
       trade.lastClose = at;
@@ -1881,7 +1895,7 @@ function advanceRecommendation(original, candles, now) {
       }
     }
     if (stopBar) {
-      if (stopBar.openTime > trade.stopCheckedThrough || stopBar.synthetic) excludeRecommendation(trade, "stop_data_gap", at);
+      if (stopBar.openTime > trade.stopCheckedThrough || unverifiedGap(stopBar)) excludeRecommendation(trade, "stop_data_gap", at);
       if (trade.status === "open" && trade.lastClose < at) excludeRecommendation(trade, "candle_data_gap", at);
       trade.stopCheckedThrough = at;
       if (!stopBar.synthetic && stopBar.close < trade.stop) {
@@ -1975,9 +1989,18 @@ function advanceSavedPlan(original, candles, price, now) {
   if (result.stoppedAt !== void 0 || result.completedAt !== void 0) return result;
   const plan = original.candidate.plan;
   const duration = result.stopTimeframe * 6e4;
+  // 과거 공백이 모두 검증된 경우에만 전 구간을 재검사한다. 가격·기존 목표 도달 이력은 보존한다.
+  if (result.hasGap) {
+    const history = candles.filter((c) => c.closeTime > result.monitoringStartedAt && c.closeTime <= result.checkedThrough);
+    if (history.length && history[0].openTime <= result.monitoringStartedAt && history.at(-1).closeTime === result.checkedThrough
+      && history.every((c, i) => !unverifiedGap(c) && c.closeTime - c.openTime === duration && (!i || c.openTime === history[i - 1].closeTime))) {
+      result.checkedThrough = result.monitoringStartedAt;
+      result.hasGap = false;
+    }
+  }
   const bars = candles.filter((c) => c.closeTime - c.openTime === duration && c.closeTime > result.checkedThrough && c.closeTime <= now);
   for (const bar of bars) {
-    if (bar.openTime > result.checkedThrough || bar.synthetic) result.hasGap = true;
+    if (bar.openTime > result.checkedThrough || unverifiedGap(bar)) result.hasGap = true;
     if (!bar.synthetic) {
       if (bar.openTime >= result.monitoringStartedAt) {
         if (bar.high >= plan.targets[0]) result.targetReachedAt ??= bar.closeTime;
