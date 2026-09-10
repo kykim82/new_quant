@@ -20,7 +20,9 @@ def stamp(value):
 
 
 def price(value):
-    return f"{value:,.0f}원" if value >= 100 else f"{value:,.4f}".rstrip("0").rstrip(".") + "원"
+    if value is None or not math.isfinite(value) or value <= 0:
+        return "—"
+    return f"{value:,.8f}".rstrip("0").rstrip(".") + "원"
 
 
 def current_quote(candidate):
@@ -280,17 +282,13 @@ def symbol_panel(worker):
     if not market:
         return
     if st.button("상세 자동 갱신 중지"):
-        if worker.detail_snapshot()["market"] == market:
-            worker.request_detail(None)
         st.session_state.pop("detail_market", None)
         st.rerun()
-    state = worker.detail_snapshot()
-    if state["market"] is None:
+    try:
         worker.request_detail(market)
-        state = worker.detail_snapshot()
-    if state["market"] != market:
-        st.info("다른 접속에서 상세 종목이 변경되었습니다. 분석 버튼을 눌러 다시 선택해 주세요.")
-        return
+    except ValueError as error:
+        st.warning(str(error))
+    state = worker.detail_snapshot(market)
     detail = state.get("payload")
     if not detail:
         if state.get("error"):

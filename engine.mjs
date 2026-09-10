@@ -671,7 +671,7 @@ function buildConfluencePlan(args) {
     intermediateResistances,
     targetMethod: `${ladder[0].source} 기준 지표 단계 · 독립 근거 중첩/시간대/최신성 순 선택`
   }, args.feeRate, args.execution.buySlippagePct);
-  return plan.netReturns[0] > 0 ? plan : null;
+  return (plan.netReturns?.[0] ?? -1) > 0 ? plan : null;
 }
 
 // lib/opportunity.ts
@@ -820,10 +820,6 @@ function screenLiquidity(hourly, now) {
     hourlyRatio,
     average3d: contiguous(96) ? sum(-96, -24) / 3 : null
   };
-}
-function liquidityEligible(ticker, screen, now) {
-  if (ticker.quoteVolume24h >= TURNOVER_MIN) return true;
-  return !!screen && screen.candleClose === Math.floor(now / 36e5) * 36e5 && (screen.increasing || screen.burst);
 }
 function frameStructure(candles, previousTrend) {
   if (candles.length < 60) return { ready: false, alive: false, early: false, score: 0, reason: "추세 이력 준비" };
@@ -2888,6 +2884,9 @@ function tripleStochasticLatest(bars) {
   });
 }
 function symbolDetailAnalysis(input, now) {
+  const liquidityQualified = highTurnover({ turnover: turnoverClass(input.candles, now) }, now);
+  const marketEligible = input.exclusionsReady === true && isAnalysisMarket(input.market);
+  const risk = recommendationRisk({ stAnalysis: stAnalysis(input.candles, now) }, input.ticker, now);
   const daily = dailySelection(input.candles["1440"], now);
   const frames = {};
   for (const unit of [15, 60, 240, 1440]) {
@@ -2906,10 +2905,12 @@ function symbolDetailAnalysis(input, now) {
       const evaluated = evaluate({ ...input, analysisAt: now });
       const calculated = evaluate({ ...input, analysisOnly: true });
       frame.plan = calculated.accepted ? calculated.candidate.plan : null;
-      frame.ready = valid && recommendationQuality(input.candles, unit === 15 ? "scalp" : "swing", now).ready && !input.market.warned && input.liquidityQualified && evaluated.accepted
+      frame.ready = valid && recommendationQuality(input.candles, unit === 15 ? "scalp" : "swing", now).ready && marketEligible && liquidityQualified && risk.ready && !risk.blocked && evaluated.accepted && validPricePlan(evaluated.candidate.plan)
         && evaluated.candidate.score + daily.bonus >= (unit === 15 ? 70 : 72);
-      frame.reason = !valid ? "완료 봉 데이터 확인 대기" : input.market.warned ? "거래소 주의 종목" : frame.ready ? "현재 신규 진입 조건 충족"
-        : REASONS[evaluated.code] ?? (!input.liquidityQualified ? REASONS.LOW_LIQUIDITY : "신규 진입 조건 대기");
+      frame.reason = !valid ? "완료 봉 데이터 확인 대기" : input.exclusionsReady !== true ? "유의·거래지원 종료 정보 확인 대기"
+        : !isAnalysisMarket(input.market) ? "추천 제외 종목" : !liquidityQualified ? REASONS.LOW_LIQUIDITY
+        : !risk.ready ? "상위봉 과열 정보 확인 대기" : risk.blocked ? "상위봉 RSI·이평선 이격 과열"
+        : frame.ready ? "현재 신규 진입 조건 충족" : REASONS[evaluated.code] ?? "신규 진입 조건 대기";
     }
     frames[unit] = frame;
   }
@@ -2961,7 +2962,7 @@ async function refreshSymbolDetail(db, market, now = Date.now()) {
   }
   const detail = symbolDetailAnalysis({ market: info, ticker, candles, trends, execution, marketRegime: regime,
     btcChangeRate: tickers.find((t) => t.market === "KRW-BTC")?.signedChangeRate ?? 0, feeRate: ASSUMED_FEE_RATE,
-    liquidityQualified: liquidityEligible(ticker, screenLiquidity(candles[60], now), now), includeCharts: false }, now);
+    exclusionsReady: markets.exclusionStatus?.ready === true, includeCharts: false }, now);
   detail.history = (await db.prepare("SELECT payload_json FROM paper_signals WHERE market = ? AND variant = ? AND status IN ('closed', 'unfilled', 'closing') ORDER BY json_extract(payload_json, '$.createdAt') DESC LIMIT 10")
     .bind(market, RECOMMENDATION_VERSION).all()).results.map((r) => JSON.parse(r.payload_json));
   await db.prepare("INSERT INTO symbol_detail_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json")

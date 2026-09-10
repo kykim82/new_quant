@@ -1,5 +1,6 @@
 # 루트의 분석 엔진 프로세스를 관리하고 최신 성공·실패 상태를 보관한다.
 import copy
+from collections import OrderedDict
 import json
 import math
 import os
@@ -171,7 +172,8 @@ class AnalysisWorker:
         self._last_event = time.monotonic()
         self._state = {"payload": None, "running": False, "error": None, "last_success": None}
         self._detail_market = None
-        self._detail = {"market": None, "payload": None, "error": None, "running": False}
+        self._details = OrderedDict()
+        self._detail_queue = []
 
     def start(self):
         with self._lock:
@@ -187,27 +189,45 @@ class AnalysisWorker:
             return public_snapshot(self._state)
 
     def request_detail(self, market):
-        if market is not None and not re.fullmatch(r"KRW-[A-Z0-9]{1,20}", market):
+        if not isinstance(market, str) or not re.fullmatch(r"KRW-[A-Z0-9]{1,20}", market):
             raise ValueError("종목 코드를 확인해 주세요.")
         with self._lock:
-            if market == self._detail_market:
+            state = self._details.get(market)
+            if state and (state["running"] or time.monotonic() - state["checked_at"] < 10):
                 return
-            self._detail_market = market
-            self._detail = {"market": market, "payload": None, "error": None, "running": bool(market)}
-            self._send_detail()
+            if state is None:
+                if len(self._details) >= 32:
+                    completed = next((m for m, d in self._details.items() if not d["running"]), None)
+                    if completed is None:
+                        raise ValueError("상세 분석 요청이 많습니다. 잠시 후 다시 시도해 주세요.")
+                    del self._details[completed]
+                state = {"market": market, "payload": None, "error": None, "running": False, "checked_at": 0}
+                self._details[market] = state
+            self._details.move_to_end(market)
+            state["running"] = True
+            self._detail_queue.append(market)
+            if self._detail_market is None:
+                self._next_detail()
+
+    def _next_detail(self):
+        # 잠금을 보유한 호출자만 다음 종목을 선택한다. 동일 종목 요청은 합친다.
+        self._detail_market = self._detail_queue.pop(0) if self._detail_queue else None
+        self._send_detail()
 
     def _send_detail(self):
-        # 호출자는 잠금을 보유한다. 자식 재시작 시에도 선택 종목을 다시 전달한다.
+        # 자식 재시작 시에도 진행 중 종목을 다시 전달한다.
         if self._process and self._process.poll() is None and self._process.stdin:
             try:
                 self._process.stdin.write(json.dumps({"type": "detail", "market": self._detail_market}) + "\n")
                 self._process.stdin.flush()
             except (OSError, ValueError):
-                self._detail["error"] = "분석기 재연결 대기 중입니다."
+                if self._detail_market:
+                    self._details[self._detail_market]["error"] = "분석기 재연결 대기 중입니다."
 
-    def detail_snapshot(self):
+    def detail_snapshot(self, market):
         with self._lock:
-            return copy.deepcopy(self._detail)
+            return copy.deepcopy(self._details.get(market) or {
+                "market": market, "payload": None, "error": None, "running": False})
 
     def _accept(self, event):
         with self._lock:
@@ -217,14 +237,18 @@ class AnalysisWorker:
                 market = event.get("payload", {}).get("market", event.get("market"))
                 if market != self._detail_market:
                     return
+                state = self._details[market]
                 if event["type"] == "detail":
-                    self._detail.update(payload=event["payload"], error=None, running=False)
+                    state.update(payload=event["payload"], error=None, running=False)
                 elif event["type"] == "detail_started":
-                    self._detail["running"] = True
+                    state["running"] = True
                 elif event["type"] == "detail_error":
                     message = str(event["message"])
                     token = self.credentials.get("CLOUDFLARE_API_TOKEN", "")
-                    self._detail.update(error=message.replace(token, "[숨김]") if token else message, running=False)
+                    state.update(error=message.replace(token, "[숨김]") if token else message, running=False)
+                if event["type"] in {"detail", "detail_error"}:
+                    state["checked_at"] = time.monotonic()
+                    self._next_detail()
             elif event["type"] == "started":
                 self._state["running"] = True
                 self._state["started_at"] = event["at"]
