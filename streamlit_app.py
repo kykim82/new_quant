@@ -331,6 +331,8 @@ def dashboard(worker):
         st.warning("현재 저장 결과에는 새 ST 검사 정보가 없습니다. 새 분석 결과를 기다리고 있으며 추천 유무를 판단할 수 없습니다.")
     elif exclusions.get("ready") is not True:
         st.warning("유의·거래지원 종료 정보 확인 대기 중입니다. 신규 추천을 잠시 보류하고 기존 기록을 추적합니다.")
+        if exclusions.get("error"):
+            st.caption(f"공지 조회 오류 · {exclusions['error']}")
     exclusion_label = f"유의·거래지원 종료 제외 {len(exclusions['excluded'])}종목" if exclusions.get("ready") and "excluded" in exclusions else "유의·거래지원 종료 제외 종목 확인 대기"
     st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · {exclusion_label}")
     for unit, label in (("15", "15분"), ("60", "1시간")):
