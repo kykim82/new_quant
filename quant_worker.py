@@ -1,6 +1,7 @@
 # 루트의 분석 엔진 프로세스를 관리하고 최신 성공·실패 상태를 보관한다.
 import copy
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -41,6 +42,41 @@ def entry_gate_current(candidate, now_ms):
             and gate.get("latestActualClose") == end)
 
 
+def price_plan_current(candidate, now_ms):
+    p = candidate.get("plan") or {}
+    targets = p.get("targets")
+    if not isinstance(p.get("id"), str) or not p["id"] or not isinstance(targets, list) or len(targets) != 3:
+        return False
+    values = [p.get(k) for k in ("entryLow", "entryAnchor", "entryHigh", "stop")] + targets + [candidate.get("currentPrice")]
+    if not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in values):
+        return False
+    returns = p.get("netReturns") or []
+    expires = candidate.get("entryValidUntil", p.get("expiresAt"))
+    tolerance = (p["entryHigh"] - p["entryLow"]) * 0.625
+    return (candidate.get("actionableVersion") == 1 and candidate.get("entryStatus") == "ready"
+            and p["stop"] < p["entryLow"] <= p["entryAnchor"] <= p["entryHigh"] < targets[0] < targets[1] < targets[2]
+            and bool(returns) and type(returns[0]) in (int, float) and math.isfinite(returns[0]) and returns[0] > 0
+            and type(expires) in (int, float) and expires > now_ms
+            and type(candidate.get("quoteVolume24h")) in (int, float) and math.isfinite(candidate["quoteVolume24h"]) and candidate["quoteVolume24h"] >= 0
+            and type(candidate.get("averageTurnover3d")) in (int, float) and math.isfinite(candidate["averageTurnover3d"]) and candidate["averageTurnover3d"] >= 1_000_000_000
+            and type(candidate.get("currentPriceAt")) in (int, float) and 0 <= now_ms - candidate["currentPriceAt"] <= 180_000
+            and p["stop"] < candidate["currentPrice"] < targets[0]
+            and p["entryLow"] - tolerance <= candidate["currentPrice"] <= p["entryHigh"] + tolerance
+            and entry_gate_current(candidate, now_ms) and quality_current(candidate.get("dataQuality"), now_ms))
+
+
+def pipeline_current(payload, now_ms):
+    pipeline = payload.get("pipeline") or {}
+    details = pipeline.get("details") or []
+    return (pipeline.get("version") == 1 and pipeline.get("primaryComplete")
+            and pipeline.get("turnoverClose") == now_ms // 3_600_000 * 3_600_000
+            and len(details) == pipeline.get("total")
+            and all(d.get("group") == "low" or d.get("group") == "high" and all(
+                d.get("frames", {}).get(str(u), {}).get("ready")
+                and d["frames"][str(u)].get("candleClose") == now_ms // (u * 60_000) * u * 60_000
+                for u in (15, 60)) for d in details))
+
+
 def public_snapshot(state, now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     view = copy.deepcopy(state)
@@ -53,9 +89,29 @@ def public_snapshot(state, now_ms=None):
     stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
     payload["stale"] = stale
     exclusions_ready = payload.get("marketExclusions", {}).get("ready", False)
-    payload["stRecommendations"] = [] if stale or not exclusions_ready else [
+    pipeline = payload.get("pipeline")
+    if pipeline and pipeline.get("version") == 1:
+        for detail in pipeline["details"]:
+            if detail.get("turnoverClose") != now_ms // 3_600_000 * 3_600_000:
+                detail["group"] = "pending"
+            for unit, frame in detail.get("frames", {}).items():
+                if frame.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
+                    frame["ready"] = False
+        details = pipeline["details"]
+        pipeline["high"] = sum(d["group"] == "high" for d in details)
+        pipeline["low"] = sum(d["group"] == "low" for d in details)
+        pipeline["classified"] = pipeline["high"] + pipeline["low"]
+        pipeline["pending"] = len(details) - pipeline["classified"]
+        pipeline["turnoverComplete"] = exclusions_ready and pipeline["pending"] == 0
+        pipeline["candlesReady"] = sum(d["group"] == "high" and all(d.get("frames", {}).get(str(u), {}).get("ready", False) for u in (15, 60)) for d in details)
+        pipeline["primaryComplete"] = pipeline["turnoverComplete"] and pipeline["candlesReady"] == pipeline["high"]
+        pipeline["complete"] = pipeline["complete"] and pipeline["primaryComplete"]
+        pipeline["stage"] = "exclusions" if not exclusions_ready else "turnover" if not pipeline["turnoverComplete"] else "candles" if not pipeline["primaryComplete"] else "analysis"
+    pipeline_ready = pipeline_current(payload, now_ms)
+
+    payload["stRecommendations"] = [] if stale or not exclusions_ready or not pipeline_ready else [
         c for c in payload.get("stRecommendations", [])
-        if entry_gate_current(c, now_ms)
+        if price_plan_current(c, now_ms)
         and c.get("risk", {}).get("version") == 1
         and c["risk"].get("ready")
         and not c["risk"].get("blocked")
@@ -66,7 +122,7 @@ def public_snapshot(state, now_ms=None):
     for unit, coverage in payload.get("primaryCoverage", {}).items():
         if coverage.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
             coverage.update(buy=0, sell=0, pending=coverage["total"], inspected=0,
-                            waiting=coverage["total"], unavailable=0, detailChecked=0)
+                            waiting=coverage["total"], unavailable=0, noTrade=0, detailChecked=0)
             for detail in coverage.get("details", []):
                 detail["status"] = "recheck" if detail.get("checkedAt") else "unscanned"
                 detail["detailChecked"] = False
@@ -77,9 +133,9 @@ def public_snapshot(state, now_ms=None):
         if c.get("dailyQuality", {}).get("ready")
         and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
     for strategy in ("scalp", "swing"):
-        payload[strategy] = [] if stale or not exclusions_ready else [
+        payload[strategy] = [] if stale or not exclusions_ready or not pipeline_ready else [
             c for c in payload.get(strategy, [])
-            if c.get("entryStatus", "ready") == "ready"
+            if price_plan_current(c, now_ms)
             and entry_gate_current(c, now_ms)
             and quality_current(c.get("dataQuality"), now_ms)
             and c.get("entryValidUntil", c["plan"]["expiresAt"]) > now_ms
