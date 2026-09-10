@@ -53,6 +53,9 @@ def public_snapshot(state, now_ms=None):
     payload["stRecommendations"] = [] if stale or not exclusions_ready else [
         c for c in payload.get("stRecommendations", [])
         if entry_gate_current(c, now_ms)
+        and c.get("risk", {}).get("version") == 1
+        and c["risk"].get("ready")
+        and not c["risk"].get("blocked")
         and c.get("turnover", {}).get("ready")
         and c["turnover"].get("average3d", 0) >= 1_000_000_000
         and c["turnover"].get("candleClose") == now_ms // 3_600_000 * 3_600_000

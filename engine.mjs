@@ -395,6 +395,15 @@ function advanceTrends(candles, previous, asOf = Infinity) {
   const pending = closed.filter((c) => c.closeTime > (previous?.lastClose ?? 0));
   const contiguous = !previous || !pending.length || pending[0].openTime === previous.lastClose;
   const state = previous?.version === 1 && contiguous ? structuredClone(previous) : initial();
+  if (state.signal && state.signal.reached === undefined) {
+    state.signal.reached = 0;
+    for (const bar of closed.filter((b) => !b.synthetic && b.openTime >= state.signal.time && b.closeTime <= state.lastClose)) {
+      while (state.signal.reached < 3 && bar.high >= state.signal.targets[state.signal.reached]) {
+        state.signal.reached++;
+        if (state.signal.reached === 3) state.signal.completedAt ??= bar.closeTime;
+      }
+    }
+  }
   for (const bar of closed) {
     if (bar.closeTime <= state.lastClose) continue;
     const pc = state.previousClose;
@@ -431,11 +440,17 @@ function advanceTrends(candles, previous, asOf = Infinity) {
       if (pc !== null && state.ttUpper !== null && pc <= state.ttUpper && bar.close > upper) state.ttDirection = true;
       if (pc !== null && state.ttLower !== null && pc >= state.ttLower && bar.close < lower) state.ttDirection = false;
       if (state.ttDirection === true && previousDirection === false) {
-        state.signal = { time: bar.closeTime, entry: bar.close, stop: lower, targets: [5, 10, 15].map((k) => bar.close + k * width), width };
+        state.signal = { time: bar.closeTime, entry: bar.close, stop: lower, reached: 0, targets: [5, 10, 15].map((k) => bar.close + k * width), width };
       }
       if (state.ttDirection === false) state.signal = null;
       state.ttUpper = upper;
       state.ttLower = lower;
+    }
+    if (state.signal && !bar.synthetic && bar.openTime >= state.signal.time) {
+      while ((state.signal.reached ?? 0) < 3 && bar.high >= state.signal.targets[state.signal.reached ?? 0]) {
+        state.signal.reached = (state.signal.reached ?? 0) + 1;
+        if (state.signal.reached === 3) state.signal.completedAt ??= bar.closeTime;
+      }
     }
     state.previousClose = bar.close;
     state.lastClose = bar.closeTime;
@@ -921,13 +936,31 @@ function stAnalysis(cache, now) {
     const bars = (cache[u] ?? []).filter((b) => !b.synthetic && b.closeTime <= boundaryFor(u, now));
     const closes = bars.map((b) => b.close), average = lastValue(ema(closes, 20));
     const fresh = bars.at(-1)?.closeTime === boundaryFor(u, now);
-    return [u, { checkedAt: fresh ? now : cache.collection?.[u]?.checkedAt ?? 0, closeTime: bars.at(-1)?.closeTime ?? 0, bars: bars.length,
+    const ma7 = simpleAverage(closes, 7), ma20 = simpleAverage(closes, 20);
+    return [u, { rsi: lastValue(rsi(closes, 14)), ma7, ma20,
+      maSpreadPct: ma7 !== null && ma20 > 0 ? (ma7 / ma20 - 1) * 100 : null,
+      exhausted: cache.collection?.[u]?.exhausted === true,
+      checkedAt: fresh ? now : cache.collection?.[u]?.checkedAt ?? 0, closeTime: bars.at(-1)?.closeTime ?? 0, bars: bars.length,
       state: !fresh || average === null ? "pending" : closes.at(-1) >= average ? "up" : "down" }];
   }));
   const daily = (cache[1440] ?? []).filter((b) => !b.synthetic);
-  return { checkedAt: now, primaryClose: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now).closeTime])), frames, rsi: Object.fromEntries([15, 60].map((u) => [u, lastValue(rsi((cache[u] ?? []).filter((b) => !b.synthetic).map((b) => b.close), 14))])),
+  return { riskVersion: 1, checkedAt: now, primaryClose: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(cache[u], u, now).closeTime])), frames, rsi: Object.fromEntries([15, 60].map((u) => [u, lastValue(rsi((cache[u] ?? []).filter((b) => !b.synthetic).map((b) => b.close), 14))])),
     newListing: turnoverClass(cache, now).newListing || cache.collection?.[1440]?.exhausted === true
       && !!daily.length && daily[0].openTime > now - 30 * 86400000 };
+}
+function recommendationRisk(result, ticker, now) {
+  const frames = result.stAnalysis?.frames ?? {};
+  const checks = [240, 1440].map((unit) => {
+    const f = frames[unit], current = f?.closeTime === boundaryFor(unit, now);
+    const available = current && Number.isFinite(f.rsi) && Number.isFinite(f.maSpreadPct) && f.ma20 > 0;
+    const shortHistory = f?.exhausted === true && f.bars < 20;
+    const priceExtensionPct = available ? (ticker.tradePrice / f.ma20 - 1) * 100 : null;
+    return { unit, available, shortHistory, rsi: f?.rsi ?? null, maSpreadPct: f?.maSpreadPct ?? null,
+      priceExtensionPct, overheated: available && f.rsi >= 70 && f.maSpreadPct >= 8 && priceExtensionPct >= 8 };
+  });
+  const ready = result.stAnalysis?.riskVersion === 1 && checks.every((f) => f.available || f.shortHistory);
+  const reasons = checks.filter((f) => f.overheated).map((f) => `${f.unit === 240 ? "4시간" : "일봉"} RSI ${f.rsi.toFixed(1)} · 7·20기간 이평선 이격 ${f.maSpreadPct.toFixed(1)}% · 현재가 이격 ${f.priceExtensionPct.toFixed(1)}%`);
+  return { version: 1, ready, blocked: reasons.length > 0, checks, reasons };
 }
 function rankedStRecommendations(results, markets, prices, now) {
   if (markets.exclusionStatus?.ready === false) return [];
@@ -935,6 +968,8 @@ function rankedStRecommendations(results, markets, prices, now) {
   for (const result of results) {
     const market = safe.get(result.market), ticker = prices.get(result.market);
     if (!market || !ticker || !highTurnover(result, now)) continue;
+    const risk = recommendationRisk(result, ticker, now);
+    if (!risk.ready || risk.blocked) continue;
     for (const [strategy, unit] of [["scalp", 15], ["swing", 60]]) {
       const gate = result.primary?.[unit];
       if (!entryGateCurrent({ strategy, entryGate: gate }, now)) continue;
@@ -944,10 +979,16 @@ function rankedStRecommendations(results, markets, prices, now) {
       const score = 50 + (frame(240) === "up" ? 15 : 0) + (frame(1440) === "up" ? 15 : 0)
         + (momentum !== null && momentum !== undefined && momentum >= 40 && momentum <= 70 ? 10 : 0) + (result.turnover.increasing ? 10 : 0);
       const technical = result.candidates.find((c) => c.strategy === strategy && entryGateCurrent(c, now) && entryStillValid(c, ticker.tradePrice, now));
+      const observation = result.observations?.find((o) => o.strategy === strategy);
+      const assessed = result.analyzedAt >= boundaryFor(unit, now);
+      const waitingCodes = ["INSUFFICIENT_DATA", "MISSING_RECENT_CANDLES", "INDICATOR_WARMUP", "ENTRY_DATA_MISSING", "ZERO_ATR", "DATA_DELAYED", "ENGINE_WARMUP", "ST_PENDING"];
+      const planStatus = technical ? "ready" : !assessed || !observation ? "pending" : waitingCodes.includes(observation.code) ? "data_pending" : "blocked";
+      const planReason = technical ? "가격 계획 산정 완료" : !assessed || !observation ? "최신 봉의 진입 가격 심사 대기" : observation.reason;
       candidates.push({ market: result.market, koreanName: market.koreanName, strategy, score,
         currentPrice: ticker.tradePrice, currentPriceAt: ticker.timestamp, quoteVolume24h: ticker.quoteVolume24h,
         averageTurnover3d: result.turnover.average3d, turnover: result.turnover, entryGate: gate,
         newListing: !!(analysis?.newListing || result.turnover.newListing), upper4h: frame(240), dailyTrend: frame(1440),
+        targetTrend: gate.targetTrend, risk, planStatus, planReason, entryStatus: technical?.entryStatus,
         rsi: momentum, plan: technical?.plan ?? null, analyzedAt: analysis?.checkedAt ?? 0 });
     }
   }
@@ -955,12 +996,15 @@ function rankedStRecommendations(results, markets, prices, now) {
     .sort((a, b) => b.score - a.score || b.averageTurnover3d - a.averageTurnover3d || a.market.localeCompare(b.market))
     .slice(0, 10).map((c, i) => ({ ...c, rank: i + 1 })));
 }
-function primaryTrend(candles, unit, now) {
+function primaryTrend(candles, unit, now, previous) {
   const end = boundaryFor(unit, now), bars = (candles ?? []).filter((b) => b.closeTime <= end);
-  const real = bars.filter((b) => !b.synthetic), trend = advanceTrends(bars, undefined, now);
+  const real = bars.filter((b) => !b.synthetic), trend = advanceTrends(bars, previous, now);
   const ready = real.length >= 10 && Number.isFinite(trend.atr10) && trend.atr10 > 0 && real.at(-1)?.closeTime === end;
   return { version: 1, unit, checkedAt: now, closeTime: end, latestActualClose: real.at(-1)?.closeTime ?? 0,
     actualBars: real.length, direction: Number.isFinite(trend.atr10) ? trend.stDirection : null, ready,
+    targetTrend: { version: 1, ready: trend.atrWindow.length === 200, direction: trend.ttDirection,
+      signalTime: trend.signal?.time ?? null, targets: trend.signal?.targets ?? [],
+      reached: trend.signal?.reached ?? 0, completedAt: trend.signal?.completedAt ?? null },
     state: ready ? trend.stDirection === 1 ? "buy" : "sell" : "unknown" };
 }
 function entryGateCurrent(candidate, now) {
@@ -2263,6 +2307,8 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
     schemaVersion: 5,
     stRecommendationVersion: 1,
     stRecommendations: rankedStRecommendations(results, markets, prices, now),
+    entryRiskExclusions: valid.filter((r) => eligible.has(r.market) && prices.has(r.market)).map((r) => ({ market: r.market,
+      name: safe.get(r.market).koreanName, ...recommendationRisk(r, prices.get(r.market), now) })).filter((r) => r.blocked),
     turnoverCoverage: [...safe.values()].reduce((a, m) => {
       const t = results.find((r) => r.market === m.market)?.turnover;
       const group = t?.ready && t.candleClose === boundaryFor(60, now) ? t.group : "pending";
@@ -2332,7 +2378,7 @@ function cachedPayload(payload, now, error) {
   const stale = payload.schemaVersion !== 5 || now - payload.generatedAt > 3 * 6e4 || Boolean(error);
   return {
     ...payload,
-    stRecommendations: stale || !payload.marketExclusions?.ready ? [] : (payload.stRecommendations ?? []).filter((c) => entryGateCurrent(c, now) && c.turnover?.candleClose === boundaryFor(60, now) && c.turnover?.average3d >= TURNOVER_MIN),
+    stRecommendations: stale || !payload.marketExclusions?.ready ? [] : (payload.stRecommendations ?? []).filter((c) => entryGateCurrent(c, now) && c.risk?.version === 1 && c.risk.ready && !c.risk.blocked && c.turnover?.candleClose === boundaryFor(60, now) && c.turnover?.average3d >= TURNOVER_MIN),
     source: "cached",
     stale,
     promising: stale || !payload.marketExclusions?.ready ? [] : (payload.promising ?? []).filter((c) => c.dailyQuality?.ready && c.dailyQuality.latestActualClose === boundaryFor(1440, now)),
@@ -2446,7 +2492,7 @@ async function refreshDashboard(db, options = {}) {
     const prepared = [], detailAttempted = new Set();
     const hasCurrentBuy = (result) => highTurnover(result, now) && [15, 60].some((u) => result?.primary?.[u]?.ready
       && result.primary[u].direction === 1 && result.primary[u].closeTime === boundaryFor(u, now));
-    const detailDue = (r) => hasCurrentBuy(r) && (!r.stAnalysis
+    const detailDue = (r) => hasCurrentBuy(r) && (!r.stAnalysis || r.stAnalysis.riskVersion !== 1
       || [15, 60].some((u) => r.primary?.[u]?.ready && r.primary[u].direction === 1 && r.primary[u].closeTime === boundaryFor(u, now) && r.stAnalysis.primaryClose?.[u] !== boundaryFor(u, now))
       || [240, 1440].some((u) => (r.stAnalysis.frames?.[u]?.checkedAt ?? 0) < boundaryFor(u, now)));
     const prepareMarket = async (market) => {
@@ -2496,7 +2542,7 @@ async function refreshDashboard(db, options = {}) {
     const primaryChecked = new Map([...results.values()].map((r) => [r.market, r.primaryCheckedAt ?? 0]));
     const primaryQueue = nextMarkets(markets, tickers, primaryChecked).filter((market) =>
       highTurnover(results.get(market.market), now) && ![15, 60].every((u) => results.get(market.market)?.primary?.[u]?.ready
-        && results.get(market.market).primary[u].closeTime === boundaryFor(u, now)));
+        && results.get(market.market).primary[u].closeTime === boundaryFor(u, now) && results.get(market.market).primary[u].targetTrend?.version === 1));
     for (let offset = 0; offset < primaryQueue.length; offset += 4) {
       if (budget <= 20 || Date.now() - startedAt > 80000) break;
       const group = primaryQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
@@ -2510,18 +2556,22 @@ async function refreshDashboard(db, options = {}) {
         for (const market of group) {
           if (budget <= 20 || Date.now() - startedAt > 80000) break;
           const previous = baseResult(market.market);
-          const primary = { ...previous.primary };
+          const primary = { ...previous.primary }, trends = { ...previous.trends };
           for (const u of [15, 60]) {
             try {
               const collected = await collect(market.market, [u], 1, false, true);
-              if (collected) primary[u] = primaryTrend((await load(market.market))[u], u, now);
+              if (collected) {
+                const cache = await load(market.market);
+                trends[u] = cachedTrends(cache, u, previous.trends?.[u], now);
+                primary[u] = primaryTrend(cache[u], u, now, trends[u]);
+              }
             } catch (error) {
               primary[u] = { ...previous.primary?.[u], version: 1, unit: u, checkedAt: now, closeTime: boundaryFor(u, now), ready: false, state: "unknown", error: error.message };
               if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
             }
             if (rateError) break;
           }
-          const result = { ...previous, primary, primaryCheckedAt: now }, candlesJson = JSON.stringify(await load(market.market));
+          const result = { ...previous, primary, trends, primaryCheckedAt: now }, candlesJson = JSON.stringify(await load(market.market));
           results.set(market.market, result);
           writes.push(
             db.prepare("INSERT INTO candle_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json").bind(market.market, candlesJson),
@@ -2638,7 +2688,7 @@ async function refreshDashboard(db, options = {}) {
         trackingCheckedAt: previous?.trackingCheckedAt,
         turnover: previous?.turnover,
         stAnalysis: stAnalysis(candles, now),
-        primary: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(candles[u], u, now)])),
+        primary: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(candles[u], u, now, trends[u])])),
         trends,
         screen: previous?.screen,
         selection: dailySelection(candles["1440"], now),
