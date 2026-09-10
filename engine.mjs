@@ -2544,11 +2544,44 @@ async function refreshDashboard(db, options = {}) {
     // 대기 검사에서 새로 확인된 Buy도 일봉 전용 수집보다 먼저 심사한다.
     const queue = nextMarkets(markets, tickers, checked).sort((a, b) => Number(hasCurrentBuy(results.get(b.market))) - Number(hasCurrentBuy(results.get(a.market))));
     for (const market of queue) {
-      if (budget <= 0 || prepared.length >= MARKET_BATCH || Date.now() - startedAt > 100000) break;
+      if (budget <= 12 || prepared.length >= MARKET_BATCH || Date.now() - startedAt > 92000) break;
       if (detailAttempted.has(market.market)) continue;
       const previous = baseResult(market.market), buy = hasCurrentBuy(previous);
       if (!buy || !detailDue(previous)) continue;
       await prepareMarket(market);
+    }
+    // 거래대금 증가 감지는 내부에서 처리하고 유망 조건 확인에 필요한 일봉만 보충한다.
+    const promisingQueue = nextMarkets(markets, tickers, new Map([...results.values()].map((r) => [r.market, r.promisingCheckedAt ?? 0])))
+      .filter((m) => {
+        const r = results.get(m.market);
+        return r?.turnover?.ready && r.turnover.candleClose === boundaryFor(60, now)
+          && (r.turnover.increasing || r.selection?.promising) && !hasCurrentBuy(r)
+          && !(r.selection?.version === 2 && r.dailyQuality?.ready && r.selection.candleClose === boundaryFor(1440, now))
+          && (r.promisingCheckedAt ?? 0) <= now - 60000;
+      });
+    for (const market of promisingQueue) {
+      if (budget <= 0 || Date.now() - startedAt > 100000) break;
+      const result = { ...baseResult(market.market) };
+      let rateError;
+      try {
+        await collect(market.market, [1440], 3, false);
+        const cache = await load(market.market);
+        result.selection = dailySelection(cache[1440], now);
+        result.dailyQuality = candleQuality(cache, 1440, now);
+        result.promisingCheckedAt = now;
+      } catch (error) {
+        if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
+        console.warn("유망 일봉 자료 대기", market.market, error.message);
+        // 실패한 종목도 뒤로 보내 다른 증가 종목을 먼저 확인한다. 다음 실행에 재시도한다.
+        result.promisingCheckedAt = now;
+      }
+      results.set(market.market, result);
+      const candlesJson = JSON.stringify(await load(market.market));
+      await db.batch([
+        db.prepare("INSERT INTO candle_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json").bind(market.market, candlesJson),
+        db.prepare("INSERT INTO market_analysis VALUES (?, ?, ?, ?) ON CONFLICT(market) DO UPDATE SET checked_at=excluded.checked_at, result_json=excluded.result_json, candles_json=excluded.candles_json").bind(market.market, checked.get(market.market) ?? 0, JSON.stringify(result), candlesJson)
+      ]);
+      if (rateError) throw rateError;
     }
     tickers = await fetchKrwTickers();
     const tickerMap = new Map(tickers.map((t) => [t.market, t]));
@@ -2683,7 +2716,7 @@ async function refreshDashboard(db, options = {}) {
     await saveRecommendations(db, tracked, cached, payload, now);
     payload.recommendations = await recommendationDashboard(db, payload, now, tickers);
     payload.promising = promisingMarkets([...results.values()], markets, tickers,
-      new Set([...payload.scalp, ...payload.swing].map((c) => c.market)), now);
+      new Set((payload.stRecommendations ?? [...payload.scalp, ...payload.swing]).map((c) => c.market)), now);
     if (markets.exclusionStatus?.ready === false) payload.promising = [];
     payload.paper = await paperSummary(db);
     await saveDashboard(db, payload);

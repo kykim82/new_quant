@@ -423,19 +423,17 @@ def dashboard(worker):
             st.dataframe(sortable_candidate_table(previous, recommendation_table(previous)),
                          hide_index=True, width="stretch", key="past-recommendation-tracking")
             st.dataframe(recommendation_timing_table(previous), hide_index=True, width="stretch")
-    st.subheader("2. 거래대금 모니터링")
-    st.caption("3일 평균 거래대금 10억 원 미만은 거래대금 증가만 확인합니다. 기준을 넘으면 ST 검사 대상으로 이동합니다.")
-    monitor = payload.get("volumeMonitor", [])
-    if monitor:
-        st.dataframe([{"종목": f"{m['name']} ({m['market'].removeprefix('KRW-')})",
-                       "3일 평균 거래대금": turnover(m["average3d"]),
-                       "최근 24시간 거래대금": turnover(m["lastDay"]),
-                       "직전 24시간 대비": "증가" if m["increasing"] else "유지·감소",
-                       "확인 시각": stamp(m["checkedAt"])}
-                      for m in sorted(monitor, key=lambda m: (not m["increasing"], -m["average3d"]))],
-                     hide_index=True, width="stretch", key="volume-monitor")
+    st.subheader("2. 유망 종목")
+    active_markets = {c["market"] for c in shown}
+    promising = [] if stale or not payload.get("marketExclusions", {}).get("ready") else [
+        c for c in payload.get("promising", []) if c["market"] not in active_markets
+    ][:10]
+    if promising:
+        st.dataframe(promising_table(promising), hide_index=True, width="stretch", key="promising-table")
     else:
-        st.info("거래대금 분류 결과를 기다리고 있습니다.")
+        st.info("현재 유망 조건을 충족한 종목이 없거나 일봉 이력을 수집 중입니다.")
+    st.caption("거래대금 증가를 내부에서 확인하고, 기존 일봉의 역배열 해소 준비·장기 이평선 부근 유지 조건을 만족한 종목을 표시합니다. 최근 20일 저가 대비 +20% 이내, SMA20 위 이격 +8% 이내인 상승 준비 종목이며 추천 종목은 중복 표시하지 않습니다.")
+
 
 
 
