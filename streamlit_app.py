@@ -332,9 +332,11 @@ def dashboard(worker):
     elif exclusions.get("ready") is not True:
         st.warning("유의·거래지원 종료 정보 확인 대기 중입니다. 신규 추천을 잠시 보류하고 기존 기록을 추적합니다.")
         if exclusions.get("error"):
-            st.caption(f"공지 조회 오류 · {exclusions['error']}")
+            st.caption(f"제외 정보 조회 오류 · {exclusions['error']}")
     exclusion_label = f"유의·거래지원 종료 제외 {len(exclusions['excluded'])}종목" if exclusions.get("ready") and "excluded" in exclusions else "유의·거래지원 종료 제외 종목 확인 대기"
     st.caption(f"전체 원화 {payload.get('coverage', {}).get('krwMarketCount', 0)}종목 · {exclusion_label}")
+    if exclusions.get("source") == "upbit-open-api":
+        st.caption("제외 기준 · 공식 API의 유의 지정·거래지원 상태·종료일을 확인합니다.")
     for unit, label in (("15", "15분"), ("60", "1시간")):
         coverage = primary.get(unit)
         if coverage:

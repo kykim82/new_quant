@@ -1468,47 +1468,62 @@ async function requestJson(path) {
   const text = await response.text();
   throw new UpbitApiError(`업비트 API ${response.status}: ${text.slice(0, 160)}`, response.status);
 }
-var terminationCache;
-function terminatedSymbols(notices, markets, now) {
-  const symbols = new Set(), handled = new Set(), since = now - 90 * 86400000;
-  for (const notice of [...notices].sort((a, b) => Date.parse(b.listed_at) - Date.parse(a.listed_at))) {
-    if (!/거래\s*지원\s*종료/.test(notice.title) || Date.parse(notice.first_listed_at ?? notice.listed_at) < since) continue;
-    const codes = [...notice.title.matchAll(/\(([A-Z0-9 ,]+)\)/g)].flatMap((m) => m[1].split(/[, ]+/).filter(Boolean).map((code) => "KRW-" + code));
-    for (const market of markets.filter((m) => codes.includes(m.market) || notice.title.includes(m.korean_name + "("))) {
-      if (handled.has(market.market)) continue;
-      handled.add(market.market);
-      if (!/종료.{0,20}(철회|취소)/.test(notice.title)) symbols.add(market.market);
-    }
-  }
-  return symbols;
-}
-async function fetchTerminationNotices(now = Date.now()) {
-  if (terminationCache && now - terminationCache.at < 300000) return terminationCache;
-  const notices = [];
-  for (let page = 1; ; page++) {
-    const query = new URLSearchParams({ os: "web", page: String(page), per_page: "20", category: "all", search: "거래지원 종료" });
-    const response = await fetch("https://api-manager.upbit.com/api/v1/announcements/search?" + query,
-      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error("거래지원 종료 공지 조회 " + response.status);
-    const body = await response.json(), data = body.data;
-    if (!body.success || !Array.isArray(data?.notices) || !Number.isInteger(data.total_pages)) throw new Error("거래지원 종료 공지 응답 확인 필요");
-    notices.push(...data.notices);
-    if (page >= data.total_pages || data.notices.length === 0 || data.notices.every((n) => Date.parse(n.listed_at) < now - 90 * 86400000)) break;
-    if (page >= 50) throw new Error("거래지원 종료 공지 범위 확인 필요");
-    await delay(150);
-  }
-  return terminationCache = { at: now, notices };
+var marketStateCache;
+async function fetchMarketStates(codes, now = Date.now()) {
+  if (marketStateCache && now - marketStateCache.at < 60000 && codes.every((code) => marketStateCache.states.has(code))) return marketStateCache;
+  const states = await new Promise((resolve, reject) => {
+    const pending = new Set(codes), received = new Map();
+    const socket = new WebSocket("wss://api.upbit.com/websocket/v1");
+    socket.binaryType = "arraybuffer";
+    let done = false;
+    const finish = (error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (socket.readyState < 2) socket.close();
+      if (error) reject(error); else resolve(received);
+    };
+    const timer = setTimeout(() => finish(new Error(`공식 거래지원 상태 수신 대기 ${received.size}/${codes.length}`)), 8000);
+    socket.addEventListener("open", () => socket.send(JSON.stringify([
+      { ticket: "quant-market-status" }, { type: "ticker", codes, is_only_snapshot: true }, { format: "DEFAULT" }
+    ])));
+    socket.addEventListener("message", (event) => {
+      try {
+        const row = JSON.parse(typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data));
+        if (row.error) throw new Error("공식 거래지원 상태 요청 오류");
+        if (!pending.has(row.code)) return;
+        if (row.type !== "ticker" || typeof row.market_state !== "string" || !row.market_state
+          || !Object.hasOwn(row, "delisting_date") || row.delisting_date === undefined) throw new Error(`${row.code} 거래지원 상태·종료일 필드 확인 필요`);
+        received.set(row.code, { state: row.market_state, delistingDate: row.delisting_date });
+        pending.delete(row.code);
+        if (pending.size === 0) finish();
+      } catch (error) { finish(error); }
+    });
+    socket.addEventListener("error", () => finish(new Error("공식 거래지원 상태 WebSocket 연결 실패")));
+    socket.addEventListener("close", () => finish(new Error(`공식 거래지원 상태 수신 중 연결 종료 ${received.size}/${codes.length}`)));
+  });
+  return marketStateCache = { at: now, states };
 }
 async function fetchKrwMarkets() {
   const response = (await requestJson("/market/all?is_details=true")).filter((item) => item.market.startsWith("KRW-"));
-  let notices = terminationCache?.notices ?? [], status;
-  try { const checked = await fetchTerminationNotices(); notices = checked.notices; status = { ready: true, checkedAt: checked.at }; }
-  catch (error) { status = { ready: false, checkedAt: terminationCache?.at ?? 0, error: error.message }; }
-  const terminated = terminatedSymbols(notices, response, Date.now());
-  const markets = response.map((item) => ({ market: item.market, koreanName: item.korean_name, englishName: item.english_name,
-    warned: Boolean(item.market_event?.warning) || terminated.has(item.market),
-    exclusionReason: terminated.has(item.market) ? "거래지원 종료 공지" : item.market_event?.warning ? "거래 유의 종목" : null,
-    caution: item.market_event?.caution ?? {} }));
+  let states = marketStateCache?.states ?? new Map(), status;
+  try {
+    if (!response.length || response.some((item) => typeof item.market_event?.warning !== "boolean")) throw new Error("공식 유의 종목 필드 확인 필요");
+    const checked = await fetchMarketStates(response.map((item) => item.market));
+    states = checked.states;
+    status = { ready: true, checkedAt: checked.at, source: "upbit-open-api" };
+  } catch (error) {
+    status = { ready: false, checkedAt: marketStateCache?.at ?? 0, source: "upbit-open-api", error: error.message };
+  }
+  const markets = response.map((item) => {
+    const state = states.get(item.market);
+    const ending = state && (state.delistingDate !== null || state.state === "PREDELISTING" || state.state === "DELISTED");
+    const inactive = state && state.state !== "ACTIVE";
+    return { market: item.market, koreanName: item.korean_name, englishName: item.english_name,
+      warned: Boolean(item.market_event?.warning) || Boolean(ending || inactive),
+      exclusionReason: ending ? "거래지원 종료 예정·종료" : item.market_event?.warning ? "거래 유의 종목" : inactive ? "거래지원 비활성 상태" : null,
+      caution: item.market_event?.caution ?? {} };
+  });
   markets.exclusionStatus = status;
   return markets;
 }
