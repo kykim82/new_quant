@@ -123,7 +123,7 @@ export function observePlan(plan,bars,quote,now){if(!plan)return null;const p=st
   return p;
 }
 export function rankScore(bars,trend,plan,turnover,upper=[]){const current=bars.at(-1).close,volRatio=turnover.previousDay>0?turnover.lastDay/turnover.previousDay:1,r=rsi(bars);
-  const parts={st:20,targets:20,rewardRisk:20*clamp(plan.rewardRisk/4,0,1),risk:10/(1+plan.riskPct/5),activity:10*clamp(volRatio/2,0,1),upper:upper.reduce((s,t)=>s+(t.stDirection===1?5:0)+(t.signal?.direction==='up'&&!t.signal.stoppedAt&&!t.signal.completedAt?5:0),0),overheat:-(r===null?0:clamp((r-70)/30,0,1)*10),extension:trend.atr10>0?-clamp((current-trend.stLower)/trend.atr10-4,0,5):0};
+  const parts={st:trend.stDirection===1?20:0,targets:20,rewardRisk:20*clamp(plan.rewardRisk/4,0,1),risk:10/(1+plan.riskPct/5),activity:10*clamp(volRatio/2,0,1),upper:upper.reduce((s,t)=>s+(t.stDirection===1?5:0)+(t.signal?.direction==='up'&&!t.signal.stoppedAt&&!t.signal.completedAt?5:0),0),overheat:-(r===null?0:clamp((r-70)/30,0,1)*10),extension:trend.atr10>0?-clamp((current-trend.stLower)/trend.atr10-4,0,5):0};
   return {score:Math.round(clamp(Object.values(parts).reduce((s,v)=>s+v,0),0,100)*100)/100,parts,rsi:r};
 }
 export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,previousTrend,previousPlan,turnover,upper=[],history}){
@@ -138,7 +138,7 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   if(!history.ready)return fail('history_pending',history.reason,{checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:false});
   const trend=history.trend,extra={trend,checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:true,historyKind:history.kind,historyExhausted:meta.exhausted===true};
   if(trend.atr10===null)return fail('new_listing','신규 상장 · ST 계산 이력 수집 중',extra);
-  if(trend.stDirection!==1)return fail('sell','ST Sell',extra);
+  if(UNITS.includes(unit)&&trend.stDirection!==1)return fail('sell','ST Sell',extra);
   let raw=trend.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;
   if(raw?.stoppedAt||raw?.completedAt)return fail('ended','타겟 트렌드 종료 · 새 신호 대기',extra);
   if(!raw)return fail('tt_wait','타겟 트렌드 상승 신호 대기',{...extra,code:'TT_SIGNAL_WAIT',turnover,quote});
@@ -150,6 +150,6 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   if(!quote||!Number.isFinite(quote.receivedAt)||now-quote.receivedAt<0||now-quote.receivedAt>45000)return fail('quote_pending','최신 시세 조회 대기',{...extra,plan});
   if(!(quote.tradePrice>0))return fail('quote_pending','시세 값 확인 대기',{...extra,plan});
   const rank=rankScore(bars,trend,plan,turnover,upper);
-  return {...fail('ready','가격 계획 확인 완료',extra),plan,turnover,...rank,quote,st:'Buy',newListing:trend.count<399,priceMethod:'원본 Target Trend'};
+  return {...fail('ready','가격 계획 확인 완료',extra),plan,turnover,...rank,quote,st:trend.stDirection===1?'Buy':'Sell',newListing:trend.count<399,priceMethod:'원본 Target Trend'};
 }
 export function promisingMarket(market,cache,turnover,quote,now){const bars=rawBars(cache,60,endOf(60,now)),ma=sma(bars,20),old=sma(bars,20,3);if(!turnover?.ready||turnover.group!=='low'||!turnover.increasing||ma===null||old===null||!(ma>old&&bars.at(-1).close>=ma))return null;return {market:market.market,name:market.koreanName,quote,turnover,reason:'거래대금 증가 · 1시간 이평선 상승 및 가격 회복',score:turnover.previousDay>0?turnover.lastDay/turnover.previousDay:1};}

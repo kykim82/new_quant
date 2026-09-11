@@ -162,7 +162,7 @@ def render(worker):
     with st.expander('분석 기준·전체 종목 현황'):
         st.write('테더·유의·거래지원 종료 예정 종목을 제외합니다. 최근 완료 72시간 거래대금 합계 ÷ 3이 10억 원 이상인 종목을 분석합니다.')
         st.write('단타는 15분, 스윙은 1시간 ST Buy를 추적합니다. 활성 상승 Target Trend의 매수·손절·세 목표가가 있을 때만 추천합니다. 다른 지표는 순위에만 사용합니다.')
-        st.write('4시간·일봉은 단타·스윙 조건을 통과한 전체 종목을 대상으로 독립 검사·정렬합니다. 단타·스윙 표의 상위 10개에 들지 못해도 대상이며, 하위 계획이 종료돼도 상위 추적을 유지합니다.')
+        st.write('4시간·일봉은 단타·스윙 조건을 통과한 전체 종목의 활성 상승 TT 가격을 독립 검사·정렬합니다. 상위봉 ST는 점수에만 반영합니다. 단타·스윙 표의 상위 10개에 들지 못해도 대상이며, 하위 계획이 종료돼도 상위 추적을 유지합니다.')
         st.write('N/O는 TT 생성일, E는 추천 판정 이후 확인된 매수가 접촉입니다. 목표 선도달 뒤 재접촉이나 순서를 알 수 없는 봉은 E로 확정하지 않습니다. 이전 기록의 진입은 추정하지 않습니다.')
         st.write('현재가 괄호는 업비트 시세의 기준 시각(KST)입니다. 조회 성공 시각과 구분하며 새 봉 확인 중에는 직전 완료봉 1개 이내의 완성된 계획을 표시합니다.')
         st.write('초기 TT는 상장 전체 이력 또는 서로 다른 시작점의 계산 일치를 확인합니다. 최소 2,000봉부터 검증하며, 일치하지 않으면 과거 이력을 더 수집합니다. 짧은 상장 이력은 전체 자료로 확인합니다.')
@@ -191,6 +191,16 @@ def render(worker):
         with tab:
             rows = [r for r in payload['rows'] if r['unit'] == unit][:10]
             st.caption(f'{len(rows)}종목 · 최대 10종목')
+            upper_pending = 0
+            if unit > 60:
+                tracked = [d for d in payload['details'] if d.get('upperTracked') and d['group'] == 'high']
+                inspected = [d for d in tracked if d.get('frames', {}).get(str(unit), {}).get('historyReady')]
+                upper_pending = len(tracked) - len(inspected)
+                st.caption(f"상위봉 이력 확인 {len(inspected)}/{len(tracked)}종목 · 수집·검증 중 {upper_pending}종목")
+                with st.expander(f'{FRAME_LABELS[unit]} 검사 내역', expanded=False, key=f'upper_checks_{unit}'):
+                    st.dataframe(pd.DataFrame([{'종목': d['name'],
+                        '판정': d.get('frames', {}).get(str(unit), {}).get('reason', '상위봉 수집 대기'),
+                        '확인한 봉 수': d.get('frames', {}).get(str(unit), {}).get('actualBars', 0)} for d in tracked]), hide_index=True, width='stretch')
             if rows:
                 st.dataframe(recommendation_table(rows, payload.get('viewedAt', payload['generatedAt'])), hide_index=True, width='stretch')
                 rechecking = [r for r in rows if r.get('rechecking')]
@@ -198,6 +208,8 @@ def render(worker):
                     st.caption(f'{len(rechecking)}종목은 직전 완료봉 기준으로 재검사 중입니다.')
                     with st.expander('봉 검사 시각 확인', key=f'recheck_{unit}', expanded=False):
                         st.dataframe(pd.DataFrame([{'종목': symbol(r), '마지막 검사 봉': stamp(r['checkedThrough'])} for r in rechecking]), hide_index=True, width='stretch')
+            elif upper_pending:
+                st.info(f'{FRAME_LABELS[unit]} 이력을 수집·검증 중입니다. 확인이 끝난 종목부터 표시합니다.')
             else:
                 st.info('현재 활성 상승 TT 가격까지 확인된 추천이 없습니다. 아래 신호 대기와 검사 사유를 확인할 수 있습니다.')
     with st.expander("타겟 트렌드 신호 대기 · ST Buy 추적", expanded=False, key="tt_signal_wait", on_change="rerun"):

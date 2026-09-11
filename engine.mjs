@@ -279,9 +279,9 @@ export class Radar {
     const exclusionReady=this.exclusions.ready&&now-this.exclusions.checkedAt>=0&&now-this.exclusions.checkedAt<=120000;
     for(const info of eligible){const state=this.states.get(info.market),cache=this.caches.get(info.market),turnover=cache?turnoverClass(cache,now):state?.turnover;
       const group=turnover?.ready&&turnover.asOf===endOf(60,now)?turnover.group:'pending';const frames={};
-      for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
+      for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,actualBars:r?.actualBars??0,historyReady:current&&r?.historyReady===true,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
         if(!r||!exclusionReady||unit>60&&!state?.upperTracking)continue;
-        if(r.status==='tt_wait'&&current&&group==='high')waiting.push({...r,quote:this.quotes.get(info.market)??r.quote});
+        if(r.status==='tt_wait'&&r.trend?.stDirection===1&&current&&group==='high')waiting.push({...r,quote:this.quotes.get(info.market)??r.quote});
         // 이미 확인된 완성 계획은 1봉 이내 재검사 동안 근거 시각을 붙여 보존한다. 새 Sell/종료 결과는 즉시 제외한다.
         const liquidity=unit>60&&turnover?.ready?turnover:r.turnover;
         const grace=r.checkedThrough>=endOf(unit,now)-unit*60000&&liquidity?.asOf>=endOf(60,now)-3600000;
@@ -315,17 +315,22 @@ export class Radar {
     for(const info of this.markets){const state=this.states.get(info.market),t=state?.turnover;
       if(info.warned||info.market==='KRW-USDT'||!state?.upperTracking||!t?.ready||t.group!=='high'||t.asOf!==endOf(60,now))continue;
       for(const unit of [240,1440]){const f=state.frames?.[unit];
-        if(!f||!f.historyReady||f.checkedThrough!==endOf(unit,now)||f.status==='quote_pending'||f.turnoverAsOf!==t.asOf)
-          jobs.push({info,unit,lastAttempt:state.upperTracking.attempts?.[unit]??0});
+        if(!f||!f.historyReady||f.checkedThrough!==endOf(unit,now)||f.status==='quote_pending'||f.turnoverAsOf!==t.asOf||f.upperRuleVersion!==2)
+          jobs.push({info,unit,lastAttempt:state.upperTracking.attempts?.[unit]??0,priority:Math.max(-1,...UNITS.map(u=>state.frames?.[u]?.status==='ready'?state.frames[u].score??0:-1))});
       }
     }
-    return jobs.sort((a,b)=>a.lastAttempt-b.lastAttempt||a.unit-b.unit||a.info.market.localeCompare(b.info.market));
+    return jobs.sort((a,b)=>a.lastAttempt-b.lastAttempt||b.priority-a.priority||a.unit-b.unit||a.info.market.localeCompare(b.info.market));
   }
-  async processUpper(info,unit){const state=this.states.get(info.market);state.upperTracking.attempts??={};state.upperTracking.attempts[unit]=this.clock();
+  async processUpper(info,unit,{deadline=this.clock()+3000}={}){const state=this.states.get(info.market);state.upperTracking.attempts??={};state.upperTracking.attempts[unit]=this.clock();
     try{const cache=await this.load(info.market);
-      const changed=await collectCandles(cache,info.market,unit,this.clock(),HISTORY_BARS,this.request);
-      if(changed){this.dirty.add(info.market);await sleep(135);}
-      const result=this.calculate(info,cache,unit,this.clock());result.turnoverAsOf=state.turnover.asOf;delete state.upperTracking.error;
+      const primaryEnd=endOf(15,this.clock());
+      for(let page=0;page<16;page++){
+        if(this.clock()>=deadline||endOf(15,this.clock())!==primaryEnd)break;
+        const changed=await collectCandles(cache,info.market,unit,this.clock(),HISTORY_BARS,this.request);
+        if(!changed)break;this.dirty.add(info.market);await sleep(135);
+        if(assessHistory(cache,unit,this.clock()).ready)break;
+      }
+      const result=this.calculate(info,cache,unit,this.clock());result.turnoverAsOf=state.turnover.asOf;result.upperRuleVersion=2;delete state.upperTracking.error;
     }catch(e){state.upperTracking.error=e.message;if(e.status===429||e.status===418)throw e;this.error(`${info.market} ${unit}분 ${e.message}`);}
     this.dirty.add(info.market);await this.flush();
   }
@@ -347,10 +352,11 @@ export class Radar {
         const priority=m=>{const s=this.states.get(m.market);return UNITS.some(u=>s?.frames[u]?.status==='ready')?0:UNITS.some(u=>s?.trends[u]?.stDirection===1)?1:2;};return priority(a)-priority(b)||(this.states.get(a.market)?.checkedAt??0)-(this.states.get(b.market)?.checkedAt??0);});
       for(const info of queue){if(used++>=maxMarkets)return;await this.process(info,'analysis');if(this.detailQueue.length)await this.runDetail();}
       while(this.detailQueue.length)await this.runDetail();
-      // 상위봉은 한 번에 한 페이지씩 순환하며 새 하위봉 검사에 우선권을 준다.
+      // 상위 이력은 짧게 이어 수집하고 새 하위봉 검사에 우선권을 준다.
+      const upperDeadline=this.clock()+4000;
       for(let pass=0;pass<4;pass++){
-        if(endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
-        await this.processUpper(job.info,job.unit);
+        if(this.clock()>=upperDeadline||endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
+        await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000)});
       }
     } finally {this.processing=false;try{await this.flush(true);}finally{await this.release();}this.emit({type:'completed',at:this.clock()});}
   }
