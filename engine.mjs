@@ -261,8 +261,8 @@ export class Radar {
     if(!row){const table=await this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_analysis'").first();if(table)row=await this.db.prepare('SELECT candles_json FROM market_analysis WHERE market=?').bind(code).first();}
     const cache=row?decodeCache(row.candles_json):{};cache.verified??={};this.caches.set(code,cache);return cache;
   }
-  async acquire(){const now=this.clock(),token=randomUUID();const row=await this.db.prepare('UPDATE scan_lease SET token=?, until_ms=?, last_run=? WHERE id=1 AND until_ms<=? RETURNING token').bind(token,now+180000,now,now).first();if(row?.token===token){this.token=token;return true;}return false;}
-  async renew(){if(!this.token)return false;const row=await this.db.prepare('UPDATE scan_lease SET until_ms=? WHERE id=1 AND token=? RETURNING token').bind(this.clock()+180000,this.token).first();if(!row){this.token=null;throw new Error('분석 저장 잠금이 변경되었습니다. 다음 회차에 다시 연결합니다.');}return true;}
+  async acquire(){if(this.token)return this.renew();const now=this.clock(),token=randomUUID();const row=await this.db.prepare('UPDATE scan_lease SET token=?, until_ms=?, last_run=? WHERE id=1 AND until_ms<=? RETURNING token').bind(token,now+180000,now,now).first();if(row?.token===token){this.token=token;this.leaseRenewedAt=now;return true;}return false;}
+  async renew(){if(!this.token)return false;const now=this.clock();if(now>=this.leaseRenewedAt&&now-this.leaseRenewedAt<60000)return true;const row=await this.db.prepare('UPDATE scan_lease SET until_ms=? WHERE id=1 AND token=? RETURNING token').bind(this.clock()+180000,this.token).first();if(!row){this.token=null;throw new Error('분석 저장 잠금이 변경되었습니다. 다음 회차에 다시 연결합니다.');}this.leaseRenewedAt=now;return true;}
   async release(){if(this.token)await this.db.prepare('UPDATE scan_lease SET until_ms=0 WHERE id=1 AND token=?').bind(this.token).run();this.token=null;}
   async refreshMarkets(){if(this.clock()-this.lastMarkets<60000&&this.markets.length)return;
     try{const markets=await this.getMarkets();this.markets=markets;this.exclusions=markets.exclusionStatus??{ready:false};this.lastMarkets=this.clock();if(!this.exclusions.ready)this.error(this.exclusions.error??'제외 정보 확인 대기');}
@@ -379,7 +379,7 @@ export class Radar {
     }
     await this.flush(true);return {market,name:info.koreanName,generatedAt:this.clock(),quote:this.quotes.get(market),frames};
   }
-  async cycle({maxMarkets=Infinity}={}){if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
+  async cycle({maxMarkets=Infinity,retainLease=false}={}){if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
     this.processing=true;this.emit({type:'started',at:this.clock()});let used=0;
     try {await this.refreshMarkets();await this.refreshQuotes();await this.flush(true);
       const primaryAt=this.clock(),eligible=this.markets.filter(m=>!m.warned&&m.market!=='KRW-USDT');
@@ -397,7 +397,7 @@ export class Radar {
         if(this.clock()>=upperDeadline||endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
         await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000),maxPages:4});
       }
-    } finally {this.processing=false;try{await this.flush(true);}finally{await this.release();}this.emit({type:'completed',at:this.clock()});}
+    } finally {this.processing=false;try{await this.flush(true);}finally{if(!retainLease)await this.release();}this.emit({type:'completed',at:this.clock()});}
   }
   async runDetail(){const market=this.detailQueue.shift();this.emit({type:'detail_started',market,at:this.clock()});try{this.emit({type:'detail',payload:await this.detail(market)});}catch(e){this.emit({type:'detail_error',market,message:e.message});}}
 }
@@ -409,7 +409,7 @@ async function main(){const local=process.env.QUANT_LOCAL_DB?await localDatabase
   const input=createInterface({input:process.stdin});input.on('line',line=>{try{const c=JSON.parse(line);if(c.type==='detail'&&/^KRW-[A-Z0-9]{1,20}$/.test(c.market)&&!radar.detailQueue.includes(c.market))radar.detailQueue.push(c.market);}catch{}});
   await radar.init();
   const timer=setInterval(async()=>{if(!radar.token||quoteBusy)return;quoteBusy=true;try{await radar.refreshMarkets();await radar.refreshQuotes();emit({type:'snapshot',payload:radar.snapshot()});}catch(e){radar.error(e.message);}finally{quoteBusy=false;}},10000);
-  try{do{try{await radar.cycle({maxMarkets:Number(process.env.QUANT_TEST_MAX_MARKETS)||Infinity});}catch(e){radar.error(e.message);if(e.status===429||e.status===418)await sleep(60000);}if(process.argv.includes('--once'))break;for(let i=0;i<5&&!stopping;i++)await sleep(1000);}while(!stopping);}
-  finally{clearInterval(timer);while(quoteBusy)await sleep(50);input.close();local?.close();}
+  try{do{try{await radar.cycle({maxMarkets:Number(process.env.QUANT_TEST_MAX_MARKETS)||Infinity,retainLease:true});}catch(e){radar.error(e.message);if(e.status===429||e.status===418)await sleep(60000);}if(process.argv.includes('--once'))break;for(let i=0;i<5&&!stopping;i++)await sleep(1000);}while(!stopping);}
+  finally{clearInterval(timer);while(quoteBusy)await sleep(50);try{await radar.release();}finally{input.close();local?.close();}}
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(e=>{process.stdout.write(JSON.stringify({type:'error',at:Date.now(),message:e.message})+'\n');process.exitCode=1;});
