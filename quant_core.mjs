@@ -4,6 +4,7 @@ export const VERSION = 7;
 export const HISTORY_BARS = 2000;
 export const MIN_TURNOVER = 1_000_000_000;
 export const UNITS = [15, 60];
+export const RECOMMEND_UNITS = [15, 60, 240, 1440];
 export const endOf = (unit, now) => Math.floor(now / (unit * 60000)) * unit * 60000;
 export const mean = a => a.length ? a.reduce((s,v)=>s+v,0)/a.length : null;
 export const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
@@ -92,7 +93,31 @@ export function pricePlan(raw,market,unit,now){
   if(![entry,stop,...targets].every(v=>Number.isFinite(v)&&v>0)||!(stop<entry&&entry<targets[0]&&targets[0]<targets[1]&&targets[1]<targets[2]))return null;
   return {id:`v7:${market}:${unit}:${raw.source}:${raw.time}`,source:raw.source,signalTime:raw.time,createdAt:now,entry,stop,targets,raw:{entry:raw.entry,stop:raw.stop,targets:raw.targets},riskPct:(entry-stop)/entry*100,rewardRisk:(targets[1]-entry)/(entry-stop),stoppedAt:raw.stoppedAt??null,completedAt:raw.completedAt??null,hits:raw.hits??[false,false,false]};
 }
+// 추천 판정 이후 확인한 가격 경로만 진입 기록에 사용한다.
+export function observeEntry(plan,bars,quote,now){
+  const t=plan.entryTracking;if(!t)return;
+  t.targetTimes??=[null,null,null];
+  const target=(at,index=0)=>{t.targetTimes[index]??=at;t.firstTargetAt=t.firstTargetAt==null?at:Math.min(t.firstTargetAt,at);};
+  const contact=(at,ambiguous=false)=>{
+    if(t.enteredAt)return;
+    if(ambiguous||(t.firstTargetAt!=null&&t.firstTargetAt<=at)){t.reviewAt??=at;return;}
+    t.enteredAt=at;
+  };
+  for(const b of bars){
+    if(b.synthetic||b.openTime<t.startedAt||b.closeTime>now||b.closeTime<=(t.checkedThrough??0))continue;
+    const hit=b.high>=plan.targets[0];
+    if(b.low<=plan.entry&&b.high>=plan.entry&&b.low>plan.stop)contact(b.closeTime,hit);
+    plan.targets.forEach((price,i)=>{if(b.high>=price)target(b.closeTime,i);});
+    t.checkedThrough=b.closeTime;
+  }
+  if(quote&&Number.isFinite(quote.tradePrice)&&now-quote.receivedAt>=0&&now-quote.receivedAt<=45000
+      &&(now===t.startedAt||quote.timestamp>=t.startedAt&&quote.timestamp<=now)){
+    plan.targets.forEach((price,i)=>{if(quote.tradePrice>=price)target(now,i);});
+    if(quote.tradePrice>plan.stop&&quote.tradePrice<=plan.entry)contact(now);
+  }
+}
 export function observePlan(plan,bars,quote,now){if(!plan)return null;const p=structuredClone(plan);p.hits??=[false,false,false];
+  observeEntry(p,bars,quote,now);
   for(const b of bars){if(b.openTime<p.signalTime)continue;if(b.low<=p.stop)p.stoppedAt??=b.closeTime;p.targets.forEach((t,i)=>{if(b.high>=t)p.hits[i]=true;});if(p.hits[2])p.completedAt??=b.closeTime;}
   if(quote&&now-quote.receivedAt>=0&&now-quote.receivedAt<=45000){if(quote.tradePrice<=p.stop)p.stoppedAt??=now;p.targets.forEach((t,i)=>{if(quote.tradePrice>=t)p.hits[i]=true;});if(p.hits[2])p.completedAt??=now;}
   return p;
@@ -119,7 +144,7 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   if(!raw)return fail('tt_wait','타겟 트렌드 상승 신호 대기',{...extra,code:'TT_SIGNAL_WAIT',turnover,quote});
   let plan=pricePlan(raw,market.market,unit,now);
   if(!plan)return fail('price_pending','유효한 매수·손절·3단계 목표 구조 없음',extra);
-  if(previousPlan?.id===plan.id)plan={...plan,createdAt:previousPlan.createdAt,entry:previousPlan.entry,stop:previousPlan.stop,targets:previousPlan.targets,stoppedAt:previousPlan.stoppedAt??plan.stoppedAt,completedAt:previousPlan.completedAt??plan.completedAt,hits:plan.hits.map((h,i)=>h||previousPlan.hits?.[i])};
+  if(previousPlan?.id===plan.id)plan={...plan,createdAt:previousPlan.createdAt,entryTracking:previousPlan.entryTracking,entry:previousPlan.entry,stop:previousPlan.stop,targets:previousPlan.targets,stoppedAt:previousPlan.stoppedAt??plan.stoppedAt,completedAt:previousPlan.completedAt??plan.completedAt,hits:plan.hits.map((h,i)=>h||previousPlan.hits?.[i])};
   plan=observePlan(plan,bars,quote,now);
   if(plan.stoppedAt||plan.completedAt)return fail('ended','가격 계획 손절·3차 목표 종료 · 새 신호 대기',{...extra,plan});
   if(!quote||!Number.isFinite(quote.receivedAt)||now-quote.receivedAt<0||now-quote.receivedAt>45000)return fail('quote_pending','최신 시세 조회 대기',{...extra,plan});

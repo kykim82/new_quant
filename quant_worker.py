@@ -45,7 +45,7 @@ def public_snapshot(state, now_ms=None):
     accepted = []
     for row in payload.get('rows', []):
         unit, plan, quote = row.get('unit'), row.get('plan'), row.get('quote') or {}
-        if unit not in (15, 60) or row.get('market') in excluded or not allowed or not valid_plan(plan):
+        if unit not in (15, 60, 240, 1440) or row.get('market') in excluded or not allowed or not valid_plan(plan):
             continue
         end = now_ms // (unit * 60_000) * unit * 60_000
         turnover = row.get('turnover') or {}
@@ -60,7 +60,7 @@ def public_snapshot(state, now_ms=None):
             accepted.append(row)
     payload['rows'] = accepted
     payload['waiting'] = [r for r in payload.get('waiting', []) if allowed and r.get('code') == 'TT_SIGNAL_WAIT'
-                          and r.get('market') not in excluded and r.get('unit') in (15, 60)
+                          and r.get('market') not in excluded and r.get('unit') in (15, 60, 240, 1440)
                           and r.get('checkedThrough') == now_ms // (r['unit'] * 60_000) * (r['unit'] * 60_000)]
     payload['promising'] = [r for r in payload.get('promising', []) if allowed and r.get('market') not in excluded
                             and r.get('turnover', {}).get('asOf') == now_ms // 3_600_000 * 3_600_000]

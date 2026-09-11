@@ -12,6 +12,7 @@ import streamlit as st
 from quant_worker import AnalysisWorker, SECRET_KEYS
 
 KST = timezone(timedelta(hours=9))
+FRAME_LABELS = {15: '단타·15분', 60: '스윙·1시간', 240: '4시간', 1440: '일봉'}
 
 
 def stamp(value, short=False):
@@ -39,22 +40,29 @@ def quote_label(row):
     return f"{price(q.get('tradePrice'))} ({stamp(q.get('timestamp'), True)})"
 
 
-def plan_status(plan):
+def plan_status(plan, now_ms=None):
     if plan.get('stoppedAt'):
         return '손절 종료'
     if plan.get('completedAt'):
         return '3차 도달'
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000 if now_ms is None else now_ms
+    tracking = plan.get('entryTracking') or {}
+    signal_time = plan.get('signalTime')
+    code = 'N' if signal_time and signal_time // 86_400_000 == now_ms // 86_400_000 else 'O'
+    if tracking.get('enteredAt'):
+        code += '·E'
     hits = plan.get('hits') or []
     if any(hits):
-        return f'{max(i + 1 for i, hit in enumerate(hits) if hit)}차 도달'
-    return '미진입'
+        return f"{code} · {max(i + 1 for i, hit in enumerate(hits) if hit)}차 도달"
+    return code
 
 
-def recommendation_table(rows):
+def recommendation_table(rows, now_ms=None):
     result = []
     for row in rows:
         p = row['plan']
-        result.append({'종목': symbol(row), '현재가': quote_label(row), '상태': plan_status(p),
+        result.append({'종목': symbol(row), '현재가': quote_label(row), '상태': plan_status(p, now_ms),
+                       'TT 생성(KST)': datetime.fromtimestamp(p['signalTime'] / 1000, KST).strftime('%m.%d %H:%M') if p.get('signalTime') else '기록 없음',
                        '매수가': price(p['entry']), '손절가': relative_price(p['stop'], p['entry']),
                        **{f'{i + 1}차 매도가': relative_price(t, p['entry']) for i, t in enumerate(p['targets'])},
                        '24시간 거래대금': turnover((row.get('quote') or {}).get('quoteVolume24h')),
@@ -154,6 +162,8 @@ def render(worker):
     with st.expander('분석 기준·전체 종목 현황'):
         st.write('테더·유의·거래지원 종료 예정 종목을 제외합니다. 최근 완료 72시간 거래대금 합계 ÷ 3이 10억 원 이상인 종목을 분석합니다.')
         st.write('단타는 15분, 스윙은 1시간 ST Buy를 추적합니다. 활성 상승 Target Trend의 매수·손절·세 목표가가 있을 때만 추천합니다. 다른 지표는 순위에만 사용합니다.')
+        st.write('4시간·일봉은 단타·스윙 조건을 통과한 전체 종목을 대상으로 독립 검사·정렬합니다. 단타·스윙 표의 상위 10개에 들지 못해도 대상이며, 하위 계획이 종료돼도 상위 추적을 유지합니다.')
+        st.write('N/O는 TT 생성일, E는 추천 판정 이후 확인된 매수가 접촉입니다. 목표 선도달 뒤 재접촉이나 순서를 알 수 없는 봉은 E로 확정하지 않습니다. 이전 기록의 진입은 추정하지 않습니다.')
         st.write('현재가 괄호는 업비트 시세의 기준 시각(KST)입니다. 조회 성공 시각과 구분하며 새 봉 확인 중에는 직전 완료봉 1개 이내의 완성된 계획을 표시합니다.')
         st.write('초기 TT는 상장 전체 이력 또는 서로 다른 시작점의 계산 일치를 확인합니다. 최소 2,000봉부터 검증하며, 일치하지 않으면 과거 이력을 더 수집합니다. 짧은 상장 이력은 전체 자료로 확인합니다.')
         st.write('목표는 원본 신호의 고정 값입니다. 신호가 오래돼도 유지하며 손절·3차 목표 도달 후에는 새 TT 신호를 기다립니다. 호가 단위에 맞춰 가격을 표시합니다.')
@@ -175,32 +185,34 @@ def render(worker):
                                        '판정': d['frames'][str(unit)]['reason'], '확인 완료': stamp(d['frames'][str(unit)]['checkedThrough']),
                                        '오류': d.get('error') or ''} for d in details]), hide_index=True, width='stretch')
     st.subheader('1. 추천 종목')
-    st.caption('ST Buy와 활성 상승 TT 가격을 확인한 종목을 순위로 표시합니다. 실제 계좌 체결을 확인하는 서비스는 아닙니다.')
-    tabs = st.tabs(['단타·15분', '스윙·1시간'])
-    for tab, unit in zip(tabs, (15, 60)):
+    st.caption('O: 오늘 이전에 생성된 가격 · N: 오늘 생성된 가격 · E: 진입중. 오늘 기준은 한국시간 오전 9시입니다.')
+    tabs = st.tabs(list(FRAME_LABELS.values()))
+    for tab, unit in zip(tabs, FRAME_LABELS):
         with tab:
             rows = [r for r in payload['rows'] if r['unit'] == unit][:10]
             st.caption(f'{len(rows)}종목 · 최대 10종목')
             if rows:
-                st.dataframe(recommendation_table(rows), hide_index=True, width='stretch')
-                for row in rows:
-                    if row.get('rechecking'):
-                        st.caption(f"{symbol(row)} · 직전 봉 기준 · 재검사 중. 확인 완료 {stamp(row['checkedThrough'])}.")
+                st.dataframe(recommendation_table(rows, payload.get('viewedAt', payload['generatedAt'])), hide_index=True, width='stretch')
+                rechecking = [r for r in rows if r.get('rechecking')]
+                if rechecking:
+                    st.caption(f'{len(rechecking)}종목은 직전 완료봉 기준으로 재검사 중입니다.')
+                    with st.expander('봉 검사 시각 확인', key=f'recheck_{unit}', expanded=False):
+                        st.dataframe(pd.DataFrame([{'종목': symbol(r), '마지막 검사 봉': stamp(r['checkedThrough'])} for r in rechecking]), hide_index=True, width='stretch')
             else:
                 st.info('현재 활성 상승 TT 가격까지 확인된 추천이 없습니다. 아래 신호 대기와 검사 사유를 확인할 수 있습니다.')
     with st.expander("타겟 트렌드 신호 대기 · ST Buy 추적", expanded=False, key="tt_signal_wait", on_change="rerun"):
         st.caption(f"추적 {len(payload['waiting'])}건")
         st.caption('ST Buy이지만 활성 상승 TT 신호가 아직 없어 진입을 권유하지 않는 종목입니다.')
         if payload['waiting']:
-            st.dataframe(pd.DataFrame([{'종목': symbol(r), '시간대': '단타·15분' if r['unit'] == 15 else '스윙·1시간',
+            st.dataframe(pd.DataFrame([{'종목': symbol(r), '시간대': FRAME_LABELS[r['unit']],
                                        'ST Buy 전환 시각': stamp(r.get('trend', {}).get('stFlipAt')), '24시간 거래대금': turnover((r.get('quote') or {}).get('quoteVolume24h')),
                                        '상태': r['reason']} for r in payload['waiting']]), hide_index=True, width='stretch')
     with st.expander('과거 추천 추적·신규 추천과 별도'):
         history = []
         for row in payload.get('history', [])[:100]:
             p = row['plan']
-            history.append({'종목': symbol(row), '시간대': '15분' if row['unit'] == 15 else '1시간', '상태': plan_status(p),
-                            '최초 표시': stamp(row['firstShownAt']), '매수가': price(p['entry']), '손절가': relative_price(p['stop'], p['entry']),
+            history.append({'종목': symbol(row), '시간대': FRAME_LABELS.get(row['unit'], str(row['unit'])), '상태': plan_status(p),
+                            '최초 추천 판정': stamp(row['firstShownAt']), '매수가': price(p['entry']), '손절가': relative_price(p['stop'], p['entry']),
                             **{f'{i + 1}차 매도가': relative_price(t, p['entry']) for i, t in enumerate(p['targets'])}})
         st.dataframe(pd.DataFrame(history), hide_index=True, width='stretch')
         st.caption('이 표는 새 구조에서 표시된 계획의 관찰 기록입니다. 이전 구조의 DB 원장은 삭제하지 않고 보존합니다.')

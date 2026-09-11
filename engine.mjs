@@ -2,7 +2,7 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { VERSION, HISTORY_BARS, assessHistory, UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
+import { VERSION, HISTORY_BARS, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
 // lib/upbit.ts
 var API_BASE = "https://api.upbit.com/v1";
 var UpbitApiError = class extends Error {
@@ -232,8 +232,12 @@ export class Radar {
   }
   async init(){await ensureSchema(this.db);
     for(const row of (await this.db.prepare('SELECT market,payload_json FROM radar_state').all()).results){const v=parse(row.payload_json);if(v.version===VERSION)this.states.set(row.market,v);}
-    for(const row of (await this.db.prepare('SELECT id,payload_json FROM radar_plans').all()).results){const v=parse(row.payload_json);if(v.plan?.id===row.id)this.plans.set(row.id,v);}
+    for(const row of (await this.db.prepare('SELECT id,payload_json FROM radar_plans').all()).results){const v=parse(row.payload_json);if(v.plan?.id===row.id){this.plans.set(row.id,v);if(row.id.startsWith('v7:')&&UNITS.includes(v.unit)&&v.firstShownAt)this.registerUpper(v.market,v.firstShownAt);}}
     const old=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(old)this.emit({type:'snapshot',payload:parse(old.payload_json)});
+  }
+  registerUpper(market,at){
+    const state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};
+    if(!state.upperTracking){state.upperTracking={firstQualifiedAt:at,attempts:{}};this.states.set(market,state);this.dirty.add(market);}
   }
   error(message){this.errors.push({at:this.clock(),message});this.errors=this.errors.slice(-12);this.emit({type:'error',at:this.clock(),message});}
   async load(code){if(this.caches.has(code))return this.caches.get(code);
@@ -250,13 +254,21 @@ export class Radar {
   async refreshQuotes(){const rows=await this.getTickers();const now=this.clock();this.quotes=new Map(rows.map(q=>[q.market,q]));this.lastQuote=now;
     for(const [id,row] of this.plans){if(row.plan.stoppedAt||row.plan.completedAt)continue;const quote=this.quotes.get(row.market);const plan=observePlan(row.plan,[],quote,now);if(JSON.stringify(plan)!==JSON.stringify(row.plan)){this.plans.set(id,{...row,plan});this.planDirty.add(id);}}
   }
-  remember(result){if(!result.plan)return;const id=result.plan.id,old=this.plans.get(id);
-    const row={market:result.market,name:result.name,unit:result.unit,plan:result.plan,firstShownAt:old?.firstShownAt??(result.status==='ready'?this.clock():null)};
-    if(JSON.stringify(row)!==JSON.stringify(old)){this.plans.set(id,row);this.planDirty.add(id);}}
+  remember(result){if(!result.plan)return;const id=result.plan.id,old=this.plans.get(id),now=this.clock();
+    let plan=result.plan;
+    if(!plan.entryTracking&&old?.plan.entryTracking)plan={...plan,entryTracking:old.plan.entryTracking};
+    if(result.status==='ready'&&!plan.entryTracking){
+      plan={...plan,entryTracking:{qualifiedAt:old?.firstShownAt??now,qualificationPrice:old?.firstShownAt?null:result.quote.tradePrice,
+        startedAt:now,enteredAt:null,firstTargetAt:plan.hits.some(Boolean)?now:null,reviewAt:null,checkedThrough:now}};
+      plan=observePlan(plan,[],result.quote,now);
+    }
+    const row={market:result.market,name:result.name,unit:result.unit,plan,firstShownAt:old?.firstShownAt??(result.status==='ready'?now:null)};
+    if(JSON.stringify(row)!==JSON.stringify(old)){this.plans.set(id,row);this.planDirty.add(id);}
+    if(result.status==='ready'&&UNITS.includes(result.unit))this.registerUpper(result.market,row.firstShownAt);}
   calculate(info,cache,unit,now){const state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};
     const bars=rawBars(cache,unit,endOf(unit,now)),history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;
     const id=trend?.signal?`v7:${info.market}:${unit}:tt:${trend.signal.time}`:null;
-    const upper=[240,1440].map(u=>assessHistory(cache,u,now)).filter(h=>h.ready).map(h=>h.trend);
+    const upper=[240,1440].filter(u=>u>unit).map(u=>assessHistory(cache,u,now)).filter(h=>h.ready).map(h=>h.trend);
     const result=evaluateMarket({market:info,cache,unit,quote:this.quotes.get(info.market),now,exclusionsReady:this.exclusions.ready,previousPlan:this.plans.get(id)?.plan,turnover:turnoverClass(cache,now),upper,history});
     state.turnover=turnoverClass(cache,now);state.frames[unit]=result;state.checkedAt=now;this.states.set(info.market,state);this.dirty.add(info.market);this.remember(result);
     // 과거에 표시한 같은 시간대의 가격도 실제 봉으로 계속 추적한다.
@@ -267,16 +279,17 @@ export class Radar {
     const exclusionReady=this.exclusions.ready&&now-this.exclusions.checkedAt>=0&&now-this.exclusions.checkedAt<=120000;
     for(const info of eligible){const state=this.states.get(info.market),cache=this.caches.get(info.market),turnover=cache?turnoverClass(cache,now):state?.turnover;
       const group=turnover?.ready&&turnover.asOf===endOf(60,now)?turnover.group:'pending';const frames={};
-      for(const unit of UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
-        if(!r||!exclusionReady)continue;
+      for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
+        if(!r||!exclusionReady||unit>60&&!state?.upperTracking)continue;
         if(r.status==='tt_wait'&&current&&group==='high')waiting.push({...r,quote:this.quotes.get(info.market)??r.quote});
         // 이미 확인된 완성 계획은 1봉 이내 재검사 동안 근거 시각을 붙여 보존한다. 새 Sell/종료 결과는 즉시 제외한다.
-        const grace=r.checkedThrough>=endOf(unit,now)-unit*60000&&r.turnover?.asOf>=endOf(60,now)-3600000;
+        const liquidity=unit>60&&turnover?.ready?turnover:r.turnover;
+        const grace=r.checkedThrough>=endOf(unit,now)-unit*60000&&liquidity?.asOf>=endOf(60,now)-3600000;
         const quote=this.quotes.get(info.market);const age=now-(quote?.receivedAt??0);
         if(r.status==='ready'&&group!=='low'&&grace&&age>=0&&age<=45000){const plan=this.plans.get(r.plan.id)?.plan??r.plan;
-          if(!plan.stoppedAt&&!plan.completedAt&&quote.tradePrice>plan.stop&&quote.tradePrice<plan.targets[2])rows.push({...r,plan,quote,rechecking:!current||group==='pending'});}
+          if(!plan.stoppedAt&&!plan.completedAt&&quote.tradePrice>plan.stop&&quote.tradePrice<plan.targets[2])rows.push({...r,plan,quote,turnover:liquidity,rechecking:!current||group==='pending'});}
       }
-      details.push({market:info.market,name:info.koreanName,group,average3d:turnover?.average3d??null,asOf:turnover?.asOf??0,frames,error:state?.error??null});
+      details.push({market:info.market,name:info.koreanName,group,average3d:turnover?.average3d??null,asOf:turnover?.asOf??0,frames,upperTracked:!!state?.upperTracking,error:state?.error??null});
       if(exclusionReady){const p=cache?promisingMarket(info,cache,turnover,this.quotes.get(info.market),now):group==='low'?state?.promising:null;if(p)promising.push({...p,quote:this.quotes.get(info.market)??p.quote});}
     }
     rows.sort((a,b)=>b.score-a.score||(b.turnover.average3d-a.turnover.average3d)||a.market.localeCompare(b.market));
@@ -298,6 +311,24 @@ export class Radar {
     }catch(e){state.error=e.message;state.checkedAt=now;if(e.status===429||e.status===418)throw e;this.error(`${info.market} ${e.message}`);}
     this.dirty.add(info.market);await this.flush();
   }
+  upperQueue(){const now=this.clock(),jobs=[];
+    for(const info of this.markets){const state=this.states.get(info.market),t=state?.turnover;
+      if(info.warned||info.market==='KRW-USDT'||!state?.upperTracking||!t?.ready||t.group!=='high'||t.asOf!==endOf(60,now))continue;
+      for(const unit of [240,1440]){const f=state.frames?.[unit];
+        if(!f||!f.historyReady||f.checkedThrough!==endOf(unit,now)||f.status==='quote_pending'||f.turnoverAsOf!==t.asOf)
+          jobs.push({info,unit,lastAttempt:state.upperTracking.attempts?.[unit]??0});
+      }
+    }
+    return jobs.sort((a,b)=>a.lastAttempt-b.lastAttempt||a.unit-b.unit||a.info.market.localeCompare(b.info.market));
+  }
+  async processUpper(info,unit){const state=this.states.get(info.market);state.upperTracking.attempts??={};state.upperTracking.attempts[unit]=this.clock();
+    try{const cache=await this.load(info.market);
+      const changed=await collectCandles(cache,info.market,unit,this.clock(),HISTORY_BARS,this.request);
+      if(changed){this.dirty.add(info.market);await sleep(135);}
+      const result=this.calculate(info,cache,unit,this.clock());result.turnoverAsOf=state.turnover.asOf;delete state.upperTracking.error;
+    }catch(e){state.upperTracking.error=e.message;if(e.status===429||e.status===418)throw e;this.error(`${info.market} ${unit}분 ${e.message}`);}
+    this.dirty.add(info.market);await this.flush();
+  }
   async detail(market){const info=this.markets.find(m=>m.market===market);if(!info)throw new Error('원화 종목 코드를 찾지 못했습니다.');const cache=await this.load(market),frames={};
     for(const unit of [15,60,240,1440]){const started=Date.now();do{await this.collect(info,unit,HISTORY_BARS);if(assessHistory(cache,unit,this.clock()).ready||cache.verified[unit]?.exhausted&&rawBars(cache,unit).length===0)break;await this.renew();}while(Date.now()-started<60000);const now=this.clock(),bars=rawBars(cache,unit,endOf(unit,now)),state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};const history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;this.states.set(market,state);this.dirty.add(market);
       const current=history.ready;const raw=current&&trend?.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;const calculated=pricePlan(raw,market,unit,now),stored=calculated?this.plans.get(calculated.id)?.plan:null,plan=observePlan(stored??calculated,bars,this.quotes.get(market),now);
@@ -308,7 +339,7 @@ export class Radar {
   async cycle({maxMarkets=Infinity}={}){if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
     this.processing=true;this.emit({type:'started',at:this.clock()});let used=0;
     try {await this.refreshMarkets();await this.refreshQuotes();await this.flush(true);
-      const eligible=this.markets.filter(m=>!m.warned&&m.market!=='KRW-USDT');
+      const primaryAt=this.clock(),eligible=this.markets.filter(m=>!m.warned&&m.market!=='KRW-USDT');
       // 초기에는 모든 거래대금을 먼저 분류한다. 재실행은 DB 분류를 이어서 처리한다.
       const classify=eligible.filter(m=>this.states.get(m.market)?.turnover?.asOf!==endOf(60,this.clock())||!this.states.get(m.market)?.turnover?.ready);
       for(const info of classify){if(used++>=maxMarkets)return;await this.process(info,'turnover');}
@@ -316,6 +347,11 @@ export class Radar {
         const priority=m=>{const s=this.states.get(m.market);return UNITS.some(u=>s?.frames[u]?.status==='ready')?0:UNITS.some(u=>s?.trends[u]?.stDirection===1)?1:2;};return priority(a)-priority(b)||(this.states.get(a.market)?.checkedAt??0)-(this.states.get(b.market)?.checkedAt??0);});
       for(const info of queue){if(used++>=maxMarkets)return;await this.process(info,'analysis');if(this.detailQueue.length)await this.runDetail();}
       while(this.detailQueue.length)await this.runDetail();
+      // 상위봉은 한 번에 한 페이지씩 순환하며 새 하위봉 검사에 우선권을 준다.
+      for(let pass=0;pass<4;pass++){
+        if(endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
+        await this.processUpper(job.info,job.unit);
+      }
     } finally {this.processing=false;try{await this.flush(true);}finally{await this.release();}this.emit({type:'completed',at:this.clock()});}
   }
   async runDetail(){const market=this.detailQueue.shift();this.emit({type:'detail_started',market,at:this.clock()});try{this.emit({type:'detail',payload:await this.detail(market)});}catch(e){this.emit({type:'detail_error',market,message:e.message});}}
