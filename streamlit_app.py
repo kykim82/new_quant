@@ -116,7 +116,7 @@ def draw_detail_slot(worker, slot):
     for unit, frame in detail['frames'].items():
         p = frame.get('plan')
         row = {'시간대': {'15': '15분', '60': '1시간', '240': '4시간', '1440': '일봉'}[unit],
-               'ST': frame['st'], 'TT': frame['tt'], '상태': frame['reason'], '매수가': price(p['entry']) if p else '—',
+               '매수가': price(p['entry']) if p else '—',
                '손절가': relative_price(p['stop'], p['entry']) if p else '—'}
         row.update({f'{i + 1}차 매도가': relative_price(p['targets'][i], p['entry']) if p else '—' for i in range(3)})
         rows.append(row)
@@ -125,8 +125,8 @@ def draw_detail_slot(worker, slot):
 
 def draw_detail(worker):
     st.subheader('4. 종목 상세 분석')
-    for slot in (1, 2):
-        with st.container(border=True):
+    for slot, column in enumerate(st.columns(2, border=True), start=1):
+        with column:
             draw_detail_slot(worker, slot)
 
 
