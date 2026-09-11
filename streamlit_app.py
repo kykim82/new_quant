@@ -130,6 +130,10 @@ def draw_detail(worker):
             draw_detail_slot(worker, slot)
 
 
+def toggle_promising():
+    st.session_state['promising_open'] = not st.session_state.get('promising_open', True)
+
+
 def render(worker):
     view = worker.snapshot()
     payload = view.get('payload')
@@ -201,12 +205,18 @@ def render(worker):
                             **{f'{i + 1}차 매도가': relative_price(t, p['entry']) for i, t in enumerate(p['targets'])}})
         st.dataframe(pd.DataFrame(history), hide_index=True, width='stretch')
         st.caption('이 표는 새 구조에서 표시된 계획의 관찰 기록입니다. 이전 구조의 DB 원장은 삭제하지 않고 보존합니다.')
-    st.subheader('2. 유망 종목')
-    st.caption('3일 평균 거래대금 10억 미만 중 거래대금이 늘고 1시간 이평선과 가격이 회복하는 종목을 관찰합니다.')
-    if payload['promising']:
-        st.dataframe(pd.DataFrame([{'종목': symbol(r), '현재가': quote_label(r), '24시간 거래대금': turnover((r.get('quote') or {}).get('quoteVolume24h')), '선정 이유': r['reason']} for r in payload['promising'][:20]]), hide_index=True, width='stretch')
-    else:
-        st.info('현재 유망 조건을 충족한 종목이 없거나 거래대금을 분류 중입니다.')
+    st.session_state.setdefault('promising_open', True)
+    with st.container(horizontal=True, vertical_alignment='center', gap='small'):
+        st.subheader('2. 유망 종목', width='content')
+        st.button('', icon=':material/expand_less:' if st.session_state['promising_open'] else ':material/expand_more:',
+                  help='유망 종목 접기' if st.session_state['promising_open'] else '유망 종목 펼치기',
+                  key='promising_toggle', on_click=toggle_promising)
+    if st.session_state['promising_open']:
+        st.caption('3일 평균 거래대금 10억 미만 중 거래대금이 늘고 1시간 이평선과 가격이 회복하는 종목을 관찰합니다.')
+        if payload['promising']:
+            st.dataframe(pd.DataFrame([{'종목': symbol(r), '현재가': quote_label(r), '24시간 거래대금': turnover((r.get('quote') or {}).get('quoteVolume24h')), '선정 이유': r['reason']} for r in payload['promising'][:20]]), hide_index=True, width='stretch')
+        else:
+            st.info('현재 유망 조건을 충족한 종목이 없거나 거래대금을 분류 중입니다.')
     st.subheader('3. 급등 코인')
     st.caption('별도 급등 예측 규칙은 아직 설정하지 않았습니다.')
     draw_detail(worker)
