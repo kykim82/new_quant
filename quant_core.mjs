@@ -2,6 +2,8 @@
 // Target Trend 원안 © BigBeluga, CC BY-NC-SA 4.0, https://creativecommons.org/licenses/by-nc-sa/4.0/
 export const VERSION = 7;
 export const HISTORY_BARS = 2000;
+export const RETENTION_VERSION = 1;
+export const RETAINED_BARS = 600;
 export const MIN_TURNOVER = 1_000_000_000;
 export const UNITS = [15, 60];
 export const RECOMMEND_UNITS = [15, 60, 240, 1440];
@@ -9,14 +11,15 @@ export const endOf = (unit, now) => Math.floor(now / (unit * 60000)) * unit * 60
 export const mean = a => a.length ? a.reduce((s,v)=>s+v,0)/a.length : null;
 export const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
 export function sma(bars,n,offset=0) { const end=bars.length-offset; return end>=n ? mean(bars.slice(end-n,end).map(b=>b.close)) : null; }
-export function rsi(bars,n=14) {
-  if(bars.length<=n)return null;
-  let gain=0,loss=0;
-  for(let i=1;i<bars.length;i++){const d=bars[i].close-bars[i-1].close;
-    if(i<=n){gain+=Math.max(d,0)/n;loss+=Math.max(-d,0)/n;}
-    else {gain=(gain*(n-1)+Math.max(d,0))/n;loss=(loss*(n-1)+Math.max(-d,0))/n;}}
-  return loss===0 ? gain===0?50:100 : 100-100/(1+gain/loss);
+function advanceRsi(bars,previous,n=14){const state=previous?{...previous}:{lastClose:0,previousClose:null,count:0,gain:0,loss:0};
+  for(const b of bars){if(b.closeTime<=state.lastClose)continue;if(state.previousClose!==null){const d=b.close-state.previousClose;state.count++;
+    if(state.count<=n){state.gain+=Math.max(d,0)/n;state.loss+=Math.max(-d,0)/n;}
+    else {state.gain=(state.gain*(n-1)+Math.max(d,0))/n;state.loss=(state.loss*(n-1)+Math.max(-d,0))/n;}}
+    state.previousClose=b.close;state.lastClose=b.closeTime;}
+  return state;
 }
+function rsiValue(state,n=14){return state.count<n?null:state.loss===0?state.gain===0?50:100:100-100/(1+state.gain/state.loss);}
+export function rsi(bars,n=14){return rsiValue(advanceRsi(bars,null,n),n);}
 export function validBar(b){return [b.openTime,b.closeTime,b.open,b.high,b.low,b.close,b.baseVolume,b.quoteVolume].every(Number.isFinite)&&b.openTime<b.closeTime&&b.low>0&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.baseVolume>=0&&b.quoteVolume>=0;}
 export function rawBars(cache,unit,now=Infinity){return (cache?.[unit]??[]).filter(b=>!b.synthetic&&b.closeTime<=now&&validBar(b)).sort((a,b)=>a.openTime-b.openTime);}
 export function initialTrend(){return {version:7,count:0,lastClose:0,previousClose:null,trSeed:[],atr10:null,atr200:null,atrWindow:[],highs:[],lows:[],stLower:null,stUpper:null,stDirection:1,stFlipAt:null,ttUpper:null,ttLower:null,ttDirection:null,signal:null};}
@@ -64,15 +67,17 @@ export function indicatorBars(cache,unit,now){
   return range?rawBars(cache,unit,end).filter(b=>b.openTime>=range[0]):[];
 }
 export function assessHistory(cache,unit,now){
-  const end=endOf(unit,now),meta=cache?.verified?.[unit],bars=indicatorBars(cache,unit,now);
+  const end=endOf(unit,now),meta=cache?.verified?.[unit],bars=indicatorBars(cache,unit,now),checkpoint=cache?.checkpoints?.[unit];
   const fail=reason=>({ready:false,reason,bars:bars.length});
   if(!meta||meta.checkedThrough<end)return fail('최신 봉 연결 확인 중');
   if(!bars.length)return fail('실제 봉 이력 수집 중');
-  const complete=meta.exhausted&&covered(cache,unit,0,end);
-  if(!complete&&bars.length<HISTORY_BARS)return fail(`TT 초기 이력 검증 중 (${bars.length}/${HISTORY_BARS}봉)`);
-  const trend=advanceTrends(bars);
-  if(complete)return {ready:true,kind:'listing',bars:bars.length,trend};
-  const shadow=advanceTrends(bars.slice(200));
+  if(meta.retainedFrom!=null&&(!checkpoint||checkpoint.version!==RETENTION_VERSION||checkpoint.trend?.version!==VERSION||checkpoint.rsi?.lastClose!==checkpoint.trend.lastClose||checkpoint.trend.lastClose>bars[0].openTime||!covered(cache,unit,checkpoint.trend.lastClose,end)||checkpoint.kind==='converged'&&!checkpoint.shadow))return fail('누적 계산 상태 확인 필요 · 이력 보존');
+  const complete=checkpoint?checkpoint.kind==='listing':meta.exhausted&&covered(cache,unit,0,end),count=(checkpoint?.trend.count??0)+bars.length;
+  if(!complete&&count<HISTORY_BARS)return fail(`TT 초기 이력 검증 중 (${count}/${HISTORY_BARS}봉)`);
+  const trend=advanceTrends(bars,checkpoint?.trend),value=rsiValue(advanceRsi(rawBars(cache,unit,end),checkpoint?.rsi));
+  const result={ready:true,kind:complete?'listing':'converged',bars:count,trend,rsi:value};
+  if(complete)return result;
+  const shadow=advanceTrends(checkpoint?bars:bars.slice(200),checkpoint?.shadow);
   const close=(a,b)=>a===null&&b===null||Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(1e-12,tickSize(Math.max(Math.abs(a),Math.abs(b)))*.01);
   const displayed=v=>Number((Math.floor(v/tickSize(v)+1e-9)*tickSize(v)).toPrecision(14));
   const same=trend.stDirection===shadow.stDirection&&trend.ttDirection===shadow.ttDirection
@@ -84,7 +89,19 @@ export function assessHistory(cache,unit,now){
       &&JSON.stringify(trend.signal.hits)===JSON.stringify(shadow.signal.hits)
       &&trend.signal.stoppedAt===shadow.signal.stoppedAt&&trend.signal.completedAt===shadow.signal.completedAt);
   if(!same||trend.stDirection===1&&trend.ttDirection===true&&!trend.signal)return fail(`TT 시작 이력 추가 검증 중 (${bars.length}봉)`);
-  return {ready:true,kind:'converged',bars:bars.length,trend};
+  return result;
+}
+// 과거 가격 도달도 보존하여 정리한 구간을 누적 상태로 재현한다.
+export function compactCandles(cache,unit,now,history=assessHistory(cache,unit,now)){
+  const bars=indicatorBars(cache,unit,now);if(!history.ready||bars.length<=RETAINED_BARS||bars.length!==rawBars(cache,unit,endOf(unit,now)).length)return 0;
+  const count=bars.length-RETAINED_BARS,prefix=bars.slice(0,count),prior=cache.checkpoints?.[unit];
+  const trend=advanceTrends(prefix,prior?.trend),shadow=history.kind==='listing'?null:advanceTrends(prior?prefix:prefix.slice(200),prior?.shadow);
+  let observed=trend.signal?.direction==='up'?pricePlan({...trend.signal,source:'tt'},'checkpoint',unit,now):null;
+  if(observed&&prior?.observed?.signalTime===observed.signalTime){observed.stoppedAt??=prior.observed.stoppedAt;observed.completedAt??=prior.observed.completedAt;observed.hits=observed.hits.map((h,i)=>h||prior.observed.hits[i]);}
+  observed=observePlan(observed,prefix,null,now);
+  cache.checkpoints??={};cache.checkpoints[unit]={version:RETENTION_VERSION,kind:history.kind,trend,shadow,rsi:advanceRsi(prefix,prior?.rsi),observed:observed?{signalTime:observed.signalTime,stoppedAt:observed.stoppedAt,completedAt:observed.completedAt,hits:observed.hits}:null};
+  cache[unit]=[...bars.slice(count),...(cache[unit]??[]).filter(b=>b.closeTime>endOf(unit,now))];cache.verified[unit].retainedFrom=cache[unit][0].openTime;
+  return count;
 }
 export function pricePlan(raw,market,unit,now){
   if(!raw||raw.source!=='tt'||!Array.isArray(raw.targets)||raw.targets.length!==3)return null;
@@ -122,7 +139,7 @@ export function observePlan(plan,bars,quote,now){if(!plan)return null;const p=st
   if(quote&&now-quote.receivedAt>=0&&now-quote.receivedAt<=45000){if(quote.tradePrice<=p.stop)p.stoppedAt??=now;p.targets.forEach((t,i)=>{if(quote.tradePrice>=t)p.hits[i]=true;});if(p.hits[2])p.completedAt??=now;}
   return p;
 }
-export function rankScore(bars,trend,plan,turnover,upper=[]){const current=bars.at(-1).close,volRatio=turnover.previousDay>0?turnover.lastDay/turnover.previousDay:1,r=rsi(bars);
+export function rankScore(bars,trend,plan,turnover,upper=[],r=rsi(bars)){const current=bars.at(-1).close,volRatio=turnover.previousDay>0?turnover.lastDay/turnover.previousDay:1;
   const parts={st:trend.stDirection===1?20:0,targets:20,rewardRisk:20*clamp(plan.rewardRisk/4,0,1),risk:10/(1+plan.riskPct/5),activity:10*clamp(volRatio/2,0,1),upper:upper.reduce((s,t)=>s+(t.stDirection===1?5:0)+(t.signal?.direction==='up'&&!t.signal.stoppedAt&&!t.signal.completedAt?5:0),0),overheat:-(r===null?0:clamp((r-70)/30,0,1)*10),extension:trend.atr10>0?-clamp((current-trend.stLower)/trend.atr10-4,0,5):0};
   return {score:Math.round(clamp(Object.values(parts).reduce((s,v)=>s+v,0),0,100)*100)/100,parts,rsi:r};
 }
@@ -144,12 +161,14 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   if(!raw)return fail('tt_wait','타겟 트렌드 상승 신호 대기',{...extra,code:'TT_SIGNAL_WAIT',turnover,quote});
   let plan=pricePlan(raw,market.market,unit,now);
   if(!plan)return fail('price_pending','유효한 매수·손절·3단계 목표 구조 없음',extra);
+  const observed=cache.checkpoints?.[unit]?.observed;
+  if(observed?.signalTime===plan.signalTime){plan.stoppedAt??=observed.stoppedAt;plan.completedAt??=observed.completedAt;plan.hits=plan.hits.map((h,i)=>h||observed.hits[i]);}
   if(previousPlan?.id===plan.id)plan={...plan,createdAt:previousPlan.createdAt,entryTracking:previousPlan.entryTracking,entry:previousPlan.entry,stop:previousPlan.stop,targets:previousPlan.targets,stoppedAt:previousPlan.stoppedAt??plan.stoppedAt,completedAt:previousPlan.completedAt??plan.completedAt,hits:plan.hits.map((h,i)=>h||previousPlan.hits?.[i])};
   plan=observePlan(plan,bars,quote,now);
   if(plan.stoppedAt||plan.completedAt)return fail('ended','가격 계획 손절·3차 목표 종료 · 새 신호 대기',{...extra,plan});
   if(!quote||!Number.isFinite(quote.receivedAt)||now-quote.receivedAt<0||now-quote.receivedAt>45000)return fail('quote_pending','최신 시세 조회 대기',{...extra,plan});
   if(!(quote.tradePrice>0))return fail('quote_pending','시세 값 확인 대기',{...extra,plan});
-  const rank=rankScore(bars,trend,plan,turnover,upper);
+  const rank=rankScore(bars,trend,plan,turnover,upper,history.rsi);
   return {...fail('ready','가격 계획 확인 완료',extra),plan,turnover,...rank,quote,st:trend.stDirection===1?'Buy':'Sell',newListing:trend.count<399,priceMethod:'원본 Target Trend'};
 }
 export function promisingMarket(market,cache,turnover,quote,now){const bars=rawBars(cache,60,endOf(60,now)),ma=sma(bars,20),old=sma(bars,20,3);if(!turnover?.ready||turnover.group!=='low'||!turnover.increasing||ma===null||old===null||!(ma>old&&bars.at(-1).close>=ma))return null;return {market:market.market,name:market.koreanName,quote,turnover,reason:'거래대금 증가 · 1시간 이평선 상승 및 가격 회복',score:turnover.previousDay>0?turnover.lastDay/turnover.previousDay:1};}

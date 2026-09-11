@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { VERSION, HISTORY_BARS, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
+import { VERSION, HISTORY_BARS, RETAINED_BARS, compactCandles, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
 // lib/upbit.ts
 var API_BASE = "https://api.upbit.com/v1";
 var UpbitApiError = class extends Error {
@@ -226,7 +226,7 @@ export async function collectCandles(cache,market,unit,now,desired,request=reque
     if(!Array.isArray(rows))throw new Error('캔들 응답 형식 오류');
     const incoming=rows.map(r=>({openTime:Date.parse(r.candle_date_time_utc+'Z'),closeTime:Date.parse(r.candle_date_time_utc+'Z')+width,open:r.opening_price,high:r.high_price,low:r.low_price,close:r.trade_price,baseVolume:r.candle_acc_trade_volume,quoteVolume:r.candle_acc_trade_price}));
     if(incoming.some(b=>!validBar(b)||b.closeTime>to||b.openTime%width!==0)||new Set(incoming.map(b=>b.openTime)).size!==incoming.length)throw new Error('캔들 값·완료 시각 검증 실패');
-    const merged=new Map(cache[unit].map(b=>[b.openTime,b]));incoming.forEach(b=>merged.set(b.openTime,b));cache[unit]=[...merged.values()].sort((a,b)=>a.openTime-b.openTime);
+    const merged=new Map(cache[unit].map(b=>[b.openTime,b]));incoming.forEach(b=>{if(b.closeTime>(cache.checkpoints?.[unit]?.trend?.lastClose??0))merged.set(b.openTime,b);});cache[unit]=[...merged.values()].sort((a,b)=>a.openTime-b.openTime);
     const first=incoming.length?Math.min(...incoming.map(b=>b.openTime)):to;
     if(rows.length<200)meta.exhausted=true;
     meta.ranges=mergeRanges([...meta.ranges,[rows.length<200?0:first,to]]);
@@ -293,7 +293,10 @@ export class Radar {
     const exclusionReady=this.exclusions.ready&&now-this.exclusions.checkedAt>=0&&now-this.exclusions.checkedAt<=120000;
     for(const info of eligible){const state=this.states.get(info.market),cache=this.caches.get(info.market),turnover=cache?turnoverClass(cache,now):state?.turnover;
       const group=turnover?.ready&&turnover.asOf===endOf(60,now)?turnover.group:'pending';const frames={};
-      for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,actualBars:r?.actualBars??0,historyReady:current&&r?.historyReady===true,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
+      for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const legacy=unit>60&&r?.status==='sell',current=r?.checkedThrough===endOf(unit,now)&&!legacy;
+        const label=unit===1440?'일봉':unit===240?'4시간':unit===60?'1시간':'15분';
+        const reason=legacy?'이전 판정 재검증 대기':!r?`${label} 최초 수집 대기`:!r.historyReady&&r.status==='history_pending'?r.reason:current?r.reason:`${label} 최신 봉 재검사 대기`;
+        frames[unit]={status:current?r.status:'collecting',reason,checkedThrough:r?.checkedThrough??0,actualBars:r?.actualBars??0,historyReady:current&&r?.historyReady===true,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
         if(!r||!exclusionReady||unit>60&&!state?.upperTracking)continue;
         if(r.status==='tt_wait'&&r.trend?.stDirection===1&&current&&group==='high')waiting.push({...displayResult(r),quote:this.quotes.get(info.market)??r.quote});
         // 이미 확인된 완성 계획은 1봉 이내 재검사 동안 근거 시각을 붙여 보존한다. 새 Sell/종료 결과는 즉시 제외한다.
@@ -310,8 +313,16 @@ export class Radar {
     return {version:VERSION,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
   }
   async flush(force=false){if(!this.token)return;const now=this.clock();if(!force&&now-this.lastSave<3000)return;await this.renew();
+    // 가격 추적을 먼저 갱신·저장한 뒤 같은 캐시 안의 누적 상태와 최근 봉을 교체한다.
+    for(const code of this.dirty){const cache=this.caches.get(code);if(!cache)continue;
+      for(const unit of RECOMMEND_UNITS){if((cache[unit]?.length??0)<=RETAINED_BARS)continue;const history=assessHistory(cache,unit,now);if(!history.ready)continue;
+        const bars=rawBars(cache,unit,endOf(unit,now));
+        for(const [id,row] of this.plans){if(row.market!==code||row.unit!==unit||row.plan.stoppedAt||row.plan.completedAt)continue;const plan=observePlan(row.plan,bars,this.quotes.get(code),now);if(JSON.stringify(plan)!==JSON.stringify(row.plan)){this.plans.set(id,{...row,plan});this.planDirty.add(id);}}
+        compactCandles(cache,unit,now,history);
+      }
+    }
     const codes=[...this.dirty],ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[];codes.forEach(code=>{if(this.caches.has(code))queries.push(this.db.prepare('INSERT OR REPLACE INTO candle_cache VALUES (?,?)').bind(code,encodeCache(this.caches.get(code))));queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify(this.states.get(code))));});
-    ids.forEach(id=>{const row=this.plans.get(id);queries.push(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));});
+    ids.forEach(id=>{const row=this.plans.get(id);queries.unshift(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));});
     for(let i=0;i<queries.length;i+=20)await this.db.batch(queries.slice(i,i+20));codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
     const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){await this.db.prepare('INSERT OR REPLACE INTO radar_snapshot VALUES (1,?)').bind(JSON.stringify(payload)).run();this.snapshotSavedAt=now;}this.lastSave=now;this.emit({type:'snapshot',payload});
   }
@@ -324,21 +335,30 @@ export class Radar {
       else state.checkedAt=this.clock();state.promising=promisingMarket(info,cache,state.turnover,this.quotes.get(info.market),this.clock());delete state.error;
     }catch(e){state.error=e.message;state.checkedAt=now;if(e.status===429||e.status===418)throw e;this.error(`${info.market} ${e.message}`);}
     this.dirty.add(info.market);await this.flush();
+    if(phase==='analysis')await this.warmUpper(info);
   }
-  upperQueue(){const now=this.clock(),jobs=[];
+  async warmUpper(info){const state=this.states.get(info.market),cache=this.caches.get(info.market),now=this.clock();
+    if(!state?.upperTracking||!cache||state.turnover?.group!=='high')return;
+    let changed=false;
+    for(const unit of [240,1440]){const old=state.frames?.[unit];if(old?.historyReady&&old.checkedThrough===endOf(unit,now)&&old.upperRuleVersion===2&&old.turnoverAsOf===state.turnover.asOf&&old.status!=='quote_pending')continue;
+      if(assessHistory(cache,unit,now).ready){const result=this.calculate(info,cache,unit,now);result.turnoverAsOf=state.turnover.asOf;result.upperRuleVersion=2;changed=true;}}
+    if(changed)await this.flush(true);
+  }
+  upperQueue(){const now=this.clock(),jobs=[],rows=this.snapshot().rows.filter(r=>UNITS.includes(r.unit));
+    const visible=new Set(UNITS.flatMap(u=>rows.filter(r=>r.unit===u).slice(0,10).map(r=>r.market))),qualified=new Set(rows.map(r=>r.market));
     for(const info of this.markets){const state=this.states.get(info.market),t=state?.turnover;
       if(info.warned||info.market==='KRW-USDT'||!state?.upperTracking||!t?.ready||t.group!=='high'||t.asOf!==endOf(60,now))continue;
       for(const unit of [240,1440]){const f=state.frames?.[unit];
         if(!f||!f.historyReady||f.checkedThrough!==endOf(unit,now)||f.status==='quote_pending'||f.turnoverAsOf!==t.asOf||f.upperRuleVersion!==2)
-          jobs.push({info,unit,lastAttempt:state.upperTracking.attempts?.[unit]??0,priority:Math.max(-1,...UNITS.map(u=>state.frames?.[u]?.status==='ready'?state.frames[u].score??0:-1))});
+          jobs.push({info,unit,tier:visible.has(info.market)?0:qualified.has(info.market)?1:2,lastAttempt:state.upperTracking.attempts?.[unit]??0,priority:Math.max(-1,...UNITS.map(u=>state.frames?.[u]?.status==='ready'?state.frames[u].score??0:-1))});
       }
     }
-    return jobs.sort((a,b)=>a.lastAttempt-b.lastAttempt||b.priority-a.priority||a.unit-b.unit||a.info.market.localeCompare(b.info.market));
+    return jobs.sort((a,b)=>a.tier-b.tier||a.lastAttempt-b.lastAttempt||b.priority-a.priority||a.unit-b.unit||a.info.market.localeCompare(b.info.market));
   }
-  async processUpper(info,unit,{deadline=this.clock()+3000}={}){const state=this.states.get(info.market);state.upperTracking.attempts??={};state.upperTracking.attempts[unit]=this.clock();
+  async processUpper(info,unit,{deadline=this.clock()+3000,maxPages=16}={}){const state=this.states.get(info.market);state.upperTracking.attempts??={};state.upperTracking.attempts[unit]=this.clock();
     try{const cache=await this.load(info.market);
       const primaryEnd=endOf(15,this.clock());
-      for(let page=0;page<16;page++){
+      for(let page=0;page<maxPages;page++){
         if(this.clock()>=deadline||endOf(15,this.clock())!==primaryEnd)break;
         const changed=await collectCandles(cache,info.market,unit,this.clock(),HISTORY_BARS,this.request);
         if(!changed)break;this.dirty.add(info.market);await sleep(135);
@@ -350,8 +370,10 @@ export class Radar {
   }
   async detail(market){const info=this.markets.find(m=>m.market===market);if(!info)throw new Error('원화 종목 코드를 찾지 못했습니다.');const cache=await this.load(market),frames={};
     for(const unit of [15,60,240,1440]){const started=Date.now();do{await this.collect(info,unit,HISTORY_BARS);if(assessHistory(cache,unit,this.clock()).ready||cache.verified[unit]?.exhausted&&rawBars(cache,unit).length===0)break;await this.renew();}while(Date.now()-started<60000);const now=this.clock(),bars=rawBars(cache,unit,endOf(unit,now)),state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};const history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;this.states.set(market,state);this.dirty.add(market);
-      const current=history.ready;const raw=current&&trend?.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;const calculated=pricePlan(raw,market,unit,now),stored=calculated?this.plans.get(calculated.id)?.plan:null,plan=observePlan(stored??calculated,bars,this.quotes.get(market),now);
-      frames[unit]={st:!current||!trend||trend.atr10===null?'이력 수집 중':trend.stDirection===1?'Buy':'Sell',tt:!current||!trend||trend.ttDirection===null?'이력·신호 대기':trend.ttDirection?'상승':'하락',plan,checkedThrough:cache.verified[unit]?.checkedThrough??0,bars:bars.length,rsi:rsi(bars),sma20:sma(bars,20),reason:!history.ready?history.reason:!plan?'상승 TT 신호 대기':plan.stoppedAt||plan.completedAt?'종료된 TT 가격 · 새 신호 대기':'활성 TT 가격'};
+      const current=history.ready;const raw=current&&trend?.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;const calculated=pricePlan(raw,market,unit,now),stored=calculated?this.plans.get(calculated.id)?.plan:null,observed=cache.checkpoints?.[unit]?.observed;
+      if(calculated&&observed?.signalTime===calculated.signalTime){calculated.stoppedAt??=observed.stoppedAt;calculated.completedAt??=observed.completedAt;calculated.hits=calculated.hits.map((h,i)=>h||observed.hits[i]);}
+      const plan=observePlan(stored??calculated,bars,this.quotes.get(market),now);
+      frames[unit]={st:!current||!trend||trend.atr10===null?'이력 수집 중':trend.stDirection===1?'Buy':'Sell',tt:!current||!trend||trend.ttDirection===null?'이력·신호 대기':trend.ttDirection?'상승':'하락',plan,checkedThrough:cache.verified[unit]?.checkedThrough??0,bars:bars.length,rsi:history.ready?history.rsi:rsi(bars),sma20:sma(bars,20),reason:!history.ready?history.reason:!plan?'상승 TT 신호 대기':plan.stoppedAt||plan.completedAt?'종료된 TT 가격 · 새 신호 대기':'활성 TT 가격'};
     }
     await this.flush(true);return {market,name:info.koreanName,generatedAt:this.clock(),quote:this.quotes.get(market),frames};
   }
@@ -364,13 +386,14 @@ export class Radar {
       for(const info of classify){if(used++>=maxMarkets)return;await this.process(info,'turnover');}
       const queue=eligible.filter(m=>{const state=this.states.get(m.market);return state?.turnover?.group==='high'&&UNITS.some(u=>{const f=state.frames?.[u];return !f||f.checkedThrough!==endOf(u,this.clock())||f.status==='quote_pending'||!f.historyReady;});}).sort((a,b)=>{
         const priority=m=>{const s=this.states.get(m.market);return UNITS.some(u=>s?.frames[u]?.status==='ready')?0:UNITS.some(u=>s?.trends[u]?.stDirection===1)?1:2;};return priority(a)-priority(b)||(this.states.get(a.market)?.checkedAt??0)-(this.states.get(b.market)?.checkedAt??0);});
-      for(const info of queue){if(used++>=maxMarkets)return;await this.process(info,'analysis');if(this.detailQueue.length)await this.runDetail();}
+      for(const info of queue){if(used++>=maxMarkets)return;await this.process(info,'analysis');if(this.detailQueue.length)await this.runDetail();
+        if(endOf(15,this.clock())===endOf(15,primaryAt)){const job=this.upperQueue()[0];if(job)await this.processUpper(job.info,job.unit,{deadline:this.clock()+1200,maxPages:1});}}
       while(this.detailQueue.length)await this.runDetail();
       // 상위 이력은 짧게 이어 수집하고 새 하위봉 검사에 우선권을 준다.
-      const upperDeadline=this.clock()+4000;
-      for(let pass=0;pass<4;pass++){
+      const upperDeadline=this.clock()+30000;
+      for(let pass=0;pass<32;pass++){
         if(this.clock()>=upperDeadline||endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
-        await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000)});
+        await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000),maxPages:4});
       }
     } finally {this.processing=false;try{await this.flush(true);}finally{await this.release();}this.emit({type:'completed',at:this.clock()});}
   }
