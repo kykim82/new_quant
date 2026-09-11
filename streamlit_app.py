@@ -111,7 +111,6 @@ def draw_detail_slot(worker, slot):
     if not detail:
         return
     st.write(f"{symbol(detail)} · 현재가 {quote_label(detail)}")
-    st.caption(f"상세 분석 {stamp(detail['generatedAt'])}. 가격은 초기 이력을 검증한 해당 시간대 Target Trend 값이며 추천 여부와 구분합니다.")
     rows = []
     for unit, frame in detail['frames'].items():
         p = frame.get('plan')
