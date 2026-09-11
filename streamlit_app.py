@@ -43,10 +43,10 @@ def plan_status(plan):
     if plan.get('stoppedAt'):
         return '손절 종료'
     if plan.get('completedAt'):
-        return '3차 매도가 도달'
+        return '3차 도달'
     hits = plan.get('hits') or []
     if any(hits):
-        return f'{max(i + 1 for i, hit in enumerate(hits) if hit)}차 매도가 도달'
+        return f'{max(i + 1 for i, hit in enumerate(hits) if hit)}차 도달'
     return '미진입'
 
 
