@@ -1,178 +1,70 @@
-# 루트의 분석 엔진 프로세스를 관리하고 최신 성공·실패 상태를 보관한다.
+# 새 분석기 프로세스와 완성 가격·TT 추적 결과를 화면에 전달한다.
 import copy
-from collections import OrderedDict
 import json
 import math
 import os
 import re
-from pathlib import Path
 import subprocess
 import threading
 import time
+from collections import OrderedDict
+from pathlib import Path
 
-SECRET_KEYS = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "CLOUDFLARE_API_TOKEN")
+SECRET_KEYS = ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID', 'CLOUDFLARE_API_TOKEN')
 
 
 def node_executable():
     import nodejs_wheel
     root = Path(nodejs_wheel.__file__).parent
-    return str(root / "node.exe" if os.name == "nt" else root / "bin" / "node")
+    return str(root / 'node.exe' if os.name == 'nt' else root / 'bin' / 'node')
 
 
 def fresh_payload(payload, now_ms):
-    return (not payload.get("stale") and not payload.get("error")
-            and 0 <= now_ms - payload["generatedAt"] <= 180_000)
+    return payload.get('version') == 6 and 0 <= now_ms - payload.get('generatedAt', 0) <= 45_000
 
 
-def quality_current(quality, now_ms):
-    if not quality or quality.get("version") != 2 or not quality.get("ready"):
+def valid_plan(plan):
+    if not isinstance(plan, dict) or plan.get('source') != 'tt':
         return False
-    units = (15, 60, 240, 1440) if quality.get("strategy") == "scalp" else (60, 240, 1440)
-    for unit in units:
-        q = quality.get("frames", {}).get(str(unit), {})
-        end = now_ms // (unit * 60_000) * unit * 60_000
-        if not q.get("ready") or q.get("expectedClose") != end:
-            return False
-        if not (q.get("available") and q.get("latestActualClose") == end
-                or unit >= 240 and q.get("optional") and q.get("exhausted")):
-            return False
-    return True
-
-
-def entry_gate_current(candidate, now_ms):
-    gate = candidate.get("entryGate") or {}
-    unit = 15 if candidate.get("strategy") == "scalp" else 60
-    end = now_ms // (unit * 60_000) * (unit * 60_000)
-    return (gate.get("version") == 1 and gate.get("unit") == unit and gate.get("ready")
-            and gate.get("direction") == 1 and gate.get("closeTime") == end
-            and gate.get("latestActualClose") == end
-            and not (gate.get("targetTrend") or {}).get("completedAt")
-            and not (gate.get("targetTrend") or {}).get("stoppedAt"))
-
-
-def price_plan_current(candidate, now_ms):
-    p = candidate.get("plan") or {}
-    targets = p.get("targets")
-    if not isinstance(p.get("id"), str) or not p["id"] or not isinstance(targets, list) or len(targets) != 3:
-        return False
-    values = [p.get(k) for k in ("entryLow", "entryAnchor", "entryHigh", "stop")] + targets + [candidate.get("currentPrice")]
-    if not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in values):
-        return False
-    returns = p.get("netReturns") or []
-    expires = candidate.get("entryValidUntil", p.get("expiresAt"))
-    tolerance = (p["entryHigh"] - p["entryLow"]) * 0.625
-    reward_risk = p.get("netRewardRiskAtTarget2")
-    return (candidate.get("actionableVersion") == 1 and candidate.get("entryPolicyVersion") == 2
-            and (p["entryAnchor"] - p["stop"]) / p["entryAnchor"] * 100 <= (2 if candidate.get("strategy") == "scalp" else 6)
-            and type(reward_risk) in (int, float) and math.isfinite(reward_risk) and reward_risk >= 1.5
-            and candidate.get("entryStatus") == "ready"
-            and p["stop"] < p["entryLow"] <= p["entryAnchor"] <= p["entryHigh"] < targets[0] < targets[1] < targets[2]
-            and bool(returns) and type(returns[0]) in (int, float) and math.isfinite(returns[0]) and returns[0] > 0
-            and type(expires) in (int, float) and expires > now_ms
-            and type(candidate.get("quoteVolume24h")) in (int, float) and math.isfinite(candidate["quoteVolume24h"]) and candidate["quoteVolume24h"] >= 0
-            and type(candidate.get("averageTurnover3d")) in (int, float) and math.isfinite(candidate["averageTurnover3d"]) and candidate["averageTurnover3d"] >= 1_000_000_000
-            and type(candidate.get("currentPriceAt")) in (int, float) and 0 <= now_ms - candidate["currentPriceAt"] <= 180_000
-            and p["stop"] < candidate["currentPrice"] < targets[0]
-            and p["entryLow"] - tolerance <= candidate["currentPrice"] <= p["entryHigh"] + tolerance
-            and entry_gate_current(candidate, now_ms) and quality_current(candidate.get("dataQuality"), now_ms))
-
-
-def pipeline_current(payload, now_ms):
-    pipeline = payload.get("pipeline") or {}
-    details = pipeline.get("details") or []
-    return (pipeline.get("version") == 1 and pipeline.get("primaryComplete")
-            and pipeline.get("turnoverClose") == now_ms // 3_600_000 * 3_600_000
-            and len(details) == pipeline.get("total")
-            and all(d.get("group") == "low" or d.get("group") == "high" and all(
-                d.get("frames", {}).get(str(u), {}).get("ready")
-                and d["frames"][str(u)].get("candleClose") == now_ms // (u * 60_000) * u * 60_000
-                for u in (15, 60)) for d in details))
+    values = [plan.get('stop'), plan.get('entry'), *(plan.get('targets') or [])]
+    return (len(values) == 5 and all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in values)
+            and all(a < b for a, b in zip(values, values[1:])) and not plan.get('stoppedAt') and not plan.get('completedAt'))
 
 
 def public_snapshot(state, now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     view = copy.deepcopy(state)
-    payload = view.get("payload")
+    payload = view.get('payload')
     if not payload:
         return view
-    for key in ("stRecommendations", "scalp", "swing", "promising", "watchlist", "volumeMonitor"):
-        if key in payload:
-            payload[key] = [c for c in payload[key] if c.get("market") != "KRW-USDT"]
-    stale = bool(view.get("error") or not fresh_payload(payload, now_ms))
-    payload["stale"] = stale
-    exclusions_ready = payload.get("marketExclusions", {}).get("ready", False)
-    pipeline = payload.get("pipeline")
-    if pipeline and pipeline.get("version") == 1:
-        for detail in pipeline["details"]:
-            if detail.get("turnoverClose") != now_ms // 3_600_000 * 3_600_000:
-                detail["group"] = "pending"
-            for unit, frame in detail.get("frames", {}).items():
-                if frame.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
-                    frame["ready"] = False
-        details = pipeline["details"]
-        pipeline["high"] = sum(d["group"] == "high" for d in details)
-        pipeline["low"] = sum(d["group"] == "low" for d in details)
-        pipeline["classified"] = pipeline["high"] + pipeline["low"]
-        pipeline["pending"] = len(details) - pipeline["classified"]
-        pipeline["turnoverComplete"] = exclusions_ready and pipeline["pending"] == 0
-        pipeline["candlesReady"] = sum(d["group"] == "high" and all(d.get("frames", {}).get(str(u), {}).get("ready", False) for u in (15, 60)) for d in details)
-        pipeline["primaryComplete"] = pipeline["turnoverComplete"] and pipeline["candlesReady"] == pipeline["high"]
-        pipeline["complete"] = pipeline["complete"] and pipeline["primaryComplete"]
-        payload["turnoverCoverage"] = {k: pipeline[k] for k in ("total", "high", "low", "pending")}
-        pipeline["classificationFailures"] = sum(d["group"] == "pending" and bool(d.get("turnoverError")) for d in details)
-        pipeline["accounted"] = len({d["market"] for d in details}) == pipeline.get("total")
-        pipeline["stage"] = "exclusions" if not exclusions_ready else "turnover" if not pipeline["turnoverComplete"] else "candles" if not pipeline["primaryComplete"] else "analysis"
-    payload["viewedAt"] = now_ms
-    invalid_schema = payload.get("schemaVersion") != 5
-
-    payload["stRecommendations"] = [] if invalid_schema or not exclusions_ready else [
-        c for c in payload.get("stRecommendations", [])
-        if price_plan_current(c, now_ms)
-        and c.get("risk", {}).get("version") == 1
-        and c["risk"].get("ready")
-        and not c["risk"].get("blocked")
-        and c.get("turnover", {}).get("ready")
-        and c["turnover"].get("average3d", 0) >= 1_000_000_000
-        and c["turnover"].get("candleClose") == now_ms // 3_600_000 * 3_600_000
-    ]
-    for unit, coverage in payload.get("primaryCoverage", {}).items():
-        if coverage.get("candleClose") != now_ms // (int(unit) * 60_000) * (int(unit) * 60_000):
-            coverage.update(buy=0, sell=0, pending=coverage["total"], inspected=0,
-                            waiting=coverage["total"], unavailable=0, noTrade=0, detailChecked=0)
-            for detail in coverage.get("details", []):
-                detail["status"] = "recheck" if detail.get("checkedAt") else "unscanned"
-                detail["detailChecked"] = False
-            coverage["counts"] = {"unscanned": coverage["total"] - coverage["checked"],
-                                  "recheck": coverage["checked"]}
-            coverage["candleClose"] = now_ms // (int(unit) * 60_000) * (int(unit) * 60_000)
-    payload["promising"] = [] if stale or not exclusions_ready else [c for c in payload.get("promising", [])
-        if c.get("dailyQuality", {}).get("ready")
-        and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
-    for strategy in ("scalp", "swing"):
-        payload[strategy] = [] if invalid_schema or not exclusions_ready else [
-            c for c in payload.get(strategy, [])
-            if price_plan_current(c, now_ms)
-            and entry_gate_current(c, now_ms)
-            and quality_current(c.get("dataQuality"), now_ms)
-            and c.get("entryValidUntil", c["plan"]["expiresAt"]) > now_ms
-        ]
-    # 원래 분석 시각·가격 계획은 유지하고 현재 시각으로 신규 진입만 막는다.
-    for plan in payload.get("savedPlans", []):
-        if plan.get("entryStatus") not in {"stopped", "completed"} and (stale or not exclusions_ready or not entry_gate_current(plan, now_ms) or not quality_current(plan.get("dataQuality"), now_ms) or plan.get("entryValidUntil", 0) <= now_ms):
-            plan["entryStatus"] = "waiting"
-            plan["entryBlockReason"] = "최신 분석과 진입 조건 재확인 대기"
-    # 분석 지연이나 진입 만료는 추천 원장을 삭제하거나 종료시키지 않는다.
-    for recommendation in payload.get("recommendations", {}).get("active", []):
-        if recommendation.get("market") == "KRW-USDT" or stale or not exclusions_ready or not entry_gate_current(recommendation, now_ms) or not quality_current(recommendation.get("dataQuality"), now_ms) or recommendation.get("entryValidUntil", 0) <= now_ms:
-            recommendation["entryStatus"] = "waiting"
-            recommendation["currentAssessment"] = None
-        record = recommendation["tracking"]
-        duration = record["stopTimeframe"] * 60_000
-        recommendation["trackingDelayed"] = (stale or now_ms // 900_000 * 900_000 > record["lastClose"]
-                                              or now_ms // duration * duration > record["stopCheckedThrough"])
-    for row in payload.get("watchlist", []):
-        if now_ms - row.get("analyzedAt", 0) > 1_200_000:
-            row["reason"] = "분석 지연 · 재분석 대기"
+    payload['viewedAt'] = now_ms
+    exclusions = payload.get('exclusions') or {}
+    allowed = (payload.get('version') == 6 and exclusions.get('ready')
+               and 0 <= now_ms - exclusions.get('checkedAt', 0) <= 120_000)
+    excluded = {r['market'] for r in payload.get('excluded', [])} | {'KRW-USDT'}
+    accepted = []
+    for row in payload.get('rows', []):
+        unit, plan, quote = row.get('unit'), row.get('plan'), row.get('quote') or {}
+        if unit not in (15, 60) or row.get('market') in excluded or not allowed or not valid_plan(plan):
+            continue
+        end = now_ms // (unit * 60_000) * unit * 60_000
+        turnover = row.get('turnover') or {}
+        received = quote.get('receivedAt', 0)
+        value = quote.get('tradePrice')
+        if (0 <= now_ms - received <= 45_000 and type(value) in (int, float) and math.isfinite(value)
+                and plan['stop'] < value < plan['targets'][2]
+                and end - unit * 60_000 <= row.get('checkedThrough', 0) <= end
+                and turnover.get('average3d', 0) >= 1_000_000_000
+                and now_ms // 3_600_000 * 3_600_000 - 3_600_000 <= turnover.get('asOf', 0) <= now_ms):
+            row['rechecking'] = row.get('rechecking', False) or row['checkedThrough'] != end or turnover['asOf'] != now_ms // 3_600_000 * 3_600_000
+            accepted.append(row)
+    payload['rows'] = accepted
+    payload['waiting'] = [r for r in payload.get('waiting', []) if allowed and r.get('code') == 'TT_SIGNAL_WAIT'
+                          and r.get('market') not in excluded and r.get('unit') in (15, 60)
+                          and r.get('checkedThrough') == now_ms // (r['unit'] * 60_000) * (r['unit'] * 60_000)]
+    payload['promising'] = [r for r in payload.get('promising', []) if allowed and r.get('market') not in excluded
+                            and r.get('turnover', {}).get('asOf') == now_ms // 3_600_000 * 3_600_000]
+    payload['stale'] = not fresh_payload(payload, now_ms)
     return view
 
 
