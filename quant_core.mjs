@@ -1,6 +1,7 @@
 // 원본 ST·Target Trend와 새 거래대금·가격·순위 규칙을 계산한다.
 // Target Trend 원안 © BigBeluga, CC BY-NC-SA 4.0, https://creativecommons.org/licenses/by-nc-sa/4.0/
 export const VERSION = 7;
+export const ST_SETTINGS = '7-2.5-hlc3-rma-v1';
 export const HISTORY_BARS = 2000;
 export const RETENTION_VERSION = 1;
 export const RETAINED_BARS = 600;
@@ -23,6 +24,19 @@ export function rsi(bars,n=14){return rsiValue(advanceRsi(bars,null,n),n);}
 export function validBar(b){return [b.openTime,b.closeTime,b.open,b.high,b.low,b.close,b.baseVolume,b.quoteVolume].every(Number.isFinite)&&b.openTime<b.closeTime&&b.low>0&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.baseVolume>=0&&b.quoteVolume>=0;}
 export function rawBars(cache,unit,now=Infinity){return (cache?.[unit]??[]).filter(b=>!b.synthetic&&b.closeTime<=now&&validBar(b)).sort((a,b)=>a.openTime-b.openTime);}
 export function initialTrend(){return {version:7,count:0,lastClose:0,previousClose:null,trSeed:[],atr10:null,atr200:null,atrWindow:[],highs:[],lows:[],stLower:null,stUpper:null,stDirection:1,stFlipAt:null,ttUpper:null,ttLower:null,ttDirection:null,signal:null};}
+// ST는 차트의 7·2.5·HLC3·RMA 설정으로 TT와 별도 누적한다.
+export function advanceSupertrend(bars,previous,initialDirection=1){
+  const reusable=previous?.settings===ST_SETTINGS&&(!bars.length||bars[0].openTime>=previous.firstOpenTime);
+  const s=reusable?structuredClone(previous):{settings:ST_SETTINGS,count:0,lastClose:0,firstOpenTime:bars[0]?.openTime,previousClose:null,seed:[],atr:null,lower:null,upper:null,direction:initialDirection,flipAt:null,restarted:false};
+  for(const b of bars){if(b.closeTime<=s.lastClose)continue;const pc=s.previousClose,tr=pc===null?b.high-b.low:Math.max(b.high-b.low,Math.abs(b.high-pc),Math.abs(b.low-pc));s.count++;
+    if(s.seed.length<7)s.seed.push(tr);s.atr=s.atr===null?(s.count===7?mean(s.seed):null):(s.atr*6+tr)/7;
+    if(s.atr!==null){const source=(b.high+b.low+b.close)/3,lower=source-2.5*s.atr,upper=source+2.5*s.atr,priorLower=s.lower??lower,priorUpper=s.upper??upper,prior=s.direction;
+      s.lower=pc!==null&&pc>priorLower?Math.max(lower,priorLower):lower;s.upper=pc!==null&&pc<priorUpper?Math.min(upper,priorUpper):upper;
+      if(s.direction===-1&&b.close>priorUpper)s.direction=1;else if(s.direction===1&&b.close<priorLower)s.direction=-1;if(prior!==s.direction)s.flipAt=b.closeTime;}
+    s.previousClose=b.close;s.lastClose=b.closeTime;
+  }return s;
+}
+function attachST(trend,st){trend.st=st;trend.stLower=st.lower;trend.stUpper=st.upper;trend.stDirection=st.direction;trend.stFlipAt=st.flipAt;return trend;}
 export function advanceTrends(bars,previous){
   const reusable=previous?.version===7&&(!bars.length||!previous.firstOpenTime||bars[0].openTime>=previous.firstOpenTime);
   const state=reusable?structuredClone(previous):initialTrend();
@@ -34,10 +48,6 @@ export function advanceTrends(bars,previous){
     state.atr200=state.atr200===null?(state.count===200?mean(state.trSeed):null):(state.atr200*199+tr)/200;
     if(state.atr200!==null){state.atrWindow.push(state.atr200);if(state.atrWindow.length>200)state.atrWindow.shift();}
     state.highs.push(b.high);state.lows.push(b.low);if(state.highs.length>10){state.highs.shift();state.lows.shift();}
-    if(state.atr10!==null){const lower=(b.high+b.low)/2-3*state.atr10,upper=(b.high+b.low)/2+3*state.atr10,priorLower=state.stLower??lower,priorUpper=state.stUpper??upper,priorDirection=state.stDirection;
-      state.stLower=pc!==null&&pc>priorLower?Math.max(lower,priorLower):lower;state.stUpper=pc!==null&&pc<priorUpper?Math.min(upper,priorUpper):upper;
-      if(state.stDirection===-1&&b.close>priorUpper)state.stDirection=1;else if(state.stDirection===1&&b.close<priorLower)state.stDirection=-1;
-      if(priorDirection!==state.stDirection)state.stFlipAt=b.closeTime;}
     if(state.atrWindow.length===200){const width=mean(state.atrWindow)*.8,upper=mean(state.highs)+width,lower=mean(state.lows)-width,prior=state.ttDirection;
       if(pc!==null&&state.ttUpper!==null&&pc<=state.ttUpper&&b.close>upper)state.ttDirection=true;
       if(pc!==null&&state.ttLower!==null&&pc>=state.ttLower&&b.close<lower)state.ttDirection=false;
@@ -50,7 +60,8 @@ export function advanceTrends(bars,previous){
       if(signal.hits[2])signal.completedAt??=b.closeTime;}
     state.lastClose=b.closeTime;state.previousClose=b.close;
   }
-  return state;
+  const st=advanceSupertrend(bars,state.st);if(reusable&&!previous.st)st.restarted=true;
+  return attachST(state,st);
 }
 export function mergeRanges(ranges){const out=[];for(const r of ranges.filter(r=>r[0]<r[1]).sort((a,b)=>a[0]-b[0])){const last=out.at(-1);if(last&&r[0]<=last[1])last[1]=Math.max(last[1],r[1]);else out.push([...r]);}return out;}
 export function covered(cache,unit,start,end){return (cache?.verified?.[unit]?.ranges??[]).some(r=>r[0]<=start&&r[1]>=end);}
@@ -75,13 +86,18 @@ export function assessHistory(cache,unit,now){
   const complete=checkpoint?checkpoint.kind==='listing':meta.exhausted&&covered(cache,unit,0,end),count=(checkpoint?.trend.count??0)+bars.length;
   if(!complete&&count<HISTORY_BARS)return fail(`TT 초기 이력 검증 중 (${count}/${HISTORY_BARS}봉)`);
   const trend=advanceTrends(bars,checkpoint?.trend),value=rsiValue(advanceRsi(rawBars(cache,unit,end),checkpoint?.rsi));
+  const recovery=cache.stRecovery?.[unit],stBars=recovery?[...recovery.bars,...bars]:bars;
+  if(recovery){const st=advanceSupertrend(stBars);st.restarted=!recovery.exhausted;attachST(trend,st);}
+  if(trend.st.restarted){const sameST=other=>trend.st.direction===other.direction&&['atr','lower','upper'].every(k=>trend.st[k]===other[k]||Number.isFinite(trend.st[k])&&Number.isFinite(other[k])&&Math.abs(trend.st[k]-other[k])<=Math.max(1e-12,Math.abs(trend.st[k])*1e-12));
+    if(stBars.length<400||!sameST(advanceSupertrend(stBars,null,-1))||!sameST(advanceSupertrend(stBars.slice(200),null,-1)))return {...fail('ST 새 설정 이력 추가 검증 중'),stPending:true};
+    trend.st.restarted=false;
+  }
   const result={ready:true,kind:complete?'listing':'converged',bars:count,trend,rsi:value};
   if(complete)return result;
   const shadow=advanceTrends(checkpoint?bars:bars.slice(200),checkpoint?.shadow);
   const close=(a,b)=>a===null&&b===null||Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(1e-12,tickSize(Math.max(Math.abs(a),Math.abs(b)))*.01);
   const displayed=v=>Number((Math.floor(v/tickSize(v)+1e-9)*tickSize(v)).toPrecision(14));
-  const same=trend.stDirection===shadow.stDirection&&trend.ttDirection===shadow.ttDirection
-    &&close(trend.stLower,shadow.stLower)&&close(trend.stUpper,shadow.stUpper)
+  const same=(checkpoint||trend.stDirection===shadow.stDirection&&close(trend.stLower,shadow.stLower)&&close(trend.stUpper,shadow.stUpper))&&trend.ttDirection===shadow.ttDirection
     &&close(trend.ttUpper,shadow.ttUpper)&&close(trend.ttLower,shadow.ttLower)
     &&(trend.signal?.time??null)===(shadow.signal?.time??null)
     &&(!trend.signal||trend.signal.direction===shadow.signal.direction
@@ -96,6 +112,9 @@ export function compactCandles(cache,unit,now,history=assessHistory(cache,unit,n
   const bars=indicatorBars(cache,unit,now);if(!history.ready||bars.length<=RETAINED_BARS||bars.length!==rawBars(cache,unit,endOf(unit,now)).length)return 0;
   const count=bars.length-RETAINED_BARS,prefix=bars.slice(0,count),prior=cache.checkpoints?.[unit];
   const trend=advanceTrends(prefix,prior?.trend),shadow=history.kind==='listing'?null:advanceTrends(prior?prefix:prefix.slice(200),prior?.shadow);
+  const recovery=cache.stRecovery?.[unit];if(recovery)attachST(trend,advanceSupertrend([...recovery.bars,...prefix]));
+  trend.st.restarted=false;if(shadow)attachST(shadow,structuredClone(trend.st));
+  if(recovery)delete cache.stRecovery[unit];
   let observed=trend.signal?.direction==='up'?pricePlan({...trend.signal,source:'tt'},'checkpoint',unit,now):null;
   if(observed&&prior?.observed?.signalTime===observed.signalTime){observed.stoppedAt??=prior.observed.stoppedAt;observed.completedAt??=prior.observed.completedAt;observed.hits=observed.hits.map((h,i)=>h||prior.observed.hits[i]);}
   observed=observePlan(observed,prefix,null,now);
@@ -144,7 +163,7 @@ export function rankScore(bars,trend,plan,turnover,upper=[],r=rsi(bars)){const c
   return {score:Math.round(clamp(Object.values(parts).reduce((s,v)=>s+v,0),0,100)*100)/100,parts,rsi:r};
 }
 export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,previousTrend,previousPlan,turnover,upper=[],history}){
-  const fail=(code,reason,extra={})=>({market:market.market,name:market.koreanName,unit,status:code,reason,checkedAt:now,...extra});
+  const fail=(code,reason,extra={})=>({market:market.market,name:market.koreanName,unit,status:code,reason,checkedAt:now,stRule:ST_SETTINGS,...extra});
   if(!exclusionsReady)return fail('exclusions','공식 제외 정보 확인 중');
   if(market.warned||market.market==='KRW-USDT')return fail('excluded','유의·거래지원 종료·테더 제외');
   if(!turnover?.ready||turnover.asOf!==endOf(60,now))return fail('volume_pending','거래대금 최신 분류 중');
@@ -154,7 +173,7 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   history??=assessHistory(cache,unit,now);
   if(!history.ready)return fail('history_pending',history.reason,{checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:false});
   const trend=history.trend,extra={trend,checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:true,historyKind:history.kind,historyExhausted:meta.exhausted===true};
-  if(trend.atr10===null)return fail('new_listing','신규 상장 · ST 계산 이력 수집 중',extra);
+  if((trend.st?trend.st.atr:trend.atr10)===null)return fail('new_listing','신규 상장 · ST 계산 이력 수집 중',extra);
   if(UNITS.includes(unit)&&trend.stDirection!==1)return fail('sell','ST Sell',extra);
   let raw=trend.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;
   if(raw?.stoppedAt||raw?.completedAt)return fail('ended','타겟 트렌드 종료 · 새 신호 대기',extra);
