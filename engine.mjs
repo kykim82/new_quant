@@ -2,6 +2,7 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { VERSION, HISTORY_BARS, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
 // lib/upbit.ts
 var API_BASE = "https://api.upbit.com/v1";
@@ -146,10 +147,17 @@ function remoteDatabase(config, transport = fetch, intervalMs = 350) {
         const retry = Number(response.headers.get("retry-after"));
         nextRequestAt = Date.now() + Math.max(60, Number.isFinite(retry) ? retry : 60) * 1e3;
       }
-      if (!response.ok) throw new Error(`D1 연결 실패(HTTP ${response.status}). 토큰 권한·무료 사용량을 확인해 주세요.`);
-      const data = await response.json();
-      if (!data.success || !Array.isArray(data.result) || data.result.length !== queries.length || data.result.some((r) => !r.success)) {
-        throw new Error(`D1 쿼리 실패(코드 ${data.errors?.[0]?.code ?? "unknown"}). 저장이 완료되지 않았습니다.`);
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success || !Array.isArray(data.result) || data.result.length !== queries.length || data.result.some((r) => !r.success)) {
+        const failure = data?.errors?.[0] ?? data?.result?.find?.((r) => !r.success)?.errors?.[0];
+        let message = String(failure?.message ?? '서버가 요청을 완료하지 못했습니다.');
+        for (const secret of [config.token, config.accountId, config.databaseId]) message = message.split(secret).join('[비공개]');
+        const reason = /maximum DB size|database.*full/i.test(message) ? 'DB 저장 용량 한도 초과'
+          : /string or blob too big|row.*size.*limit/i.test(message) ? '저장 행 크기 한도 초과'
+          : /daily row write limit/i.test(message) ? '일일 쓰기 한도 초과'
+          : /daily row read limit/i.test(message) ? '일일 읽기 한도 초과'
+          : [401, 403].includes(response.status) ? '인증·권한 확인 필요' : '요청 실패';
+        throw new Error(`D1 ${reason}(HTTP ${response.status}, 코드 ${failure?.code ?? 'unknown'}). ${message.replace(/[\r\n]+/g, ' ').slice(0, 200)}`);
       }
       return data.result.map((r) => ({ ...r, results: r.results ?? [] }));
     });
@@ -193,6 +201,12 @@ export async function ensureSchema(db) {
   ].map(s=>db.prepare(s)));
 }
 const parse = (text, fallback={}) => {try{return JSON.parse(text);}catch{return fallback;}};
+// 캔들 전체와 검증 메타데이터를 손실 없이 보존하며 구형 JSON도 읽는다.
+function encodeCache(cache){return JSON.stringify({encoding:'gzip-base64-v1',data:gzipSync(JSON.stringify(cache),{level:1}).toString('base64')});}
+function decodeCache(text){const value=JSON.parse(text);return value.encoding==='gzip-base64-v1'?JSON.parse(gunzipSync(Buffer.from(value.data,'base64')).toString('utf8')):value;}
+// 화면에서 사용하지 않는 계산 버퍼는 원본 상태에만 보존한다.
+function displayResult(result){if(!result.trend)return result;const {trSeed,atrWindow,highs,lows,...trend}=result.trend;return {...result,trend};}
+
 export async function collectCandles(cache,market,unit,now,desired,request=requestJson) {
   const end=endOf(unit,now),width=unit*60000;
   cache[unit]??=[];cache.verified??={};
@@ -243,7 +257,7 @@ export class Radar {
   async load(code){if(this.caches.has(code))return this.caches.get(code);
     let row=await this.db.prepare('SELECT candles_json FROM candle_cache WHERE market=?').bind(code).first();
     if(!row){const table=await this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_analysis'").first();if(table)row=await this.db.prepare('SELECT candles_json FROM market_analysis WHERE market=?').bind(code).first();}
-    const cache=row?JSON.parse(row.candles_json):{};cache.verified??={};this.caches.set(code,cache);return cache;
+    const cache=row?decodeCache(row.candles_json):{};cache.verified??={};this.caches.set(code,cache);return cache;
   }
   async acquire(){const now=this.clock(),token=randomUUID();const row=await this.db.prepare('UPDATE scan_lease SET token=?, until_ms=?, last_run=? WHERE id=1 AND until_ms<=? RETURNING token').bind(token,now+180000,now,now).first();if(row?.token===token){this.token=token;return true;}return false;}
   async renew(){if(!this.token)return false;const row=await this.db.prepare('UPDATE scan_lease SET until_ms=? WHERE id=1 AND token=? RETURNING token').bind(this.clock()+180000,this.token).first();if(!row){this.token=null;throw new Error('분석 저장 잠금이 변경되었습니다. 다음 회차에 다시 연결합니다.');}return true;}
@@ -281,13 +295,13 @@ export class Radar {
       const group=turnover?.ready&&turnover.asOf===endOf(60,now)?turnover.group:'pending';const frames={};
       for(const unit of RECOMMEND_UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,actualBars:r?.actualBars??0,historyReady:current&&r?.historyReady===true,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
         if(!r||!exclusionReady||unit>60&&!state?.upperTracking)continue;
-        if(r.status==='tt_wait'&&r.trend?.stDirection===1&&current&&group==='high')waiting.push({...r,quote:this.quotes.get(info.market)??r.quote});
+        if(r.status==='tt_wait'&&r.trend?.stDirection===1&&current&&group==='high')waiting.push({...displayResult(r),quote:this.quotes.get(info.market)??r.quote});
         // 이미 확인된 완성 계획은 1봉 이내 재검사 동안 근거 시각을 붙여 보존한다. 새 Sell/종료 결과는 즉시 제외한다.
         const liquidity=unit>60&&turnover?.ready?turnover:r.turnover;
         const grace=r.checkedThrough>=endOf(unit,now)-unit*60000&&liquidity?.asOf>=endOf(60,now)-3600000;
         const quote=this.quotes.get(info.market);const age=now-(quote?.receivedAt??0);
         if(r.status==='ready'&&group!=='low'&&grace&&age>=0&&age<=45000){const plan=this.plans.get(r.plan.id)?.plan??r.plan;
-          if(!plan.stoppedAt&&!plan.completedAt&&quote.tradePrice>plan.stop&&quote.tradePrice<plan.targets[2])rows.push({...r,plan,quote,turnover:liquidity,rechecking:!current||group==='pending'});}
+          if(!plan.stoppedAt&&!plan.completedAt&&quote.tradePrice>plan.stop&&quote.tradePrice<plan.targets[2])rows.push({...displayResult(r),plan,quote,turnover:liquidity,rechecking:!current||group==='pending'});}
       }
       details.push({market:info.market,name:info.koreanName,group,average3d:turnover?.average3d??null,asOf:turnover?.asOf??0,frames,upperTracked:!!state?.upperTracking,error:state?.error??null});
       if(exclusionReady){const p=cache?promisingMarket(info,cache,turnover,this.quotes.get(info.market),now):group==='low'?state?.promising:null;if(p)promising.push({...p,quote:this.quotes.get(info.market)??p.quote});}
@@ -296,10 +310,10 @@ export class Radar {
     return {version:VERSION,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
   }
   async flush(force=false){if(!this.token)return;const now=this.clock();if(!force&&now-this.lastSave<3000)return;await this.renew();
-    const codes=[...this.dirty],ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[];codes.forEach(code=>{if(this.caches.has(code))queries.push(this.db.prepare('INSERT INTO candle_cache VALUES (?,?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json').bind(code,JSON.stringify(this.caches.get(code))));queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify(this.states.get(code))));});
+    const codes=[...this.dirty],ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[];codes.forEach(code=>{if(this.caches.has(code))queries.push(this.db.prepare('INSERT OR REPLACE INTO candle_cache VALUES (?,?)').bind(code,encodeCache(this.caches.get(code))));queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify(this.states.get(code))));});
     ids.forEach(id=>{const row=this.plans.get(id);queries.push(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));});
     for(let i=0;i<queries.length;i+=20)await this.db.batch(queries.slice(i,i+20));codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
-    const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){await this.db.prepare('INSERT INTO radar_snapshot VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(JSON.stringify(payload)).run();this.snapshotSavedAt=now;}this.lastSave=now;this.emit({type:'snapshot',payload});
+    const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){await this.db.prepare('INSERT OR REPLACE INTO radar_snapshot VALUES (1,?)').bind(JSON.stringify(payload)).run();this.snapshotSavedAt=now;}this.lastSave=now;this.emit({type:'snapshot',payload});
   }
   async collect(info,unit,desired){const cache=await this.load(info.market);let changed=false;
     for(let pass=0;pass<3;pass++){const did=await collectCandles(cache,info.market,unit,this.clock(),desired,this.request);changed||=did;if(!did)break;await sleep(135);}
