@@ -1,6 +1,7 @@
 // 원본 ST·Target Trend와 새 거래대금·가격·순위 규칙을 계산한다.
 // Target Trend 원안 © BigBeluga, CC BY-NC-SA 4.0, https://creativecommons.org/licenses/by-nc-sa/4.0/
-export const VERSION = 6;
+export const VERSION = 7;
+export const HISTORY_BARS = 2000;
 export const MIN_TURNOVER = 1_000_000_000;
 export const UNITS = [15, 60];
 export const endOf = (unit, now) => Math.floor(now / (unit * 60000)) * unit * 60000;
@@ -17,9 +18,9 @@ export function rsi(bars,n=14) {
 }
 export function validBar(b){return [b.openTime,b.closeTime,b.open,b.high,b.low,b.close,b.baseVolume,b.quoteVolume].every(Number.isFinite)&&b.openTime<b.closeTime&&b.low>0&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.baseVolume>=0&&b.quoteVolume>=0;}
 export function rawBars(cache,unit,now=Infinity){return (cache?.[unit]??[]).filter(b=>!b.synthetic&&b.closeTime<=now&&validBar(b)).sort((a,b)=>a.openTime-b.openTime);}
-export function initialTrend(){return {version:6,count:0,lastClose:0,previousClose:null,trSeed:[],atr10:null,atr200:null,atrWindow:[],highs:[],lows:[],stLower:null,stUpper:null,stDirection:1,stFlipAt:null,ttUpper:null,ttLower:null,ttDirection:null,signal:null};}
+export function initialTrend(){return {version:7,count:0,lastClose:0,previousClose:null,trSeed:[],atr10:null,atr200:null,atrWindow:[],highs:[],lows:[],stLower:null,stUpper:null,stDirection:1,stFlipAt:null,ttUpper:null,ttLower:null,ttDirection:null,signal:null};}
 export function advanceTrends(bars,previous){
-  const reusable=previous?.version===6&&(!bars.length||!previous.firstOpenTime||bars[0].openTime>=previous.firstOpenTime);
+  const reusable=previous?.version===7&&(!bars.length||!previous.firstOpenTime||bars[0].openTime>=previous.firstOpenTime);
   const state=reusable?structuredClone(previous):initialTrend();
   state.firstOpenTime??=bars[0]?.openTime;
   for(const b of bars){if(b.closeTime<=state.lastClose)continue;
@@ -56,12 +57,40 @@ export function turnoverClass(cache,now){const end=endOf(60,now),start=end-72*36
   return {ready:true,group:average3d>=MIN_TURNOVER?'high':'low',average3d,lastDay,previousDay,increasing:lastDay>previousDay,asOf:end};
 }
 export function tickSize(p){return p>=1e6?1000:p>=5e5?500:p>=1e5?100:p>=5e4?50:p>=1e4?10:p>=5e3?5:p>=100?1:p>=10?.1:p>=1?.01:p>=.1?.001:p>=.01?.0001:p>=.001?.00001:p>=.0001?.000001:p>=.00001?.0000001:.00000001;}
+// ATR 시작점에 민감한 TT는 상장 전체 이력 또는 서로 다른 시작점의 수렴을 확인한다.
+export function indicatorBars(cache,unit,now){
+  const end=endOf(unit,now),range=cache?.verified?.[unit]?.ranges?.find(r=>r[1]>=end);
+  return range?rawBars(cache,unit,end).filter(b=>b.openTime>=range[0]):[];
+}
+export function assessHistory(cache,unit,now){
+  const end=endOf(unit,now),meta=cache?.verified?.[unit],bars=indicatorBars(cache,unit,now);
+  const fail=reason=>({ready:false,reason,bars:bars.length});
+  if(!meta||meta.checkedThrough<end)return fail('최신 봉 연결 확인 중');
+  if(!bars.length)return fail('실제 봉 이력 수집 중');
+  const complete=meta.exhausted&&covered(cache,unit,0,end);
+  if(!complete&&bars.length<HISTORY_BARS)return fail(`TT 초기 이력 검증 중 (${bars.length}/${HISTORY_BARS}봉)`);
+  const trend=advanceTrends(bars);
+  if(complete)return {ready:true,kind:'listing',bars:bars.length,trend};
+  const shadow=advanceTrends(bars.slice(200));
+  const close=(a,b)=>a===null&&b===null||Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(1e-12,tickSize(Math.max(Math.abs(a),Math.abs(b)))*.01);
+  const displayed=v=>Number((Math.floor(v/tickSize(v)+1e-9)*tickSize(v)).toPrecision(14));
+  const same=trend.stDirection===shadow.stDirection&&trend.ttDirection===shadow.ttDirection
+    &&close(trend.stLower,shadow.stLower)&&close(trend.stUpper,shadow.stUpper)
+    &&close(trend.ttUpper,shadow.ttUpper)&&close(trend.ttLower,shadow.ttLower)
+    &&(trend.signal?.time??null)===(shadow.signal?.time??null)
+    &&(!trend.signal||trend.signal.direction===shadow.signal.direction
+      &&[trend.signal.entry,trend.signal.stop,...trend.signal.targets].every((v,i)=>{const other=[shadow.signal.entry,shadow.signal.stop,...shadow.signal.targets][i];return close(v,other)&&displayed(v)===displayed(other);})
+      &&JSON.stringify(trend.signal.hits)===JSON.stringify(shadow.signal.hits)
+      &&trend.signal.stoppedAt===shadow.signal.stoppedAt&&trend.signal.completedAt===shadow.signal.completedAt);
+  if(!same||trend.stDirection===1&&trend.ttDirection===true&&!trend.signal)return fail(`TT 시작 이력 추가 검증 중 (${bars.length}봉)`);
+  return {ready:true,kind:'converged',bars:bars.length,trend};
+}
 export function pricePlan(raw,market,unit,now){
   if(!raw||raw.source!=='tt'||!Array.isArray(raw.targets)||raw.targets.length!==3)return null;
   const round=(v,dir)=>{const t=tickSize(v);return Number(((dir==='down'?Math.floor(v/t+1e-9):Math.round(v/t))*t).toPrecision(14));};
   const entry=round(raw.entry,'near'),stop=round(raw.stop,'down'),targets=raw.targets.map(p=>round(p,'down'));
   if(![entry,stop,...targets].every(v=>Number.isFinite(v)&&v>0)||!(stop<entry&&entry<targets[0]&&targets[0]<targets[1]&&targets[1]<targets[2]))return null;
-  return {id:`v6:${market}:${unit}:${raw.source}:${raw.time}`,source:raw.source,signalTime:raw.time,createdAt:now,entry,stop,targets,raw:{entry:raw.entry,stop:raw.stop,targets:raw.targets},riskPct:(entry-stop)/entry*100,rewardRisk:(targets[1]-entry)/(entry-stop),stoppedAt:raw.stoppedAt??null,completedAt:raw.completedAt??null,hits:raw.hits??[false,false,false]};
+  return {id:`v7:${market}:${unit}:${raw.source}:${raw.time}`,source:raw.source,signalTime:raw.time,createdAt:now,entry,stop,targets,raw:{entry:raw.entry,stop:raw.stop,targets:raw.targets},riskPct:(entry-stop)/entry*100,rewardRisk:(targets[1]-entry)/(entry-stop),stoppedAt:raw.stoppedAt??null,completedAt:raw.completedAt??null,hits:raw.hits??[false,false,false]};
 }
 export function observePlan(plan,bars,quote,now){if(!plan)return null;const p=structuredClone(plan);p.hits??=[false,false,false];
   for(const b of bars){if(b.openTime<p.signalTime)continue;if(b.low<=p.stop)p.stoppedAt??=b.closeTime;p.targets.forEach((t,i)=>{if(b.high>=t)p.hits[i]=true;});if(p.hits[2])p.completedAt??=b.closeTime;}
@@ -72,7 +101,7 @@ export function rankScore(bars,trend,plan,turnover,upper=[]){const current=bars.
   const parts={st:20,targets:20,rewardRisk:20*clamp(plan.rewardRisk/4,0,1),risk:10/(1+plan.riskPct/5),activity:10*clamp(volRatio/2,0,1),upper:upper.reduce((s,t)=>s+(t.stDirection===1?5:0)+(t.signal?.direction==='up'&&!t.signal.stoppedAt&&!t.signal.completedAt?5:0),0),overheat:-(r===null?0:clamp((r-70)/30,0,1)*10),extension:trend.atr10>0?-clamp((current-trend.stLower)/trend.atr10-4,0,5):0};
   return {score:Math.round(clamp(Object.values(parts).reduce((s,v)=>s+v,0),0,100)*100)/100,parts,rsi:r};
 }
-export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,previousTrend,previousPlan,turnover,upper=[]}){
+export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,previousTrend,previousPlan,turnover,upper=[],history}){
   const fail=(code,reason,extra={})=>({market:market.market,name:market.koreanName,unit,status:code,reason,checkedAt:now,...extra});
   if(!exclusionsReady)return fail('exclusions','공식 제외 정보 확인 중');
   if(market.warned||market.market==='KRW-USDT')return fail('excluded','유의·거래지원 종료·테더 제외');
@@ -80,7 +109,9 @@ export function evaluateMarket({market,cache,unit,quote,now,exclusionsReady,prev
   if(turnover.group!=='high')return fail('monitor','10억 미만 · 거래대금 변화 관찰');
   const bars=rawBars(cache,unit,endOf(unit,now)),meta=cache?.verified?.[unit];
   if(!bars.length||meta?.checkedThrough<endOf(unit,now)||!meta)return fail('collecting','주 시간대 최신 봉 수집 중');
-  const trend=advanceTrends(bars,previousTrend),extra={trend,checkedThrough:endOf(unit,now),actualBars:bars.length,historyExhausted:meta.exhausted===true};
+  history??=assessHistory(cache,unit,now);
+  if(!history.ready)return fail('history_pending',history.reason,{checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:false});
+  const trend=history.trend,extra={trend,checkedThrough:endOf(unit,now),actualBars:history.bars,historyReady:true,historyKind:history.kind,historyExhausted:meta.exhausted===true};
   if(trend.atr10===null)return fail('new_listing','신규 상장 · ST 계산 이력 수집 중',extra);
   if(trend.stDirection!==1)return fail('sell','ST Sell',extra);
   let raw=trend.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;

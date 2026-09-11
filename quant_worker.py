@@ -20,7 +20,7 @@ def node_executable():
 
 
 def fresh_payload(payload, now_ms):
-    return payload.get('version') == 6 and 0 <= now_ms - payload.get('generatedAt', 0) <= 45_000
+    return payload.get('version') == 7 and 0 <= now_ms - payload.get('generatedAt', 0) <= 45_000
 
 
 def valid_plan(plan):
@@ -39,7 +39,7 @@ def public_snapshot(state, now_ms=None):
         return view
     payload['viewedAt'] = now_ms
     exclusions = payload.get('exclusions') or {}
-    allowed = (payload.get('version') == 6 and exclusions.get('ready')
+    allowed = (payload.get('version') == 7 and exclusions.get('ready')
                and 0 <= now_ms - exclusions.get('checkedAt', 0) <= 120_000)
     excluded = {r['market'] for r in payload.get('excluded', [])} | {'KRW-USDT'}
     accepted = []

@@ -111,7 +111,7 @@ def draw_detail(worker):
     if not detail:
         return
     st.write(f"{symbol(detail)} · 현재가 {quote_label(detail)}")
-    st.caption(f"상세 분석 {stamp(detail['generatedAt'])}. 가격은 해당 시간대의 원본 Target Trend 값이며 추천 여부와 구분합니다.")
+    st.caption(f"상세 분석 {stamp(detail['generatedAt'])}. 가격은 초기 이력을 검증한 해당 시간대 Target Trend 값이며 추천 여부와 구분합니다.")
     rows = []
     for unit, frame in detail['frames'].items():
         p = frame.get('plan')
@@ -127,7 +127,7 @@ def render(worker):
     view = worker.snapshot()
     payload = view.get('payload')
     st.title('KRW 퀀트 레이더')
-    if not payload or payload.get('version') != 6:
+    if not payload or payload.get('version') != 7:
         st.info('새 분석 구조의 거래대금 분류와 ST·TT 검사를 시작하고 있습니다.')
         if view.get('error'):
             st.error(view['error'])
@@ -145,6 +145,7 @@ def render(worker):
         st.write('테더·유의·거래지원 종료 예정 종목을 제외합니다. 최근 완료 72시간 거래대금 합계 ÷ 3이 10억 원 이상인 종목을 분석합니다.')
         st.write('단타는 15분, 스윙은 1시간 ST Buy를 추적합니다. 활성 상승 Target Trend의 매수·손절·세 목표가가 있을 때만 추천합니다. 다른 지표는 순위에만 사용합니다.')
         st.write('현재가 괄호는 업비트 시세의 기준 시각(KST)입니다. 조회 성공 시각과 구분하며 새 봉 확인 중에는 직전 완료봉 1개 이내의 완성된 계획을 표시합니다.')
+        st.write('초기 TT는 상장 전체 이력 또는 서로 다른 시작점의 계산 일치를 확인합니다. 최소 2,000봉부터 검증하며, 일치하지 않으면 과거 이력을 더 수집합니다. 짧은 상장 이력은 전체 자료로 확인합니다.')
         st.write('목표는 원본 신호의 고정 값입니다. 신호가 오래돼도 유지하며 손절·3차 목표 도달 후에는 새 TT 신호를 기다립니다. 호가 단위에 맞춰 가격을 표시합니다.')
         c = payload['coverage']
         st.write(f"전체 원화 {payload['total']}종목 · 제외 {len(payload['excluded'])}종목 · 대상 {c['total']}종목 · 10억 이상 {c['high']} · 미만 {c['low']} · 분류 중 {c['pending']}")

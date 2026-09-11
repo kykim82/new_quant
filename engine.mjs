@@ -2,7 +2,7 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { VERSION, UNITS, endOf, rawBars, validBar, mergeRanges, turnoverClass, advanceTrends, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
+import { VERSION, HISTORY_BARS, assessHistory, UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
 // lib/upbit.ts
 var API_BASE = "https://api.upbit.com/v1";
 var UpbitApiError = class extends Error {
@@ -198,10 +198,13 @@ export async function collectCandles(cache,market,unit,now,desired,request=reque
   cache[unit]??=[];cache.verified??={};
   const meta=cache.verified[unit]??={ranges:[],checkedThrough:0,exhausted:false};
   const bars=rawBars(cache,unit,end),latestDue=meta.checkedThrough<end;
-  if(!latestDue&&(bars.length>=desired||meta.exhausted))return false;
+  if(!latestDue&&meta.exhausted&&covered(cache,unit,0,end))return false;
+  const historical=desired>=HISTORY_BARS,historyNeeded=historical&&!assessHistory(cache,unit,now).ready;
+  if(!latestDue&&(historical?!historyNeeded:bars.length>=desired||meta.exhausted&&covered(cache,unit,0,end)))return false;
   // 긴 중단은 최신 응답부터 이전 확인 지점까지 페이지를 연결한 후에만 최신 판정으로 바꾼다.
   const recover=latestDue&&Number.isFinite(meta.gapBefore);
-  const to=recover?meta.gapBefore:latestDue?end:bars[0]?.openTime??end;
+  const suffix=meta.ranges.find(r=>r[1]>=end);
+  const to=recover?meta.gapBefore:latestDue?end:historyNeeded?(suffix?.[0]??end):bars[0]?.openTime??end;
   meta.attemptedAt=now;
   try {
     const route=unit===1440?'/candles/days':`/candles/minutes/${unit}`;
@@ -251,10 +254,10 @@ export class Radar {
     const row={market:result.market,name:result.name,unit:result.unit,plan:result.plan,firstShownAt:old?.firstShownAt??(result.status==='ready'?this.clock():null)};
     if(JSON.stringify(row)!==JSON.stringify(old)){this.plans.set(id,row);this.planDirty.add(id);}}
   calculate(info,cache,unit,now){const state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};
-    const bars=rawBars(cache,unit,endOf(unit,now)),trend=cache.verified?.[unit]?.checkedThrough>=endOf(unit,now)?advanceTrends(bars,state.trends[unit]):state.trends[unit];if(trend)state.trends[unit]=trend;
-    const id=trend?.signal?`v6:${info.market}:${unit}:tt:${trend.signal.time}`:null;
-    const upper=[240,1440].filter(u=>cache.verified?.[u]?.checkedThrough>=endOf(u,now)).map(u=>advanceTrends(rawBars(cache,u,endOf(u,now)),state.trends[u]));
-    const result=evaluateMarket({market:info,cache,unit,quote:this.quotes.get(info.market),now,exclusionsReady:this.exclusions.ready,previousTrend:trend,previousPlan:this.plans.get(id)?.plan,turnover:turnoverClass(cache,now),upper});
+    const bars=rawBars(cache,unit,endOf(unit,now)),history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;
+    const id=trend?.signal?`v7:${info.market}:${unit}:tt:${trend.signal.time}`:null;
+    const upper=[240,1440].map(u=>assessHistory(cache,u,now)).filter(h=>h.ready).map(h=>h.trend);
+    const result=evaluateMarket({market:info,cache,unit,quote:this.quotes.get(info.market),now,exclusionsReady:this.exclusions.ready,previousPlan:this.plans.get(id)?.plan,turnover:turnoverClass(cache,now),upper,history});
     state.turnover=turnoverClass(cache,now);state.frames[unit]=result;state.checkedAt=now;this.states.set(info.market,state);this.dirty.add(info.market);this.remember(result);
     // 과거에 표시한 같은 시간대의 가격도 실제 봉으로 계속 추적한다.
     for(const [key,row] of this.plans){if(row.market!==info.market||row.unit!==unit||row.plan.stoppedAt||row.plan.completedAt)continue;const plan=observePlan(row.plan,bars,this.quotes.get(info.market),now);if(JSON.stringify(plan)!==JSON.stringify(row.plan)){this.plans.set(key,{...row,plan});this.planDirty.add(key);}}
@@ -264,7 +267,7 @@ export class Radar {
     const exclusionReady=this.exclusions.ready&&now-this.exclusions.checkedAt>=0&&now-this.exclusions.checkedAt<=120000;
     for(const info of eligible){const state=this.states.get(info.market),cache=this.caches.get(info.market),turnover=cache?turnoverClass(cache,now):state?.turnover;
       const group=turnover?.ready&&turnover.asOf===endOf(60,now)?turnover.group:'pending';const frames={};
-      for(const unit of UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,st:current&&r?.trend?.atr10!==null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
+      for(const unit of UNITS){let r=state?.frames?.[unit];const current=r?.checkedThrough===endOf(unit,now);frames[unit]={status:current?r.status:'collecting',reason:current?r.reason:'주 시간대 재검사 중',checkedThrough:r?.checkedThrough??0,st:current&&r?.trend?.atr10!=null?(r?.trend?.stDirection===1?'Buy':'Sell'):null};
         if(!r||!exclusionReady)continue;
         if(r.status==='tt_wait'&&current&&group==='high')waiting.push({...r,quote:this.quotes.get(info.market)??r.quote});
         // 이미 확인된 완성 계획은 1봉 이내 재검사 동안 근거 시각을 붙여 보존한다. 새 Sell/종료 결과는 즉시 제외한다.
@@ -289,16 +292,16 @@ export class Radar {
     for(let pass=0;pass<3;pass++){const did=await collectCandles(cache,info.market,unit,this.clock(),desired,this.request);changed||=did;if(!did)break;await sleep(135);}
     if(changed)this.dirty.add(info.market);return cache;}
   async process(info,phase){const now=this.clock(),state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};this.states.set(info.market,state);
-    try {let cache=await this.collect(info,60,phase==='turnover'?72:600);state.turnover=turnoverClass(cache,this.clock());
-      if(phase==='analysis'&&state.turnover.group==='high'){this.calculate(info,cache,60,this.clock());cache=await this.collect(info,15,600);this.calculate(info,cache,15,this.clock());}
+    try {let cache=await this.collect(info,60,phase==='turnover'?72:HISTORY_BARS);state.turnover=turnoverClass(cache,this.clock());
+      if(phase==='analysis'&&state.turnover.group==='high'){this.calculate(info,cache,60,this.clock());cache=await this.collect(info,15,HISTORY_BARS);this.calculate(info,cache,15,this.clock());}
       else state.checkedAt=this.clock();state.promising=promisingMarket(info,cache,state.turnover,this.quotes.get(info.market),this.clock());delete state.error;
     }catch(e){state.error=e.message;state.checkedAt=now;if(e.status===429||e.status===418)throw e;this.error(`${info.market} ${e.message}`);}
     this.dirty.add(info.market);await this.flush();
   }
   async detail(market){const info=this.markets.find(m=>m.market===market);if(!info)throw new Error('원화 종목 코드를 찾지 못했습니다.');const cache=await this.load(market),frames={};
-    for(const unit of [15,60,240,1440]){await this.collect(info,unit,600);const now=this.clock(),bars=rawBars(cache,unit,endOf(unit,now)),state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};const trend=cache.verified?.[unit]?.checkedThrough>=endOf(unit,now)?advanceTrends(bars,state.trends[unit]):state.trends[unit];if(trend)state.trends[unit]=trend;this.states.set(market,state);this.dirty.add(market);
-      const current=cache.verified[unit]?.checkedThrough>=endOf(unit,now);const raw=current&&trend?.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;const calculated=pricePlan(raw,market,unit,now),stored=calculated?this.plans.get(calculated.id)?.plan:null,plan=observePlan(stored??calculated,bars,this.quotes.get(market),now);
-      frames[unit]={st:!current||!trend||trend.atr10===null?'이력 수집 중':trend.stDirection===1?'Buy':'Sell',tt:!current||!trend||trend.ttDirection===null?'이력·신호 대기':trend.ttDirection?'상승':'하락',plan,checkedThrough:cache.verified[unit]?.checkedThrough??0,bars:bars.length,rsi:rsi(bars),sma20:sma(bars,20),reason:!plan?'상승 TT 신호 대기':plan.stoppedAt||plan.completedAt?'종료된 TT 가격 · 새 신호 대기':'활성 TT 가격'};
+    for(const unit of [15,60,240,1440]){const started=Date.now();do{await this.collect(info,unit,HISTORY_BARS);if(assessHistory(cache,unit,this.clock()).ready||cache.verified[unit]?.exhausted&&rawBars(cache,unit).length===0)break;await this.renew();}while(Date.now()-started<60000);const now=this.clock(),bars=rawBars(cache,unit,endOf(unit,now)),state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};const history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;this.states.set(market,state);this.dirty.add(market);
+      const current=history.ready;const raw=current&&trend?.signal?.direction==='up'?{...trend.signal,source:'tt'}:null;const calculated=pricePlan(raw,market,unit,now),stored=calculated?this.plans.get(calculated.id)?.plan:null,plan=observePlan(stored??calculated,bars,this.quotes.get(market),now);
+      frames[unit]={st:!current||!trend||trend.atr10===null?'이력 수집 중':trend.stDirection===1?'Buy':'Sell',tt:!current||!trend||trend.ttDirection===null?'이력·신호 대기':trend.ttDirection?'상승':'하락',plan,checkedThrough:cache.verified[unit]?.checkedThrough??0,bars:bars.length,rsi:rsi(bars),sma20:sma(bars,20),reason:!history.ready?history.reason:!plan?'상승 TT 신호 대기':plan.stoppedAt||plan.completedAt?'종료된 TT 가격 · 새 신호 대기':'활성 TT 가격'};
     }
     await this.flush(true);return {market,name:info.koreanName,generatedAt:this.clock(),quote:this.quotes.get(market),frames};
   }
@@ -309,7 +312,7 @@ export class Radar {
       // 초기에는 모든 거래대금을 먼저 분류한다. 재실행은 DB 분류를 이어서 처리한다.
       const classify=eligible.filter(m=>this.states.get(m.market)?.turnover?.asOf!==endOf(60,this.clock())||!this.states.get(m.market)?.turnover?.ready);
       for(const info of classify){if(used++>=maxMarkets)return;await this.process(info,'turnover');}
-      const queue=eligible.filter(m=>{const state=this.states.get(m.market);return state?.turnover?.group==='high'&&UNITS.some(u=>{const f=state.frames?.[u];return !f||f.checkedThrough!==endOf(u,this.clock())||f.status==='quote_pending'||f.actualBars<600&&!f.historyExhausted;});}).sort((a,b)=>{
+      const queue=eligible.filter(m=>{const state=this.states.get(m.market);return state?.turnover?.group==='high'&&UNITS.some(u=>{const f=state.frames?.[u];return !f||f.checkedThrough!==endOf(u,this.clock())||f.status==='quote_pending'||!f.historyReady;});}).sort((a,b)=>{
         const priority=m=>{const s=this.states.get(m.market);return UNITS.some(u=>s?.frames[u]?.status==='ready')?0:UNITS.some(u=>s?.trends[u]?.stDirection===1)?1:2;};return priority(a)-priority(b)||(this.states.get(a.market)?.checkedAt??0)-(this.states.get(b.market)?.checkedAt??0);});
       for(const info of queue){if(used++>=maxMarkets)return;await this.process(info,'analysis');if(this.detailQueue.length)await this.runDetail();}
       while(this.detailQueue.length)await this.runDetail();
