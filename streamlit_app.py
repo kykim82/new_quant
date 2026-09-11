@@ -82,10 +82,10 @@ def get_worker(revision, _credentials):
     return worker
 
 
-def draw_detail(worker):
-    st.subheader('4. 종목 상세 분석')
-    with st.form('detail_form'):
-        code = st.text_input('종목 코드', placeholder='예. BTC, ARX')
+def draw_detail_slot(worker, slot):
+    state_key = 'detail_market' if slot == 1 else 'detail_market_2'
+    with st.form(f'detail_form_{slot}'):
+        code = st.text_input(f'종목 코드 {slot}', placeholder='예. BTC, ARX', key=f'detail_code_{slot}')
         submitted = st.form_submit_button('분석')
     if submitted:
         market = code.strip().upper()
@@ -96,10 +96,10 @@ def draw_detail(worker):
         else:
             try:
                 worker.request_detail(market)
-                st.session_state['detail_market'] = market
+                st.session_state[state_key] = market
             except ValueError as error:
                 st.error(str(error))
-    market = st.session_state.get('detail_market')
+    market = st.session_state.get(state_key)
     if not market:
         return
     state = worker.detail_snapshot(market)
@@ -121,6 +121,13 @@ def draw_detail(worker):
         row.update({f'{i + 1}차 매도가': relative_price(p['targets'][i], p['entry']) if p else '—' for i in range(3)})
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+
+
+def draw_detail(worker):
+    st.subheader('4. 종목 상세 분석')
+    for slot in (1, 2):
+        with st.container(border=True):
+            draw_detail_slot(worker, slot)
 
 
 def render(worker):
@@ -178,7 +185,8 @@ def render(worker):
                         st.caption(f"{symbol(row)} · 직전 봉 기준 · 재검사 중. 확인 완료 {stamp(row['checkedThrough'])}.")
             else:
                 st.info('현재 활성 상승 TT 가격까지 확인된 추천이 없습니다. 아래 신호 대기와 검사 사유를 확인할 수 있습니다.')
-    with st.expander(f"타겟 트렌드 신호 대기 · ST Buy 추적 {len(payload['waiting'])}건", expanded=bool(payload['waiting'])):
+    with st.expander("타겟 트렌드 신호 대기 · ST Buy 추적", expanded=False, key="tt_signal_wait", on_change="rerun"):
+        st.caption(f"추적 {len(payload['waiting'])}건")
         st.caption('ST Buy이지만 활성 상승 TT 신호가 아직 없어 진입을 권유하지 않는 종목입니다.')
         if payload['waiting']:
             st.dataframe(pd.DataFrame([{'종목': symbol(r), '시간대': '단타·15분' if r['unit'] == 15 else '스윙·1시간',
