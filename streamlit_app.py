@@ -239,10 +239,12 @@ def detail_price_table(frames):
 
     rows = []
     for unit, label in (("15", "15분"), ("60", "1시간"), ("240", "4시간"), ("1440", "일봉")):
-        plan = frames.get(unit, {}).get("plan") or {}
+        frame = frames.get(unit, {})
+        plan = frame.get("plan") or {}
         entry = plan.get("entryAnchor")
         targets = plan.get("targets") or []
-        rows.append({"시간대": label, "매수가": cell(entry), "손절가": cell(plan.get("stop"), entry),
+        status = "추세·과열 평가용" if unit in {"240", "1440"} else "진입 조건 통과" if frame.get("ready") else "참고 가격" if plan else "보류"
+        rows.append({"시간대": label, "판정": status, "매수가": cell(entry), "손절가": cell(plan.get("stop"), entry),
                      **{f"{i + 1}차 목표가": cell(targets[i], entry) if i < len(targets) else "—" for i in range(3)}})
     return pd.DataFrame(rows)
 
@@ -253,16 +255,17 @@ def render_detail(detail, stale=False):
     st.caption(f"마지막 상세 분석 {stamp(detail['generatedAt'])}")
     frames = detail.get("frames", {})
     st.dataframe(detail_price_table(frames), hide_index=True, width="stretch", height=178)
-    delayed = []
-    for unit, label in (("15", "15분"), ("60", "1시간"), ("240", "4시간"), ("1440", "일봉")):
+    for unit, label in (("15", "15분"), ("60", "1시간")):
         frame = frames.get(unit, {})
-        width = int(unit) * 60_000
-        if not frame.get("valid") or frame.get("asOf") != now_ms // width * width:
-            delayed.append(label)
+        reason = frame.get("reason") or "추천 자격 확인 대기"
+        if frame.get("riskLimited"):
+            reason += " · 신규 상장으로 상위 지표 일부 미확인, 확보된 1시간 과열 검사 적용"
+        st.caption(f"{label} · {reason}")
+    st.caption("참고 가격은 신규 추천 조건을 통과하지 않은 계산값입니다. 진입 조건 통과와 최종 추천 순위는 구분합니다.")
     if stale:
         st.warning("갱신 지연 · 표시 가격은 이전 분석 참고값입니다.")
-    elif delayed:
-        st.warning(f"{'·'.join(delayed)} 데이터 확인 대기 · 해당 가격은 참고값입니다.")
+    elif any(not frames.get(unit, {}).get("valid") or frames.get(unit, {}).get("asOf") != now_ms // (int(unit) * 60_000) * int(unit) * 60_000 for unit in ("15", "60")):
+        st.warning("일부 시간대의 최신 실제 봉 확인 대기 · 해당 시간대 가격은 참고값입니다.")
 
 
 @st.fragment(run_every="10s")
@@ -356,7 +359,7 @@ def dashboard(worker):
     exclusions = payload.get("marketExclusions", {})
     primary = payload.get("primaryCoverage", {})
     candidates = payload.get("stRecommendations", []) if payload.get("stRecommendationVersion") == 1 else [*payload["scalp"], *payload["swing"]]
-    candidates = [c for c in candidates if price_plan_current(c, payload["generatedAt"])] if not stale and exclusions.get("ready") and primary and pipeline_current(payload, payload["generatedAt"]) else []
+    candidates = [c for c in candidates if price_plan_current(c, payload.get("viewedAt", payload["generatedAt"]))] if exclusions.get("ready") and primary else []
     tracking = payload.get("recommendations")
     shown = candidates
     if not primary or not exclusions:
@@ -376,6 +379,13 @@ def dashboard(worker):
         turnover_coverage = payload.get("turnoverCoverage")
         if turnover_coverage:
             st.caption(f"최근 완료 72시간 거래대금 합계 ÷ 3 · 10억 원 이상 {turnover_coverage['high']}종목 · 미만 {turnover_coverage['low']}종목 · 분류 중 {turnover_coverage['pending']}종목")
+        processing = payload.get("processing") or {}
+        if processing:
+            st.caption(f"최근 처리 {processing['elapsedMs'] / 1000:.1f}초 · 봉 요청 {processing['candleRequests']}회 · 정밀 분석 {processing['prepared']}종목")
+        if pipeline.get("classificationFailures"):
+            st.caption(f"거래대금 분류 오류 {pipeline['classificationFailures']}종목 · 저장 자료를 보존하고 재시도합니다.")
+        if pipeline.get("accounted") is False:
+            st.warning("종목 집계가 일치하지 않아 확인이 필요합니다.")
         if pipeline.get("details"):
             st.caption("전 종목 저장·분류 내역입니다. 10억 미만은 거래대금 감시, 이상은 분봉 수집 후 조건을 검사합니다.")
             st.dataframe([{"종목": f"{d['name']} ({d['market']})",
@@ -384,7 +394,7 @@ def dashboard(worker):
                            **{f"{u}분 수집": "감시 대상" if d["group"] == "low" else "완료" if d.get("frames", {}).get(u, {}).get("ready") else "대기" for u in ("15", "60")},
                            "오류": d.get("turnoverError") or " / ".join(f.get("error", "") for f in d.get("frames", {}).values() if f.get("error"))}
                           for d in pipeline["details"]], hide_index=True, width="stretch")
-        st.caption("과열 제외 · 4시간 또는 일봉 RSI 70 이상, 7·20기간 이평선 이격 8% 이상, 현재가의 20기간 이평선 이격 8% 이상이 함께 확인된 경우입니다. 목표 도달 여부만으로 제외하지 않습니다.")
+        st.caption("과열 제외 · 4시간 또는 일봉 RSI 70 이상, 7·20기간 이평선 이격 8% 이상, 현재가의 20기간 이평선 이격 8% 이상이 함께 확인된 경우입니다. 해당 시간대 타겟 트렌드의 손절·3차 목표가 종료된 경우 새 신호를 기다립니다.")
         if payload.get("entryRiskExclusions"):
             st.dataframe([{"종목": r["name"], "추천 제외 사유": " / ".join(r["reasons"])} for r in payload["entryRiskExclusions"]], hide_index=True, width="stretch")
     for unit, label in (("15", "15분"), ("60", "1시간")):
@@ -430,7 +440,7 @@ def dashboard(worker):
                 elif not exclusions.get("ready"):
                     st.info("유의·거래지원 종료 제외 정보 확인 후 신규 추천을 표시합니다.")
                 elif not pipeline_current(payload, payload["generatedAt"]):
-                    st.info("전체 거래대금 저장·분류와 분석 대상의 분봉 수집을 확인한 뒤 추천을 표시합니다.")
+                    st.info("종목별 검사를 진행 중입니다. 검사가 끝나고 유효한 가격 계획을 갖춘 종목부터 표시합니다.")
                 elif payload.get("stRecommendationVersion") == 1:
                     st.info("현재 진입 조건과 유효한 매수·손절·매도 가격 계획을 모두 갖춘 추천이 없습니다. 후보 검사는 계속 진행합니다.")
                 elif coverage["pending"]:

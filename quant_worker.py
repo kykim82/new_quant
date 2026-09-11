@@ -25,13 +25,18 @@ def fresh_payload(payload, now_ms):
 
 
 def quality_current(quality, now_ms):
-    if not quality or quality.get("version") != 1 or not quality.get("ready"):
+    if not quality or quality.get("version") != 2 or not quality.get("ready"):
         return False
-    frames = quality.get("frames", {})
-    return all(frames.get(str(unit), {}).get("ready") for unit in (60, 240, 1440)) and all(
-        q.get("ready") and q.get("latestActualClose") == now_ms // (int(unit) * 60_000) * (int(unit) * 60_000)
-        for unit, q in frames.items()
-    )
+    units = (15, 60, 240, 1440) if quality.get("strategy") == "scalp" else (60, 240, 1440)
+    for unit in units:
+        q = quality.get("frames", {}).get(str(unit), {})
+        end = now_ms // (unit * 60_000) * unit * 60_000
+        if not q.get("ready") or q.get("expectedClose") != end:
+            return False
+        if not (q.get("available") and q.get("latestActualClose") == end
+                or unit >= 240 and q.get("optional") and q.get("exhausted")):
+            return False
+    return True
 
 
 def entry_gate_current(candidate, now_ms):
@@ -40,7 +45,9 @@ def entry_gate_current(candidate, now_ms):
     end = now_ms // (unit * 60_000) * (unit * 60_000)
     return (gate.get("version") == 1 and gate.get("unit") == unit and gate.get("ready")
             and gate.get("direction") == 1 and gate.get("closeTime") == end
-            and gate.get("latestActualClose") == end)
+            and gate.get("latestActualClose") == end
+            and not (gate.get("targetTrend") or {}).get("completedAt")
+            and not (gate.get("targetTrend") or {}).get("stoppedAt"))
 
 
 def price_plan_current(candidate, now_ms):
@@ -54,7 +61,11 @@ def price_plan_current(candidate, now_ms):
     returns = p.get("netReturns") or []
     expires = candidate.get("entryValidUntil", p.get("expiresAt"))
     tolerance = (p["entryHigh"] - p["entryLow"]) * 0.625
-    return (candidate.get("actionableVersion") == 1 and candidate.get("entryStatus") == "ready"
+    reward_risk = p.get("netRewardRiskAtTarget2")
+    return (candidate.get("actionableVersion") == 1 and candidate.get("entryPolicyVersion") == 2
+            and (p["entryAnchor"] - p["stop"]) / p["entryAnchor"] * 100 <= (2 if candidate.get("strategy") == "scalp" else 6)
+            and type(reward_risk) in (int, float) and math.isfinite(reward_risk) and reward_risk >= 1.5
+            and candidate.get("entryStatus") == "ready"
             and p["stop"] < p["entryLow"] <= p["entryAnchor"] <= p["entryHigh"] < targets[0] < targets[1] < targets[2]
             and bool(returns) and type(returns[0]) in (int, float) and math.isfinite(returns[0]) and returns[0] > 0
             and type(expires) in (int, float) and expires > now_ms
@@ -107,10 +118,14 @@ def public_snapshot(state, now_ms=None):
         pipeline["candlesReady"] = sum(d["group"] == "high" and all(d.get("frames", {}).get(str(u), {}).get("ready", False) for u in (15, 60)) for d in details)
         pipeline["primaryComplete"] = pipeline["turnoverComplete"] and pipeline["candlesReady"] == pipeline["high"]
         pipeline["complete"] = pipeline["complete"] and pipeline["primaryComplete"]
+        payload["turnoverCoverage"] = {k: pipeline[k] for k in ("total", "high", "low", "pending")}
+        pipeline["classificationFailures"] = sum(d["group"] == "pending" and bool(d.get("turnoverError")) for d in details)
+        pipeline["accounted"] = len({d["market"] for d in details}) == pipeline.get("total")
         pipeline["stage"] = "exclusions" if not exclusions_ready else "turnover" if not pipeline["turnoverComplete"] else "candles" if not pipeline["primaryComplete"] else "analysis"
-    pipeline_ready = pipeline_current(payload, now_ms)
+    payload["viewedAt"] = now_ms
+    invalid_schema = payload.get("schemaVersion") != 5
 
-    payload["stRecommendations"] = [] if stale or not exclusions_ready or not pipeline_ready else [
+    payload["stRecommendations"] = [] if invalid_schema or not exclusions_ready else [
         c for c in payload.get("stRecommendations", [])
         if price_plan_current(c, now_ms)
         and c.get("risk", {}).get("version") == 1
@@ -134,7 +149,7 @@ def public_snapshot(state, now_ms=None):
         if c.get("dailyQuality", {}).get("ready")
         and c["dailyQuality"].get("latestActualClose") == now_ms // 86_400_000 * 86_400_000]
     for strategy in ("scalp", "swing"):
-        payload[strategy] = [] if stale or not exclusions_ready or not pipeline_ready else [
+        payload[strategy] = [] if invalid_schema or not exclusions_ready else [
             c for c in payload.get(strategy, [])
             if price_plan_current(c, now_ms)
             and entry_gate_current(c, now_ms)

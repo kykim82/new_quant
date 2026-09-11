@@ -289,7 +289,14 @@ var ENTRY_VOLUME = { scalp: 1e9, swing: 1e9 };
 var SIGNAL_FRESH_MS = 20 * 6e4;
 var HISTORY_BARS = 800;
 var REASONS = {
+  INVALID_PRICE_GEOMETRY: "매수 구간·손절 가격 관계 불성립",
+  TARGET_TICK_COLLISION: "호가 단위 반영 후 목표 가격 중복·구간 충돌",
+  TARGET_CYCLE_ENDED: "타겟 트렌드 손절·3차 목표 종료 · 새 신호 대기",
   ST_SELL: "주 시간대 슈퍼트렌드 Sell · 신규 추천 제외",
+  EXCLUSIONS_PENDING: "유의·거래지원 종료 정보 확인 대기",
+  MARKET_EXCLUDED: "추천 제외 종목",
+  RISK_DATA_PENDING: "과열 판단에 필요한 실제 봉 확인 대기",
+  UPPER_OVERHEATED: "RSI·이평선 이격 과열 · 신규 추천 제외",
   ST_PENDING: "주 시간대 완료봉·ST 이력 확인 대기",
   LOW_LIQUIDITY: "기본 시세 감시 · 24h 10억 또는 거래대금 증가 대기",
   UPPER_TREND_WAIT: "1시간·4시간 상승 구조 확인 대기",
@@ -409,6 +416,12 @@ function advanceTrends(candles, previous, asOf = Infinity) {
       }
     }
   }
+  if (state.signal && state.signal.stopCheckedThrough === undefined) {
+    for (const bar of closed.filter((b) => !b.synthetic && b.openTime >= state.signal.time && b.closeTime <= state.lastClose)) {
+      if (bar.low <= state.signal.stop && state.signal.stop <= bar.high) state.signal.stoppedAt ??= bar.closeTime;
+    }
+    state.signal.stopCheckedThrough = state.lastClose;
+  }
   for (const bar of closed) {
     if (bar.closeTime <= state.lastClose) continue;
     const pc = state.previousClose;
@@ -434,8 +447,10 @@ function advanceTrends(candles, previous, asOf = Infinity) {
       const upper1 = state.stUpper ?? basicUpper;
       state.stLower = pc !== null && pc > lower1 ? Math.max(basicLower, lower1) : basicLower;
       state.stUpper = pc !== null && pc < upper1 ? Math.min(basicUpper, upper1) : basicUpper;
+      const priorStDirection = state.stDirection;
       if (state.stDirection === -1 && bar.close > upper1) state.stDirection = 1;
       else if (state.stDirection === 1 && bar.close < lower1) state.stDirection = -1;
+      if (priorStDirection !== state.stDirection) state.stFlipAt = bar.closeTime;
     }
     if (state.atrWindow.length === 200) {
       const width = mean(state.atrWindow) * 0.8;
@@ -452,6 +467,8 @@ function advanceTrends(candles, previous, asOf = Infinity) {
       state.ttLower = lower;
     }
     if (state.signal && !bar.synthetic && bar.openTime >= state.signal.time) {
+      if (bar.low <= state.signal.stop && state.signal.stop <= bar.high) state.signal.stoppedAt ??= bar.closeTime;
+      state.signal.stopCheckedThrough = bar.closeTime;
       while ((state.signal.reached ?? 0) < 3 && bar.high >= state.signal.targets[state.signal.reached ?? 0]) {
         state.signal.reached = (state.signal.reached ?? 0) + 1;
         if (state.signal.reached === 3) state.signal.completedAt ??= bar.closeTime;
@@ -568,7 +585,7 @@ function resistanceLevels(candles, strategy, now, trends) {
     });
   }
   const tt = trends[strategy === "scalp" ? "15" : "60"];
-  if (tt.ttDirection === true && tt.signal && now - tt.signal.time <= (strategy === "scalp" ? 6 : 72) * 36e5) {
+  if (tt.ttDirection === true && tt.signal && !tt.signal.stoppedAt && !tt.signal.completedAt && now - tt.signal.time <= (strategy === "scalp" ? 6 : 72) * 36e5) {
     tt.signal.targets.forEach((price, i) => levels.push({
       price,
       source: `TT 신호 고정 ${i + 1}차`,
@@ -626,6 +643,7 @@ function costedPlan(plan, feeRate, slippagePct) {
   };
 }
 function buildConfluencePlan(args) {
+  const fail = (code) => { if (args.failure) args.failure.code = code; return null; };
   const tick = (price) => resolvedKrwTickSize(price, args.execution.tickSize, args.execution.tickSizeReferencePrice);
   const round = (price, direction) => {
     const step = tick(price);
@@ -633,15 +651,15 @@ function buildConfluencePlan(args) {
   };
   const entryLow = round(args.entryLow, "up"), entryHigh = round(args.entryHigh, "down"), entryAnchor = round(args.entryAnchor, "near");
   const stop = round(args.rawStop, "down");
-  if (!(stop > 0 && stop < entryLow && entryLow <= entryAnchor && entryAnchor <= entryHigh)) return null;
+  if (!(stop > 0 && stop < entryLow && entryLow <= entryAnchor && entryAnchor <= entryHigh)) return fail("INVALID_PRICE_GEOMETRY");
   const tolerance = Math.max(2 * tick(entryAnchor), args.atr * 0.15);
   const eligible = args.levels.filter((l) => Number.isFinite(l.price) && l.price > entryHigh);
   const ladder = selectTargetLadder(eligible, tolerance, args.strategy);
   const targets = [], evidence = [];
   for (const level of ladder) {
     const target = round(level.price - tick(level.price), "down");
-    if (target <= entryHigh) return null;
-    if (target <= (targets.at(-1) ?? entryHigh)) return null;
+    if (target <= entryHigh) return fail("TARGET_TICK_COLLISION");
+    if (target <= (targets.at(-1) ?? entryHigh)) return fail("TARGET_TICK_COLLISION");
     targets.push(target);
     const supporting = eligible.filter((other) => Math.abs(other.price - level.price) <= tolerance);
     evidence.push({
@@ -651,7 +669,7 @@ function buildConfluencePlan(args) {
       reasons: [.../* @__PURE__ */ new Set([level.source, ...supporting.map((l) => l.source)])]
     });
   }
-  if (targets.length !== 3) return null;
+  if (targets.length !== 3) return fail("NO_RESISTANCE_ROOM");
   const intermediateResistances = mergeLevels(eligible.filter((l) => l.structural && l.price < targets[2] && !ladder.some((target) => Math.abs(target.price - l.price) <= tolerance)), tolerance).map((zone) => ({ price: zone.low, reasons: [...new Set(zone.levels.map((l) => l.source))] }));
   const plan = costedPlan({
     entryLow,
@@ -671,7 +689,8 @@ function buildConfluencePlan(args) {
     intermediateResistances,
     targetMethod: `${ladder[0].source} 기준 지표 단계 · 독립 근거 중첩/시간대/최신성 순 선택`
   }, args.feeRate, args.execution.buySlippagePct);
-  return (plan.netReturns?.[0] ?? -1) > 0 ? plan : null;
+  if (!Number.isFinite(plan.netReturns?.[0])) return fail("POOR_EXECUTION");
+  return plan.netReturns[0] > 0 ? plan : fail("POOR_NET_RR");
 }
 
 // lib/opportunity.ts
@@ -824,7 +843,7 @@ function screenLiquidity(hourly, now) {
 function frameStructure(candles, previousTrend) {
   if (candles.length < 60) return { ready: false, alive: false, early: false, score: 0, reason: "추세 이력 준비" };
   const recent = candles.slice(-12);
-  if (recent.some((c, i) => c.synthetic || i > 0 && c.openTime !== recent[i - 1].closeTime)) {
+  if (recent.some((c, i) => c.synthetic && !c.noTrade || i > 0 && c.openTime !== recent[i - 1].closeTime)) {
     return { ready: false, alive: false, early: false, score: 0, reason: "최근 누락 봉 확인 필요" };
   }
   const closes = candles.map((c) => c.close);
@@ -890,7 +909,7 @@ function trendSet(input) {
   return input.trends ?? { "15": advanceTrends(input.candles["15"]), "60": advanceTrends(input.candles["60"]), "240": advanceTrends(input.candles["240"]) };
 }
 function hasRecentSynthetic(candles, count) {
-  return candles.slice(-count).some((candle) => candle.synthetic);
+  return candles.slice(-count).some((candle) => candle.synthetic && !candle.noTrade);
 }
 function chartSet(input) {
   if (input.includeCharts === false) return { "15": [], "60": [], "240": [] };
@@ -929,6 +948,9 @@ function turnoverClass(cache, now) {
     increasing: average3d !== null && lastDay > previousDay, lastDay, previousDay,
     newListing: exhausted && !!first && first.openTime > end - 30 * 86400000 };
 }
+function collectionPriority(result, tracked = false) {
+  return tracked ? 0 : result?.turnover?.group === "high" ? 1 : result?.turnover?.ready ? 3 : 2;
+}
 function highTurnover(result, now) {
   const t = result?.turnover;
   return t?.version === 2 && t.ready && t.group === "high" && t.candleClose === boundaryFor(60, now);
@@ -959,7 +981,8 @@ function pipelineCoverage(results, markets, now) {
     const assessed = group === "high" && Object.values(frames).every((q) => q.ready)
       && buyUnits.every((u) => r?.entryGateVersion === 1 && r.analyzedAt >= boundaryFor(u, now) && !r.detailCollectionPending);
     return { market: m.market, name: m.koreanName, group, average3d: group === "pending" ? null : t.average3d,
-      turnoverClose: t?.candleClose ?? 0, turnoverError: t?.error ?? null, frames, buy: buyUnits.length > 0, assessed };
+      previousGroup: t?.ready ? t.group : null, previousAverage3d: t?.average3d ?? null,
+      turnoverClose: t?.candleClose ?? 0, turnoverError: r?.turnoverError ?? t?.error ?? null, frames, buy: buyUnits.length > 0, assessed };
   });
   const pending = details.filter((d) => d.group === "pending").length, high = details.filter((d) => d.group === "high");
   const classified = markets.exclusionStatus?.ready !== false && details.length > 0 && pending === 0;
@@ -967,13 +990,15 @@ function pipelineCoverage(results, markets, now) {
   const primaryComplete = classified && candlesReady === high.length;
   const assessed = high.filter((d) => d.assessed).length;
   return { version: 1, asOf: now, turnoverClose: boundaryFor(60, now), total: details.length,
+    classificationFailures: details.filter((d) => d.group === "pending" && d.turnoverError).length,
+    accounted: new Set(details.map((d) => d.market)).size === details.length,
     classified: details.length - pending, high: high.length, low: details.length - pending - high.length, pending,
     turnoverComplete: classified, candlesReady, primaryComplete, assessed,
     complete: primaryComplete && assessed === high.length,
     stage: markets.exclusionStatus?.ready === false ? "exclusions" : !classified ? "turnover" : !primaryComplete ? "candles" : "analysis", details };
 }
 function stAnalysis(cache, now) {
-  const frames = Object.fromEntries([240, 1440].map((u) => {
+  const frames = Object.fromEntries([60, 240, 1440].map((u) => {
     const bars = (cache[u] ?? []).filter((b) => !b.synthetic && b.closeTime <= boundaryFor(u, now));
     const closes = bars.map((b) => b.close), average = lastValue(ema(closes, 20));
     const fresh = bars.at(-1)?.closeTime === boundaryFor(u, now);
@@ -999,9 +1024,15 @@ function recommendationRisk(result, ticker, now) {
     return { unit, available, shortHistory, rsi: f?.rsi ?? null, maSpreadPct: f?.maSpreadPct ?? null,
       priceExtensionPct, overheated: available && f.rsi >= 70 && f.maSpreadPct >= 8 && priceExtensionPct >= 8 };
   });
-  const ready = result.stAnalysis?.riskVersion === 1 && checks.every((f) => f.available || f.shortHistory);
+  const limited = checks.some((f) => f.shortHistory), fallback = frames[60];
+  const fallbackAvailable = fallback?.closeTime === boundaryFor(60, now) && Number.isFinite(fallback.rsi)
+    && Number.isFinite(fallback.maSpreadPct) && fallback.ma20 > 0;
+  const fallbackOverheated = limited && fallbackAvailable && fallback.rsi >= 70 && fallback.maSpreadPct >= 8
+    && (ticker.tradePrice / fallback.ma20 - 1) * 100 >= 8;
+  const ready = result.stAnalysis?.riskVersion === 1 && checks.every((f) => f.available || f.shortHistory && fallbackAvailable);
   const reasons = checks.filter((f) => f.overheated).map((f) => `${f.unit === 240 ? "4시간" : "일봉"} RSI ${f.rsi.toFixed(1)} · 7·20기간 이평선 이격 ${f.maSpreadPct.toFixed(1)}% · 현재가 이격 ${f.priceExtensionPct.toFixed(1)}%`);
-  return { version: 1, ready, blocked: reasons.length > 0, checks, reasons };
+  if (fallbackOverheated) reasons.push("신규 상장 · 확인 가능한 1시간 RSI·이평선 이격 과열");
+  return { version: 1, ready, limited, fallbackAvailable, blocked: reasons.length > 0, checks, reasons };
 }
 function validPricePlan(p) {
   return !!p && typeof p.id === "string" && !!p.id && Array.isArray(p.targets) && p.targets.length === 3
@@ -1009,9 +1040,55 @@ function validPricePlan(p) {
     && p.stop < p.entryLow && p.entryLow <= p.entryAnchor && p.entryAnchor <= p.entryHigh
     && p.entryHigh < p.targets[0] && p.targets[0] < p.targets[1] && p.targets[1] < p.targets[2];
 }
+function priceRiskReason(plan, strategy) {
+  if (!validPricePlan(plan)) return "NO_RESISTANCE_ROOM";
+  const riskPct = (plan.entryAnchor - plan.stop) / plan.entryAnchor * 100;
+  if (riskPct > (strategy === "scalp" ? 2 : 6)) return "RISK_TOO_WIDE";
+  if (!Number.isFinite(plan.netRewardRiskAtTarget2) || plan.netRewardRiskAtTarget2 < 1.5
+    || !Number.isFinite(plan.netReturns?.[0]) || plan.netReturns[0] <= 0) return "POOR_NET_RR";
+  return null;
+}
+function assessRecommendation(input, strategy, now, saved) {
+  if (input.exclusionsReady !== true) return reject("insufficientData", "EXCLUSIONS_PENDING");
+  if (!isAnalysisMarket(input.market)) return reject("technicalConditions", "MARKET_EXCLUDED");
+  if (!highTurnover({ turnover: turnoverClass(input.candles, now) }, now)) return reject("technicalConditions", "LOW_LIQUIDITY");
+  const unit = strategy === "scalp" ? 15 : 60;
+  const gate = primaryTrend(input.candles[unit], unit, now, input.trends?.[unit]);
+  if (gate.targetTrend.stoppedAt || gate.targetTrend.completedAt) return reject("technicalConditions", "TARGET_CYCLE_ENDED");
+  const ended = saved && (saved.stoppedAt !== undefined || saved.completedAt !== undefined);
+  const originSignalTime = gate.targetTrend.signalTime ?? gate.stFlipAt;
+  if (saved && (ended ? !canReplacePlan(saved, { originSignalTime }) : planBlockReason(saved))) return reject("technicalConditions", "SAVED_PLAN_WAITING");
+  const evaluation = (strategy === "scalp" ? evaluateScalp : evaluateSwing)({ ...input, analysisAt: now, analysisOnly: false }, saved && !ended ? saved.candidate.plan : undefined);
+  if (!evaluation.accepted) return evaluation;
+  const risk = recommendationRisk({ stAnalysis: stAnalysis(input.candles, now) }, input.ticker, now);
+  if (!risk.ready) return reject("insufficientData", "RISK_DATA_PENDING");
+  if (risk.blocked) return reject("technicalConditions", "UPPER_OVERHEATED");
+  let candidate = applyDailySelection(evaluation.candidate, dailySelection(input.candles[1440], now), now);
+  const activity = activityRatio(input.candles[60], input.ticker.quoteVolume24h);
+  if (activity !== null) {
+    candidate.metrics.activityRatio = activity;
+    candidate.score = Math.min(100, candidate.score + (activity >= 1.5 ? 5 : activity >= 1.1 ? 2 : 0));
+  }
+  const riskReason = priceRiskReason(candidate.plan, strategy);
+  if (riskReason) return reject("technicalConditions", riskReason);
+  if (candidate.score < (strategy === "scalp" ? 70 : 72)) return reject("technicalConditions", "SCORE_TOO_LOW");
+  candidate.rankingFactors = { stFlipAt: gate.stFlipAt,
+    stDistanceAtr: gate.atr > 0 ? Math.abs(input.ticker.tradePrice - gate.stLine) / gate.atr : null,
+    stopDistancePct: candidate.plan.riskPct, netRewardRiskAtTarget2: candidate.plan.netRewardRiskAtTarget2,
+    activeTargetFrames: [15, 60, 240, 1440].filter((u) => {
+      const t = cachedTrends(input.candles, u, input.trends?.[u], now);
+      return t.ttDirection === true && t.signal && !t.signal.completedAt && !t.signal.stoppedAt;
+    }) };
+  const age = now - input.ticker.timestamp;
+  if (!Number.isFinite(age) || age < 0 || age > 180000) return reject("insufficientData", "DATA_DELAYED");
+  if (!entryStillValid(candidate, input.ticker.tradePrice, now)) return reject("technicalConditions", "CURRENT_PRICE_OUTSIDE_ENTRY");
+  return { accepted: true, candidate: { ...candidate, entryPolicyVersion: 2, risk,
+    entryGate: gate, originSignalTime: gate.targetTrend.signalTime ?? gate.stFlipAt,
+    dataQuality: recommendationQuality(input.candles, strategy, now) } };
+}
 function pricePlanCurrent(candidate, now) {
   const p = candidate?.plan;
-  return validPricePlan(p) && Number.isFinite(candidate.currentPrice) && candidate.currentPrice > 0
+  return candidate?.entryPolicyVersion === 2 && !priceRiskReason(p, candidate.strategy) && Number.isFinite(candidate.currentPrice) && candidate.currentPrice > 0
     && Number.isFinite(candidate.quoteVolume24h) && candidate.quoteVolume24h >= 0
     && Number.isFinite(candidate.currentPriceAt) && 0 <= now - candidate.currentPriceAt && now - candidate.currentPriceAt <= 180000
     && Number.isFinite(p.netReturns?.[0]) && p.netReturns[0] > 0
@@ -1032,10 +1109,9 @@ function rankedStRecommendations(results, markets, prices, now, accepted = []) {
       const analysis = result.stAnalysis, frames = analysis?.frames ?? {};
       const frame = (u) => frames[u]?.closeTime === boundaryFor(u, now) ? frames[u].state : "pending";
       const momentum = analysis?.checkedAt >= boundaryFor(unit, now) ? analysis.rsi?.[unit] : null;
-      const score = 50 + (frame(240) === "up" ? 15 : 0) + (frame(1440) === "up" ? 15 : 0)
-        + (momentum !== null && momentum !== undefined && momentum >= 40 && momentum <= 70 ? 10 : 0) + (result.turnover.increasing ? 10 : 0);
       const technical = accepted.find((c) => c.market === result.market && c.strategy === strategy && pricePlanCurrent(c, now));
       if (!technical) continue;
+      const score = technical.rankingScore ?? technical.score;
       candidates.push({ ...technical, actionableVersion: 1, market: result.market, koreanName: market.koreanName, strategy, score,
         currentPrice: ticker.tradePrice, currentPriceAt: ticker.timestamp, quoteVolume24h: ticker.quoteVolume24h,
         averageTurnover3d: result.turnover.average3d, turnover: result.turnover, entryGate: gate,
@@ -1045,7 +1121,8 @@ function rankedStRecommendations(results, markets, prices, now, accepted = []) {
     }
   }
   return ["scalp", "swing"].flatMap((strategy) => candidates.filter((c) => c.strategy === strategy)
-    .sort((a, b) => b.score - a.score || b.averageTurnover3d - a.averageTurnover3d || a.market.localeCompare(b.market))
+    .sort((a, b) => b.score - a.score || b.plan.netRewardRiskAtTarget2 - a.plan.netRewardRiskAtTarget2
+      || a.plan.riskPct - b.plan.riskPct || b.averageTurnover3d - a.averageTurnover3d || a.market.localeCompare(b.market))
     .slice(0, 10).map((c, i) => ({ ...c, rank: i + 1 })));
 }
 function primaryTrend(candles, unit, now, previous) {
@@ -1056,13 +1133,15 @@ function primaryTrend(candles, unit, now, previous) {
     actualBars: real.length, direction: Number.isFinite(trend.atr10) ? trend.stDirection : null, ready,
     targetTrend: { version: 1, ready: trend.atrWindow.length === 200, direction: trend.ttDirection,
       signalTime: trend.signal?.time ?? null, targets: trend.signal?.targets ?? [],
-      reached: trend.signal?.reached ?? 0, completedAt: trend.signal?.completedAt ?? null },
+      reached: trend.signal?.reached ?? 0, completedAt: trend.signal?.completedAt ?? null, stoppedAt: trend.signal?.stoppedAt ?? null },
+    stFlipAt: trend.stFlipAt ?? null, stLine: trend.stDirection === 1 ? trend.stLower : trend.stUpper, atr: trend.atr10,
     state: ready ? trend.stDirection === 1 ? "buy" : "sell" : "unknown" };
 }
 function entryGateCurrent(candidate, now) {
   const gate = candidate?.entryGate, unit = candidate?.strategy === "scalp" ? 15 : 60;
   return gate?.version === 1 && gate.unit === unit && gate.ready && gate.direction === 1
-    && gate.closeTime === boundaryFor(unit, now) && gate.latestActualClose === gate.closeTime;
+    && gate.closeTime === boundaryFor(unit, now) && gate.latestActualClose === gate.closeTime
+    && !gate.targetTrend?.completedAt && !gate.targetTrend?.stoppedAt;
 }
 function stEntryCheck(input, unit) {
   const gate = primaryTrend(input.candles[String(unit)], unit, input.analysisAt ?? input.ticker.timestamp);
@@ -1076,8 +1155,6 @@ function evaluateScalp(input, fixedPlan) {
   }
   const trends = trendSet(input);
   const upper = upperStructure(input.candles, input.analysisAt ?? input.ticker.timestamp, trends);
-  if (!upper.ready) return reject("insufficientData", "INSUFFICIENT_DATA");
-  if (!input.analysisOnly && !upper.alive) return reject("technicalConditions", "UPPER_TREND_WAIT");
   const candles15 = input.candles["15"];
   const candles60 = input.candles["60"];
   if (candles15.length < 60 || candles60.length < 55) return reject("insufficientData", "INSUFFICIENT_DATA");
@@ -1116,7 +1193,9 @@ function evaluateScalp(input, fixedPlan) {
   if (!pivot && !fixedPlan) return reject("technicalConditions", "NO_CONFIRMED_SWING_LOW");
   const anchor = isBreakout ? breakout : ema20_15;
   const rawStop = fixedPlan?.stop ?? (isBreakout ? Math.min(pivot.price, breakout - atr14 * 0.7) : pivot.price - atr14 * 0.2);
+  const priceFailure = {};
   const plan = fixedPlan ?? buildConfluencePlan({
+    failure: priceFailure,
     entryLow: anchor,
     entryAnchor: anchor + atr14 * 0.1,
     entryHigh: anchor + atr14 * 0.3,
@@ -1132,7 +1211,7 @@ function evaluateScalp(input, fixedPlan) {
     expiresAt: latest.closeTime + 30 * 6e4,
     feeRate: input.feeRate
   });
-  if (!plan) return reject("technicalConditions", "NO_RESISTANCE_ROOM");
+  if (!plan) return reject("technicalConditions", priceFailure.code ?? "NO_RESISTANCE_ROOM");
   if (!input.analysisOnly && (input.ticker.tradePrice < plan.entryLow - atr14 * 0.25 || input.ticker.tradePrice > plan.entryHigh + atr14 * 0.25)) {
     return reject("technicalConditions", "CURRENT_PRICE_OUTSIDE_ENTRY");
   }
@@ -1189,10 +1268,9 @@ function evaluateSwing(input, fixedPlan) {
   }
   const trends = trendSet(input);
   const upper = upperStructure(input.candles, input.analysisAt ?? input.ticker.timestamp, trends);
-  if (!upper.ready) return reject("insufficientData", "INSUFFICIENT_DATA");
-  if (!input.analysisOnly && !upper.alive) return reject("technicalConditions", "UPPER_TREND_WAIT");
   const candles60 = input.candles["60"];
-  const candles240 = input.candles["240"];
+  const contextUnit = input.candles["240"].filter((b) => !b.synthetic).length >= 60 ? 240 : 60;
+  const candles240 = input.candles[contextUnit];
   if (candles60.length < 60 || candles240.length < 60) return reject("insufficientData", "INSUFFICIENT_DATA");
   if (hasRecentSynthetic(candles60, 36) || hasRecentSynthetic(candles240, 20)) return reject("insufficientData", "MISSING_RECENT_CANDLES");
   if (!input.analysisOnly && input.marketRegime === "RISK_OFF") return reject("technicalConditions", "BTC_RISK_OFF");
@@ -1238,7 +1316,9 @@ function evaluateSwing(input, fixedPlan) {
   const entryLowRaw = isBreakout ? breakout - atr60 * 0.2 : pullbackLow;
   const entryHighRaw = isBreakout ? breakout + atr60 * 0.2 : pullbackHigh;
   const entryAnchorRaw = isBreakout ? breakout : (pullbackLow + pullbackHigh) / 2;
+  const priceFailure = {};
   const plan = fixedPlan ?? buildConfluencePlan({
+    failure: priceFailure,
     entryLow: entryLowRaw,
     entryAnchor: entryAnchorRaw,
     entryHigh: entryHighRaw,
@@ -1249,12 +1329,12 @@ function evaluateSwing(input, fixedPlan) {
     market: input.market.market,
     strategy: "swing",
     signalTime: latest60.closeTime,
-    entryReason: isBreakout ? "1시간 고점 돌파 기준 구간 진입" : "4시간 추세와 1시간 지지가 겹친 회복 구간",
+    entryReason: isBreakout ? "1시간 고점 돌파 기준 구간 진입" : "1시간 지지 구간의 가격 회복",
     stopReason: "확정된 1시간 지지 저점과 ATR 완충 아래",
     expiresAt: latest60.closeTime + 3 * 60 * 6e4,
     feeRate: input.feeRate
   });
-  if (!plan) return reject("technicalConditions", "NO_RESISTANCE_ROOM");
+  if (!plan) return reject("technicalConditions", priceFailure.code ?? "NO_RESISTANCE_ROOM");
   if (!input.analysisOnly && (input.ticker.tradePrice < plan.entryLow - atr60 * 0.25 || input.ticker.tradePrice > plan.entryHigh + atr60 * 0.25)) {
     return reject("technicalConditions", "CURRENT_PRICE_OUTSIDE_ENTRY");
   }
@@ -1266,7 +1346,7 @@ function evaluateSwing(input, fixedPlan) {
   const flowQuality = clamp((flow + 0.1) / 0.3, 0, 1);
   const momentumQuality = momentum > 0 ? 1 : clamp(1 + momentum / 0.5, 0, 1);
   const relativeQuality = clamp((relativeStrength + 0.02) / 0.06, 0, 1);
-  const daily = dailyContext(candles240, input.ticker.timestamp);
+  const daily = dailyContext(input.candles[240], input.analysisAt ?? input.ticker.timestamp);
   const score = Math.round(
     45 + upper.score * 0.1 + (ema200_240 !== null && ema50_240 > ema200_240 ? 3 : 0) + clamp((adx240 - 15) / 15, 0, 1) * 5 + volumeQuality * 10 + flowQuality * 4 + rsiQuality * 4 + momentumQuality * 4 + relativeQuality * 4 + (plusDi > minusDi ? 3 : 0) + clamp((plan.netSplitReturn ?? 0) / 15, 0, 1) * 10 + (daily === "up" ? 5 : 0)
   );
@@ -1298,6 +1378,7 @@ function evaluateSwing(input, fixedPlan) {
       ], "swing", input.execution.spreadPct),
       plan,
       metrics: {
+        contextTimeframe: contextUnit,
         rsi: rsi240,
         atrPct: atr240 / latest240.close * 100,
         rvol: relativeVolume,
@@ -1813,14 +1894,37 @@ function candleQuality(cache, unit, now) {
       : noTradeCount && !gapCount && latestActualClose !== boundaryFor(unit, now) ? "최근 봉 무거래 · 최신 실제 봉 확인 대기"
       : gapCount || latestActualClose !== boundaryFor(unit, now) ? "누락·최신 실제 봉 복구 대기" : "지표 과거 이력 보충 중" };
 }
+function analysisCandleQuality(cache, unit, minimum, now, optional = false) {
+  const end = boundaryFor(unit, now), bars = (cache[unit] ?? []).filter((b) => b.closeTime <= end);
+  const recent = bars.slice(-400), actual = bars.filter((b) => !b.synthetic), state = cache.collection?.[unit];
+  const gapCount = recent.filter((b, i) => b.synthetic && !b.noTrade || i > 0 && b.openTime !== recent[i - 1].closeTime).length;
+  const valid = recent.every((b) => [b.open, b.high, b.low, b.close, b.baseVolume, b.quoteVolume].every(Number.isFinite)
+    && b.low > 0 && b.low <= Math.min(b.open, b.close) && b.high >= Math.max(b.open, b.close)
+    && b.baseVolume >= 0 && b.quoteVolume >= 0 && b.closeTime === b.openTime + unit * 60000);
+  const exhausted = state?.exhausted === true, latestActualClose = actual.at(-1)?.closeTime ?? 0;
+  const available = actual.length >= minimum && latestActualClose === end;
+  const unavailableListing = optional && exhausted && actual.length < minimum
+    && (bars.at(-1)?.closeTime === end || !bars.length && state.checkedAt >= end);
+  const ready = valid && !gapCount && (available || unavailableListing);
+  return { ready, available, optional: !!unavailableListing, actualBars: actual.length, required: minimum, exhausted,
+    gapCount, noTradeCount: recent.filter((b) => b.noTrade).length, latestActualClose, expectedClose: end,
+    reason: !valid ? "봉 값 오류 확인 대기" : gapCount ? "미확인 누락 봉 복구 대기"
+      : unavailableListing ? "신규 상장 · 해당 상위 지표 사용 안 함" : available ? "산식에 필요한 실제 봉 확인"
+      : actual.length < minimum && exhausted ? "신규 상장 · 가격 계산 이력 부족"
+      : latestActualClose !== end ? "최신 실제 봉 확인 대기" : "가격 계산 이력 보충 중" };
+}
 function recommendationQuality(cache, strategy, now) {
   const units = strategy === "scalp" ? [15, 60, 240, 1440] : [60, 240, 1440];
-  const frames = Object.fromEntries(units.map((u) => [u, candleQuality(cache, u, now)]));
-  return { version: 1, asOf: now, frames, ready: Object.values(frames).every((q) => q.ready) };
+  const frames = Object.fromEntries(units.map((u) => [u, analysisCandleQuality(cache, u, u === 15 || u === 60 ? 60 : 20, now, u >= 240)]));
+  return { version: 2, strategy, asOf: now, frames, ready: Object.values(frames).every((q) => q.ready) };
 }
 function qualityCurrent(quality, now) {
-  return quality?.version === 1 && quality.ready && [60, 240, 1440].every((u) => quality.frames?.[u]?.ready)
-    && Object.entries(quality.frames).every(([u, q]) => q.ready && q.latestActualClose === boundaryFor(Number(u), now));
+  const units = quality?.strategy === "scalp" ? [15, 60, 240, 1440] : [60, 240, 1440];
+  return quality?.version === 2 && quality.ready && units.every((u) => {
+    const q = quality.frames?.[u];
+    return q?.ready && q.expectedClose === boundaryFor(u, now)
+      && (q.available && q.latestActualClose === q.expectedClose || u >= 240 && q.optional && q.exhausted);
+  });
 }
 function candleRequest(cache, unit, now) {
   const bars = cache[unit] ?? [], state = cache.collection?.[unit] ?? {};
@@ -2256,7 +2360,8 @@ function planBlockReason(plan) {
 }
 function canReplacePlan(previous, candidate) {
   const endedAt = previous?.stoppedAt ?? previous?.completedAt;
-  return !previous || endedAt !== void 0 && candidate.signalTime > endedAt;
+  return !previous || endedAt !== void 0 && Number.isFinite(candidate.originSignalTime)
+    && candidate.originSignalTime > endedAt && candidate.originSignalTime !== previous.candidate.originSignalTime;
 }
 function describeSavedPlan(saved, candidate, reason, now, validFor) {
   const block = planBlockReason(saved);
@@ -2264,6 +2369,7 @@ function describeSavedPlan(saved, candidate, reason, now, validFor) {
   const snapshot = candidate ?? saved.candidate;
   return { ...saved, candidate: {
     ...snapshot,
+    originSignalTime: saved.candidate.originSignalTime,
     setup: saved.candidate.setup,
     signalTime: saved.candidate.signalTime,
     plan: saved.candidate.plan,
@@ -2378,7 +2484,7 @@ function summarizeMarkets(results, markets, tickers, regime, now, executions = /
   }
   const btc = prices.get("KRW-BTC");
   const pipeline = pipelineCoverage(results, markets, now);
-  const recommendations = pipeline.primaryComplete ? rankedStRecommendations(results, markets, prices, now, accepted) : [];
+  const recommendations = rankedStRecommendations(results, markets, prices, now, accepted);
   return {
     schemaVersion: 5,
     pipeline,
@@ -2464,15 +2570,15 @@ function cachedPayload(payload, now, error) {
     if (payload[key]) payload[key] = payload[key].filter((c) => c.market !== "KRW-USDT");
   }
   const stale = payload.schemaVersion !== 5 || now - payload.generatedAt > 3 * 6e4 || Boolean(error);
-  const pipelineReady = pipelineCurrent(payload.pipeline, now);
+  const invalidSchema = payload.schemaVersion !== 5;
   return {
     ...payload,
-    stRecommendations: stale || !pipelineReady || !payload.marketExclusions?.ready ? [] : (payload.stRecommendations ?? []).filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && c.risk?.version === 1 && c.risk.ready && !c.risk.blocked && c.turnover?.candleClose === boundaryFor(60, now) && c.turnover?.average3d >= TURNOVER_MIN),
+    stRecommendations: invalidSchema || !payload.marketExclusions?.ready ? [] : (payload.stRecommendations ?? []).filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && c.risk?.version === 1 && c.risk.ready && !c.risk.blocked && c.turnover?.candleClose === boundaryFor(60, now) && c.turnover?.average3d >= TURNOVER_MIN),
     source: "cached",
     stale,
     promising: stale || !payload.marketExclusions?.ready ? [] : (payload.promising ?? []).filter((c) => c.dailyQuality?.ready && c.dailyQuality.latestActualClose === boundaryFor(1440, now)),
-    scalp: stale || !pipelineReady || !payload.marketExclusions?.ready ? [] : payload.scalp.filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && entryGateCurrent(c, now) && qualityCurrent(c.dataQuality, now) && entryStillValid(c, c.currentPrice, now)),
-    swing: stale || !pipelineReady || !payload.marketExclusions?.ready ? [] : payload.swing.filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && entryGateCurrent(c, now) && qualityCurrent(c.dataQuality, now) && entryStillValid(c, c.currentPrice, now)),
+    scalp: invalidSchema || !payload.marketExclusions?.ready ? [] : payload.scalp.filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && entryGateCurrent(c, now) && qualityCurrent(c.dataQuality, now) && entryStillValid(c, c.currentPrice, now)),
+    swing: invalidSchema || !payload.marketExclusions?.ready ? [] : payload.swing.filter((c) => c.actionableVersion === 1 && pricePlanCurrent(c, now) && entryGateCurrent(c, now) && qualityCurrent(c.dataQuality, now) && entryStillValid(c, c.currentPrice, now)),
     savedPlans: payload.savedPlans?.map((c) => ["stopped", "completed"].includes(c.entryStatus) || !stale && payload.marketExclusions?.ready && entryGateCurrent(c, now) && qualityCurrent(c.dataQuality, now) && (c.entryValidUntil ?? 0) > now ? c : { ...c, entryStatus: "waiting", entryBlockReason: stale ? REASONS.DATA_DELAYED : c.entryBlockReason ?? "신규 진입 조건 재확인 대기" }),
     error: error instanceof Error ? error.message : error ? "시세 갱신 실패" : void 0
   };
@@ -2482,7 +2588,9 @@ async function getDashboard(db, now = Date.now()) {
   return latest ? cachedPayload(latest, now) : null;
 }
 async function refreshDashboard(db, options = {}) {
-  const now = options.now ?? Date.now();
+  const clock = options.clock ?? (() => options.now ?? Date.now());
+  let now = clock();
+  const scanStartedAt = now;
   const startedAt = Date.now();
   await ensureCycleSchema(db);
   const token = await acquireCycle(db, now);
@@ -2527,9 +2635,13 @@ async function refreshDashboard(db, options = {}) {
       }
       return true;
     };
+    let preparedCount = 0;
     const baseResult = (market) => results.get(market) ?? { market, analyzedAt: 0, complete: false, candidates: [], legacy: [], observations: [] };
     const publish = async (regime = "RISK_OFF", executions = new Map()) => {
+      now = clock();
       const payload = summarizeMarkets([...results.values()], markets, tickers, regime, now, executions);
+      payload.processing = { startedAt: scanStartedAt, finishedAt: now, elapsedMs: Date.now() - startedAt,
+        candleRequests: CANDLE_BUDGET - budget, prepared: preparedCount, boundaryCrossed: boundaryFor(15, scanStartedAt) !== boundaryFor(15, now) };
       await saveRecommendations(db, tracked, cached, payload, now);
       payload.recommendations = await recommendationDashboard(db, payload, now, tickers);
       payload.promising = promisingMarkets([...results.values()], markets, tickers,
@@ -2562,11 +2674,14 @@ async function refreshDashboard(db, options = {}) {
       await writeMarket(db, result, await load(market), checked.get(market) ?? 0);
     }
     if (markets.exclusionStatus?.ready === false) return await publish();
-    const volumeChecked = new Map([...results.values()].map((r) => [r.market, r.turnover?.checkedAt ?? 0]));
-    const volumeQueue = nextMarkets(markets, tickers, volumeChecked).filter((m) =>
+    const volumeChecked = new Map([...results.values()].map((r) => [r.market, r.turnoverAttemptedAt ?? r.turnover?.checkedAt ?? 0]));
+    const byPriority = (a, b) => collectionPriority(results.get(a.market), trackedMarkets.has(a.market))
+      - collectionPriority(results.get(b.market), trackedMarkets.has(b.market));
+    const volumeQueue = nextMarkets(markets, markets.map((m) => tickerByCode.get(m.market) ?? { market: m.market, quoteVolume24h: 0 }), volumeChecked).sort(byPriority).filter((m) =>
       results.get(m.market)?.turnover?.version !== 2 || !results.get(m.market)?.turnover?.ready || results.get(m.market).turnover.candleClose !== boundaryFor(60, now));
+    const volumeBudget = budget;
     for (let offset = 0; offset < volumeQueue.length; offset += 4) {
-      if (budget <= 0 || Date.now() - startedAt > 100000) break;
+      if (budget <= 0 || volumeBudget - budget >= 80 || Date.now() - startedAt > 35000) break;
       const group = volumeQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
       if (missing.length) {
         const loaded = await db.batch(missing.map((m) => db.prepare("SELECT COALESCE((SELECT candles_json FROM candle_cache WHERE market = ?), (SELECT candles_json FROM market_analysis WHERE market = ?)) AS candles_json").bind(m.market, m.market)));
@@ -2574,12 +2689,13 @@ async function refreshDashboard(db, options = {}) {
       }
       const writes = []; let rateError;
       for (const m of group) {
-        const result = { ...baseResult(m.market) };
+        const result = { ...baseResult(m.market), turnoverAttemptedAt: now };
         try {
           await collect(m.market, [60], 1, false, "turnover");
           result.turnover = turnoverClass(await load(m.market), now);
+          result.turnoverError = null;
         } catch (error) {
-          result.turnover = { ready: false, group: "pending", checkedAt: now, candleClose: boundaryFor(60, now), error: error.message };
+          result.turnoverError = error.message;
           if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
         }
         results.set(m.market, result);
@@ -2591,11 +2707,10 @@ async function refreshDashboard(db, options = {}) {
       if (writes.length) await db.batch(writes);
       if (rateError) throw rateError;
     }
-    if (!pipelineCoverage([...results.values()], markets, now).turnoverComplete) return await publish();
     const prepared = [], detailAttempted = new Set();
     const hasCurrentBuy = (result) => highTurnover(result, now) && [15, 60].some((u) => result?.primary?.[u]?.ready
       && result.primary[u].direction === 1 && result.primary[u].closeTime === boundaryFor(u, now));
-    const detailDue = (r) => hasCurrentBuy(r) && (r.detailCollectionPending && (r.detailAttemptedAt ?? 0) <= now - 60000 || !r.stAnalysis || r.stAnalysis.riskVersion !== 1
+    const detailDue = (r) => hasCurrentBuy(r) && (r.detailCollectionPending && (r.detailAttemptedAt ?? 0) <= now - 60000 || !r.stAnalysis || r.stAnalysis.riskVersion !== 1 || r.entryPolicyVersion !== 2 || r.reliabilityVersion !== 1
       || [15, 60].some((u) => r.primary?.[u]?.ready && r.primary[u].direction === 1 && r.primary[u].closeTime === boundaryFor(u, now) && r.stAnalysis.primaryClose?.[u] !== boundaryFor(u, now))
       || [240, 1440].some((u) => (r.stAnalysis.frames?.[u]?.checkedAt ?? 0) < boundaryFor(u, now)));
     const prepareMarket = async (market) => {
@@ -2616,7 +2731,7 @@ async function refreshDashboard(db, options = {}) {
         result.stAnalysis = stAnalysis(cache, now);
         result.selection = dailySelection(cache[1440], now);
         result.dailyQuality = candleQuality(cache, 1440, now);
-        if (buy) prepared.push({ market, candles: cache });
+        if (buy) { prepared.push({ market, candles: cache }); preparedCount++; }
       } catch (error) {
         if (error instanceof UpbitApiError && [418, 429].includes(error.status)) rateError = error;
         result.candidates = [];
@@ -2631,13 +2746,14 @@ async function refreshDashboard(db, options = {}) {
       if (rateError) throw rateError;
       checked.set(market.market, now);
     };
-    // 전체 거래대금 분류가 끝난 뒤 고거래대금 시장의 가격 계산용 분봉을 준비한다.
+    // 분류가 확인된 시장부터 검사하며 나머지 시장이 끝날 때까지 막지 않는다.
     const primaryChecked = new Map([...results.values()].map((r) => [r.market, r.primaryCheckedAt ?? 0]));
-    const primaryQueue = nextMarkets(markets, tickers, primaryChecked).filter((market) =>
+    const primaryQueue = nextMarkets(markets, tickers, primaryChecked).sort(byPriority).filter((market) =>
       highTurnover(results.get(market.market), now) && ![15, 60].every((u) => results.get(market.market)?.primaryCollection?.[u]?.ready
         && results.get(market.market).primaryCollection[u].candleClose === boundaryFor(u, now)));
+    const primaryBudget = budget;
     for (let offset = 0; offset < primaryQueue.length; offset += 4) {
-      if (budget <= 0 || Date.now() - startedAt > 100000) break;
+      if (budget <= 70 || primaryBudget - budget >= 80 || Date.now() - startedAt > 60000) break;
       const group = primaryQueue.slice(offset, offset + 4), missing = group.filter((m) => !cached.has(m.market));
       if (missing.length) {
         const loaded = await db.batch(missing.map((m) => db.prepare("SELECT COALESCE((SELECT candles_json FROM candle_cache WHERE market = ?), (SELECT candles_json FROM market_analysis WHERE market = ?)) AS candles_json").bind(m.market, m.market)));
@@ -2678,7 +2794,7 @@ async function refreshDashboard(db, options = {}) {
       }
       if (rateError) throw rateError;
     }
-    if (!pipelineCoverage([...results.values()], markets, now).primaryComplete || budget <= 12 || Date.now() - startedAt > 95000) return await publish();
+    if (budget <= 12 || Date.now() - startedAt > 95000) return await publish();
     await collect("KRW-BTC", [60, 240]);
     const btcCandles = await load("KRW-BTC");
     if (btcCandles["60"].length < 55 || btcCandles["240"].length < 200 || [60, 240].some((unit) => btcCandles[unit].at(-1)?.closeTime !== boundaryFor(unit, now) || btcCandles[unit].slice(-200).some((b) => b.synthetic))) {
@@ -2686,7 +2802,8 @@ async function refreshDashboard(db, options = {}) {
     }
     const regime = deriveBtcRegime(btcCandles["60"], btcCandles["240"]);
     // 대기 검사에서 새로 확인된 Buy도 일봉 전용 수집보다 먼저 심사한다.
-    const queue = nextMarkets(markets, tickers, checked).sort((a, b) => Number(hasCurrentBuy(results.get(b.market))) - Number(hasCurrentBuy(results.get(a.market))));
+    const queue = nextMarkets(markets, tickers, checked).sort((a, b) => Number(trackedMarkets.has(b.market)) - Number(trackedMarkets.has(a.market))
+      || Number(hasCurrentBuy(results.get(b.market))) - Number(hasCurrentBuy(results.get(a.market))));
     for (const market of queue) {
       if (budget <= 12 || prepared.length >= MARKET_BATCH || Date.now() - startedAt > 92000) break;
       if (detailAttempted.has(market.market)) continue;
@@ -2728,6 +2845,7 @@ async function refreshDashboard(db, options = {}) {
       if (rateError) throw rateError;
     }
     tickers = await fetchKrwTickers();
+    now = clock();
     const tickerMap = new Map(tickers.map((t) => [t.market, t]));
     for (const result of results.values()) {
       const ticker = tickerMap.get(result.market);
@@ -2744,6 +2862,7 @@ async function refreshDashboard(db, options = {}) {
       ...[...results.values()].filter((r) => safeCodes.has(r.market) && now - r.analyzedAt <= SIGNAL_FRESH_MS && (r.candidates.length > 0 || r.plans?.some((p) => p.candidate.entryStatus === "ready"))).map((r) => r.market)
     ])];
     const executions = await fetchExecutionQualities(executionCodes, ANALYSIS_NOTIONAL_KRW, Date.now());
+    now = clock();
     for (const { market, candles } of prepared) {
       const ticker = tickerMap.get(market.market);
       const execution = executions.get(market.market) ?? {
@@ -2771,19 +2890,22 @@ async function refreshDashboard(db, options = {}) {
         btcChangeRate: tickerMap.get("KRW-BTC")?.signedChangeRate ?? 0,
         feeRate: ASSUMED_FEE_RATE,
         trends,
-        liquidityQualified: highTurnover(previous, now)
+        liquidityQualified: highTurnover({ turnover: turnoverClass(candles, now) }, now),
+        exclusionsReady: markets.exclusionStatus?.ready === true
       };
       const result = {
         market: market.market,
         analyzedAt: now,
         engineVersion: 5,
+        reliabilityVersion: 1,
+        entryPolicyVersion: 2,
         entryGateVersion: 1,
         primaryCheckedAt: now,
-        primaryCollection: previous?.primaryCollection,
+        primaryCollection: Object.fromEntries([15, 60].map((u) => [u, primaryCollectionStatus(candles, u, now)])),
         trackingCheckedAt: previous?.trackingCheckedAt,
         detailAttemptedAt: previous?.detailAttemptedAt,
         detailCollectionPending: previous?.detailCollectionPending,
-        turnover: previous?.turnover,
+        turnover: turnoverClass(candles, now),
         stAnalysis: stAnalysis(candles, now),
         primary: Object.fromEntries([15, 60].map((u) => [u, primaryTrend(candles[u], u, now, trends[u])])),
         trends,
@@ -2800,17 +2922,8 @@ async function refreshDashboard(db, options = {}) {
       for (const strategy of ["scalp", "swing"]) {
         const previousPlan = previous?.plans?.find((p) => p.candidate.strategy === strategy) ?? (previous?.engineVersion === 3 && previous.candidates.find((c) => c.strategy === strategy) ? createSavedPlan(previous.candidates.find((c) => c.strategy === strategy)) : void 0);
         let saved = previousPlan ? advanceSavedPlan(previousPlan, candles[strategy === "scalp" ? "15" : "60"], ticker.tradePrice, now) : void 0;
-        const evaluation = strategy === "scalp" ? evaluateScalp(input) : evaluateSwing(input);
-        const assessed = applyDailySelection(evaluation.accepted ? evaluation.candidate : { score: 0, metrics: {}, reasons: [] }, result.selection, now);
-        if (evaluation.accepted) {
-          evaluation.candidate = { ...assessed, entryGate: result.primary[strategy === "scalp" ? 15 : 60], dataQuality: recommendationQuality(candles, strategy, now) };
-        }
-        const activity = activityRatio(candles["60"], ticker.quoteVolume24h);
-        if (evaluation.accepted && activity !== null) {
-          evaluation.candidate.metrics.activityRatio = activity;
-          evaluation.candidate.score = Math.min(100, evaluation.candidate.score + (activity >= 1.5 ? 5 : activity >= 1.1 ? 2 : 0));
-          evaluation.candidate.reasons.push(`24시간 거래대금 / 이전 3일 일평균 ${activity.toFixed(2)}배`);
-        }
+        const evaluation = assessRecommendation(input, strategy, now, saved);
+        const assessed = evaluation.accepted ? evaluation.candidate : applyDailySelection({ score: 0, metrics: {}, reasons: [] }, result.selection, now);
         if (evaluation.accepted && previous?.screen) {
           const screen = previous.screen;
           if (screen.average3d !== null) evaluation.candidate.metrics.averageTurnover3d = screen.average3d;
@@ -2832,6 +2945,7 @@ async function refreshDashboard(db, options = {}) {
           const candidate = {
             ...saved.candidate,
             entryGate: result.primary[strategy === "scalp" ? 15 : 60],
+            entryPolicyVersion: qualified ? 2 : 0,
             rankingScore: qualified ? evaluation.candidate.score : 0,
             rankingAt: now,
             selectionVersion: 2,
@@ -2862,7 +2976,7 @@ async function refreshDashboard(db, options = {}) {
     return await publish(regime, executions);
   } catch (error) {
     const latest = await getLatestDashboard(db);
-    if (latest) return cachedPayload(latest, now, error);
+    if (latest) return cachedPayload(latest, clock(), error);
     throw error;
   } finally {
     await releaseCycle(db, token);
@@ -2884,16 +2998,13 @@ function tripleStochasticLatest(bars) {
   });
 }
 function symbolDetailAnalysis(input, now) {
-  const liquidityQualified = highTurnover({ turnover: turnoverClass(input.candles, now) }, now);
-  const marketEligible = input.exclusionsReady === true && isAnalysisMarket(input.market);
-  const risk = recommendationRisk({ stAnalysis: stAnalysis(input.candles, now) }, input.ticker, now);
   const daily = dailySelection(input.candles["1440"], now);
   const frames = {};
   for (const unit of [15, 60, 240, 1440]) {
     const bars = (input.candles[unit] ?? []).filter((c) => c.closeTime <= boundaryFor(unit, now));
     const trend = cachedTrends(input.candles, unit, input.trends?.[unit], now);
     const latest = bars.at(-1);
-    const quality = candleQuality(input.candles, unit, now);
+    const quality = unit === 15 || unit === 60 ? analysisCandleQuality(input.candles, unit, 60, now) : candleQuality(input.candles, unit, now);
     const valid = quality.ready;
     const frame = { asOf: latest?.closeTime ?? 0, valid, quality, bars: bars.length,
       averages: movingAverageState(bars), rsi: lastValue(rsi(bars.map((c) => c.close), 14)),
@@ -2902,15 +3013,16 @@ function symbolDetailAnalysis(input, now) {
     if (unit === 1440) frame.selection = daily;
     if (unit === 15 || unit === 60) {
       const evaluate = unit === 15 ? evaluateScalp : evaluateSwing;
-      const evaluated = evaluate({ ...input, analysisAt: now });
-      const calculated = evaluate({ ...input, analysisOnly: true });
-      frame.plan = calculated.accepted ? calculated.candidate.plan : null;
-      frame.ready = valid && recommendationQuality(input.candles, unit === 15 ? "scalp" : "swing", now).ready && marketEligible && liquidityQualified && risk.ready && !risk.blocked && evaluated.accepted && validPricePlan(evaluated.candidate.plan)
-        && evaluated.candidate.score + daily.bonus >= (unit === 15 ? 70 : 72);
-      frame.reason = !valid ? "완료 봉 데이터 확인 대기" : input.exclusionsReady !== true ? "유의·거래지원 종료 정보 확인 대기"
-        : !isAnalysisMarket(input.market) ? "추천 제외 종목" : !liquidityQualified ? REASONS.LOW_LIQUIDITY
-        : !risk.ready ? "상위봉 과열 정보 확인 대기" : risk.blocked ? "상위봉 RSI·이평선 이격 과열"
-        : frame.ready ? "현재 신규 진입 조건 충족" : REASONS[evaluated.code] ?? "신규 진입 조건 대기";
+      const strategy = unit === 15 ? "scalp" : "swing";
+      const previousPlan = input.savedPlans?.find((p) => p.candidate.strategy === strategy);
+      const saved = previousPlan ? advanceSavedPlan(previousPlan, bars, input.ticker.tradePrice, now) : undefined;
+      const evaluated = assessRecommendation(input, strategy, now, saved);
+      const calculated = evaluate({ ...input, analysisAt: now, analysisOnly: true });
+      frame.plan = evaluated.accepted ? evaluated.candidate.plan : saved?.candidate.plan ?? (calculated.accepted ? calculated.candidate.plan : null);
+      frame.ready = evaluated.accepted;
+      frame.riskLimited = evaluated.accepted && evaluated.candidate.risk.limited;
+      frame.reason = frame.ready ? "신규 진입 조건 통과" : REASONS[evaluated.code] ?? "신규 진입 조건 대기";
+      frame.planKind = frame.ready ? "entry" : frame.plan ? "reference" : "unavailable";
     }
     frames[unit] = frame;
   }
@@ -2918,7 +3030,9 @@ function symbolDetailAnalysis(input, now) {
     currentPrice: input.ticker.tradePrice, currentPriceAt: input.ticker.timestamp, quoteVolume24h: input.ticker.quoteVolume24h,
     selection: daily, frames };
 }
-async function refreshSymbolDetail(db, market, now = Date.now()) {
+async function refreshSymbolDetail(db, market, now) {
+  const fixedNow = now;
+  now ??= Date.now();
   if (!/^KRW-[A-Z0-9]{1,20}$/.test(market)) throw new Error("종목 코드를 확인해 주세요.");
   const markets = await fetchKrwMarkets();
   const info = markets.find((m) => m.market === market);
@@ -2946,7 +3060,8 @@ async function refreshSymbolDetail(db, market, now = Date.now()) {
   }
   const tickers = await fetchKrwTickers();
   const ticker = tickers.find((t) => t.market === market);
-  if (!ticker || now - ticker.timestamp > 180000) throw new Error("최신 시세 시각을 확인할 수 없습니다.");
+  now = fixedNow ?? Date.now();
+  if (!ticker || now - ticker.timestamp < 0 || now - ticker.timestamp > 180000) throw new Error("최신 시세 시각을 확인할 수 없습니다.");
   const execution = (await fetchExecutionQualities([market], ANALYSIS_NOTIONAL_KRW, Date.now())).get(market);
   if (!execution) throw new Error("가격 계산에 필요한 호가 정보를 받지 못했습니다.");
   const btc = await readCandles(db, "KRW-BTC");
@@ -2960,9 +3075,10 @@ async function refreshSymbolDetail(db, market, now = Date.now()) {
     const prior = previous.trends?.[unit] ?? scanResult?.trends?.[unit];
     trends[unit] = cachedTrends(candles, unit, prior, now);
   }
+  now = fixedNow ?? Date.now();
   const detail = symbolDetailAnalysis({ market: info, ticker, candles, trends, execution, marketRegime: regime,
     btcChangeRate: tickers.find((t) => t.market === "KRW-BTC")?.signedChangeRate ?? 0, feeRate: ASSUMED_FEE_RATE,
-    exclusionsReady: markets.exclusionStatus?.ready === true, includeCharts: false }, now);
+    exclusionsReady: markets.exclusionStatus?.ready === true, savedPlans: scanResult?.plans, includeCharts: false }, now);
   detail.history = (await db.prepare("SELECT payload_json FROM paper_signals WHERE market = ? AND variant = ? AND status IN ('closed', 'unfilled', 'closing') ORDER BY json_extract(payload_json, '$.createdAt') DESC LIMIT 10")
     .bind(market, RECOMMENDATION_VERSION).all()).results.map((r) => JSON.parse(r.payload_json));
   await db.prepare("INSERT INTO symbol_detail_cache VALUES (?, ?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json")
