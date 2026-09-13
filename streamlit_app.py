@@ -150,16 +150,23 @@ def render(worker):
         if view.get('error'):
             st.error(view['error'])
         return
-    st.caption(f"{'수집·분석 중' if payload.get('processing') else '최근 분석 결과'} · 마지막 분석 {stamp(payload.get('analysisAt'))}")
+    recovering = view.get('recovering') or payload.get('stale')
+    status = '분석 중단·복구 대기' if recovering else '수집·분석 중' if payload.get('processing') else '최근 분석 결과'
+    st.caption(f"{status} · 마지막 분석 {stamp(payload.get('analysisAt'))}")
     if not payload.get('exclusions', {}).get('ready'):
         st.warning('공식 제외 정보 확인 중입니다. 확인된 이후 신규 추천을 표시합니다.')
     if payload.get('viewedAt', payload['generatedAt']) - payload.get('lastQuoteAt', 0) > 45_000:
         st.warning('시세 조회가 지연되어 신규 추천 표시를 보류합니다. 연결 복구 후 다시 확인합니다.')
     if payload.get('stale'):
-        st.warning('새 분석기 응답을 기다리고 있습니다. 저장된 기록은 유지합니다.')
+        st.warning('분석 진행이 멈췄거나 연결이 지연되고 있습니다. 시세 갱신과 별도로 자동 복구하며 저장된 기록은 유지합니다.')
     if view.get('error'):
         st.warning(view['error'])
+    if recovering:
+        st.caption(f"마지막 진행 단계 · {view.get('stage') or payload.get('pipeline', {}).get('stage') or '확인 중'}")
     with st.expander('분석 기준·전체 종목 현황'):
+        if view.get('last_restart'):
+            restart = view['last_restart']
+            st.caption(f"최근 자동 복구 {stamp(restart['at'])} · {restart['reason']}")
         st.write('테더·유의·거래지원 종료 예정 종목을 제외합니다. 최근 완료 72시간 거래대금 합계 ÷ 3이 10억 원 이상인 종목을 분석합니다.')
         st.write('단타는 15분, 스윙은 1시간 ST Buy를 추적합니다. 활성 상승 Target Trend의 매수·손절·세 목표가가 있을 때만 추천합니다. 다른 지표는 순위에만 사용합니다.')
         st.write('4시간·일봉은 단타·스윙 조건을 통과한 전체 종목의 활성 상승 TT 가격을 독립 검사·정렬합니다. 상위봉 ST는 점수에만 반영합니다. 단타·스윙 표의 상위 10개에 들지 못해도 대상이며, 하위 계획이 종료돼도 상위 추적을 유지합니다.')

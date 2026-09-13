@@ -1,6 +1,7 @@
 # 새 분석기 프로세스와 완성 가격·TT 추적 결과를 화면에 전달한다.
 import copy
 import json
+import logging
 import math
 import os
 import re
@@ -11,6 +12,9 @@ from collections import OrderedDict
 from pathlib import Path
 
 SECRET_KEYS = ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID', 'CLOUDFLARE_API_TOKEN')
+ANALYSIS_STALL_SECONDS = 180
+SUPERVISE_POLL_SECONDS = 1
+RESTART_DELAY_SECONDS = 60
 
 
 def node_executable():
@@ -20,7 +24,10 @@ def node_executable():
 
 
 def fresh_payload(payload, now_ms):
-    return payload.get('version') == 7 and 0 <= now_ms - payload.get('generatedAt', 0) <= 45_000
+    progress_at = payload.get('pipeline', {}).get('progressAt', payload.get('analysisAt', 0))
+    return (payload.get('version') == 7
+            and 0 <= now_ms - payload.get('generatedAt', 0) <= 45_000
+            and 0 <= now_ms - progress_at <= ANALYSIS_STALL_SECONDS * 1000)
 
 
 def valid_plan(plan):
@@ -76,8 +83,10 @@ class AnalysisWorker:
         self._stop = threading.Event()
         self._thread = None
         self._process = None
-        self._last_event = time.monotonic()
+        self._last_progress = time.monotonic()
+        self._payload_progress = 0
         self._state = {"payload": None, "running": False, "error": None, "last_success": None}
+        self._state.update(stage="분석기 시작", recovering=False, restart_count=0)
         self._detail_market = None
         self._details = OrderedDict()
         self._detail_queue = []
@@ -138,7 +147,6 @@ class AnalysisWorker:
 
     def _accept(self, event):
         with self._lock:
-            self._last_event = time.monotonic()
             now_ms = int(time.time() * 1000)
             if event["type"].startswith("detail"):
                 market = event.get("payload", {}).get("market", event.get("market"))
@@ -156,6 +164,11 @@ class AnalysisWorker:
                 if event["type"] in {"detail", "detail_error"}:
                     state["checked_at"] = time.monotonic()
                     self._next_detail()
+            elif event["type"] in {"stage", "progress"}:
+                self._state["stage"] = event["stage"]
+                if event["type"] == "progress":
+                    self._last_progress = time.monotonic()
+                    self._payload_progress = max(self._payload_progress, event["at"])
             elif event["type"] == "started":
                 self._state["running"] = True
                 self._state["started_at"] = event["at"]
@@ -163,11 +176,20 @@ class AnalysisWorker:
             elif event["type"] == "snapshot":
                 payload = event["payload"]
                 self._state.update(payload=payload, received_at=now_ms)
-                # 다른 실행이 저장한 최신 정상 결과도 복구로 인정하되 자체 분석 완료로 기록하지 않는다.
+                # 시세 snapshot은 진척이 아니다. 다른 실행도 실제 새 분석 진척이 있어야 한다.
                 if fresh_payload(payload, now_ms):
-                    self._state.update(error=None, error_at=None, waiting=None)
+                    pipeline = payload.get('pipeline', {})
+                    progress_at = pipeline.get('progressAt', payload.get('analysisAt', 0))
+                    if progress_at > self._payload_progress:
+                        self._last_progress = time.monotonic()
+                        self._payload_progress = progress_at
+                    if pipeline.get('savedAt', 0) > (self._state.get('error_at') or 0):
+                        self._state.update(error=None, error_at=None, waiting=None, recovering=False)
             elif event["type"] == "completed":
-                self._state.update(running=False, error=None, error_at=None, waiting=None, last_success=event["at"])
+                self._last_progress = time.monotonic()
+                self._payload_progress = max(self._payload_progress, event["at"])
+                self._state.update(running=False, error=None, error_at=None, waiting=None,
+                                   recovering=False, last_success=event["at"])
             elif event["type"] == "waiting":
                 self._state.update(running=False, waiting=event["message"])
             elif event["type"] == "error":
@@ -181,11 +203,17 @@ class AnalysisWorker:
         for line in process.stdout:
             try:
                 event = json.loads(line)
-                if isinstance(event, dict) and event.get("type") in {"started", "snapshot", "completed", "waiting", "error", "detail", "detail_started", "detail_error"}:
+                if isinstance(event, dict) and event.get("type") in {"stage", "progress", "started", "snapshot", "completed", "waiting", "error", "detail", "detail_started", "detail_error"}:
                     self._accept(event)
             except (ValueError, KeyError, TypeError):
                 # 라이브러리 경고는 서버 로그에만 남기며 비밀을 포함한 원문을 화면에 보내지 않는다.
                 continue
+
+    def _watchdog_reason(self):
+        with self._lock:
+            if time.monotonic() - self._last_progress > ANALYSIS_STALL_SECONDS:
+                return f"분석이 3분 동안 진행되지 않아 재시작합니다. 마지막 단계 · {self._state['stage']}"
+        return None
 
     def _supervise(self):
         while not self._stop.is_set():
@@ -198,13 +226,21 @@ class AnalysisWorker:
                                            creationflags=flags)
                 with self._lock:
                     self._process = process
-                    self._last_event = time.monotonic()
+                    self._last_progress = time.monotonic()
+                    self._payload_progress = 0
+                    self._state["stage"] = "분석기 시작·저장 기록 불러오기"
                     self._send_detail()
                 reader = threading.Thread(target=self._read_events, args=(process,), daemon=True)
                 reader.start()
-                while process.poll() is None and not self._stop.wait(1):
-                    if time.monotonic() - self._last_event > 180:
-                        self._accept({"type": "error", "message": "분석기가 3분 동안 응답하지 않아 재시작합니다."})
+                while process.poll() is None and not self._stop.wait(SUPERVISE_POLL_SECONDS):
+                    reason = self._watchdog_reason()
+                    if reason:
+                        self._accept({"type": "error", "message": reason})
+                        with self._lock:
+                            self._state["recovering"] = True
+                            self._state["restart_count"] += 1
+                            self._state["last_restart"] = {"at": int(time.time() * 1000), "reason": reason}
+                        logging.getLogger(__name__).warning(reason)
                         process.kill()
                         break
                 if process.poll() is None:
@@ -224,7 +260,7 @@ class AnalysisWorker:
                         self._state["error"] = "분석 프로세스가 종료되어 60초 후 재시작합니다."
             except (OSError, RuntimeError) as error:
                 self._accept({"type": "error", "message": f"분석기 실행 실패. {type(error).__name__}"})
-            if self._stop.wait(60):
+            if self._stop.wait(RESTART_DELAY_SECONDS):
                 break
 
     def stop(self):

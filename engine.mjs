@@ -245,17 +245,21 @@ export class Radar {
   constructor(db,{request=requestJson,markets=fetchKrwMarkets,tickers=fetchKrwTickers,emit=()=>{},clock=Date.now}={}) {
     this.db=db;this.request=request;this.getMarkets=markets;this.getTickers=tickers;this.emit=emit;this.clock=clock;
     this.markets=[];this.exclusions={ready:false};this.states=new Map();this.caches=new Map();this.plans=new Map();this.quotes=new Map();this.errors=[];this.processing=false;this.detailQueue=[];this.token=null;this.dirty=new Set();this.planDirty=new Set();this.lastSave=0;this.lastMarkets=0;this.lastQuote=0;
+    this.progressAt=0;this.savedAt=0;this.activeStage='분석기 시작';
   }
-  async init(){await ensureSchema(this.db);
+  stage(label,market='',unit=null){this.activeStage=[label,market,unit===null?'':unit===1440?'일봉':unit+'분'].filter(Boolean).join(' · ');this.emit({type:'stage',at:this.clock(),stage:this.activeStage});}
+  progress(label){this.progressAt=this.clock();this.activeStage=label;this.emit({type:'progress',at:this.progressAt,stage:label});}
+  async init(){this.stage('저장 이력 불러오기');await ensureSchema(this.db);
     for(const row of (await this.db.prepare('SELECT market,payload_json FROM radar_state').all()).results){const v=parse(row.payload_json);if(v.version===VERSION)this.states.set(row.market,v);}
     for(const row of (await this.db.prepare('SELECT id,payload_json FROM radar_plans').all()).results){const v=parse(row.payload_json);if(v.plan?.id===row.id){this.plans.set(row.id,v);if(row.id.startsWith('v7:')&&UNITS.includes(v.unit)&&v.firstShownAt)this.registerUpper(v.market,v.firstShownAt);}}
     const old=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(old&&parse(old.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(old.payload_json)});
+    this.progress('저장 이력 불러오기 완료');
   }
   registerUpper(market,at){
     const state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};
     if(!state.upperTracking){state.upperTracking={firstQualifiedAt:at,attempts:{}};this.states.set(market,state);this.dirty.add(market);}
   }
-  error(message){this.errors.push({at:this.clock(),message});this.errors=this.errors.slice(-12);this.emit({type:'error',at:this.clock(),message});}
+  error(message){this.errors.push({at:this.clock(),message,stage:this.activeStage});this.errors=this.errors.slice(-12);this.emit({type:'error',at:this.clock(),message,stage:this.activeStage});}
   async load(code){if(this.caches.has(code))return this.caches.get(code);
     let row=await this.db.prepare('SELECT candles_json FROM candle_cache WHERE market=?').bind(code).first();
     if(!row){const table=await this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_analysis'").first();if(table)row=await this.db.prepare('SELECT candles_json FROM market_analysis WHERE market=?').bind(code).first();}
@@ -281,7 +285,7 @@ export class Radar {
     const row={market:result.market,name:result.name,unit:result.unit,plan,firstShownAt:old?.firstShownAt??(result.status==='ready'?now:null)};
     if(JSON.stringify(row)!==JSON.stringify(old)){this.plans.set(id,row);this.planDirty.add(id);}
     if(result.status==='ready'&&UNITS.includes(result.unit))this.registerUpper(result.market,row.firstShownAt);}
-  calculate(info,cache,unit,now){const state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};
+  calculate(info,cache,unit,now){this.stage('지표 계산·가격 추적',info.market,unit);const state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};
     const bars=rawBars(cache,unit,endOf(unit,now)),history=assessHistory(cache,unit,now),trend=history.trend;if(history.ready)state.trends[unit]=trend;
     const id=trend?.signal?`v7:${info.market}:${unit}:tt:${trend.signal.time}`:null;
     const upper=[240,1440].filter(u=>u>unit).map(u=>assessHistory(cache,u,now)).filter(h=>h.ready).map(h=>h.trend);
@@ -312,9 +316,9 @@ export class Radar {
       if(exclusionReady){const p=cache?promisingMarket(info,cache,turnover,this.quotes.get(info.market),now):group==='low'?state?.promising:null;if(p)promising.push({...p,quote:this.quotes.get(info.market)??p.quote});}
     }
     rows.sort((a,b)=>b.score-a.score||(b.turnover.average3d-a.turnover.average3d)||a.market.localeCompare(b.market));
-    return {version:VERSION,stSettings:ST_SETTINGS,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
+    return {version:VERSION,stSettings:ST_SETTINGS,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,pipeline:{progressAt:this.progressAt,savedAt:this.savedAt,stage:this.activeStage},exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
   }
-  async flush(force=false){if(!this.token)return;const now=this.clock();if(!force&&now-this.lastSave<3000)return;await this.renew();
+  async flush(force=false){if(!this.token)return;const now=this.clock();if(!force&&now-this.lastSave<3000)return;this.stage('분석 결과 DB 저장');await this.renew();
     // 가격 추적을 먼저 갱신·저장한 뒤 같은 캐시 안의 누적 상태와 최근 봉을 교체한다.
     for(const code of this.dirty){const cache=this.caches.get(code);if(!cache)continue;
       for(const unit of RECOMMEND_UNITS){if((cache[unit]?.length??0)<=RETAINED_BARS)continue;const history=assessHistory(cache,unit,now);if(!history.ready)continue;
@@ -325,11 +329,11 @@ export class Radar {
     }
     const codes=[...this.dirty],ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[];codes.forEach(code=>{if(this.caches.has(code))queries.push(this.db.prepare('INSERT OR REPLACE INTO candle_cache VALUES (?,?)').bind(code,encodeCache(this.caches.get(code))));queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify(this.states.get(code))));});
     ids.forEach(id=>{const row=this.plans.get(id);queries.unshift(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));});
-    for(let i=0;i<queries.length;i+=20)await this.db.batch(queries.slice(i,i+20));codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
-    const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){await this.db.prepare('INSERT OR REPLACE INTO radar_snapshot VALUES (1,?)').bind(JSON.stringify(payload)).run();this.snapshotSavedAt=now;}this.lastSave=now;this.emit({type:'snapshot',payload});
+    for(let i=0;i<queries.length;i+=20){await this.db.batch(queries.slice(i,i+20));this.progress('분석 기록 저장 완료');}codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
+    const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){this.stage('화면 결과 DB 저장');payload.pipeline.savedAt=this.clock();await this.db.prepare('INSERT OR REPLACE INTO radar_snapshot VALUES (1,?)').bind(JSON.stringify(payload)).run();this.savedAt=payload.pipeline.savedAt;this.snapshotSavedAt=now;}this.lastSave=now;this.progress('분석 결과 확인 완료');payload.pipeline.progressAt=this.progressAt;this.emit({type:'snapshot',payload});
   }
-  async collect(info,unit,desired){const cache=await this.load(info.market);let changed=false;
-    for(let pass=0;pass<3;pass++){const did=await collectCandles(cache,info.market,unit,this.clock(),desired,this.request);changed||=did;if(!did)break;await sleep(135);}
+  async collect(info,unit,desired){this.stage('캔들 캐시 조회',info.market,unit);const cache=await this.load(info.market);let changed=false;
+    for(let pass=0;pass<3;pass++){this.stage('캔들 수집·검증',info.market,unit);const did=await collectCandles(cache,info.market,unit,this.clock(),desired,this.request);this.progress('캔들 수집·검증 완료');changed||=did;if(!did)break;await sleep(135);}
     if(changed)this.dirty.add(info.market);return cache;}
   async process(info,phase){const now=this.clock(),state=this.states.get(info.market)??{version:VERSION,market:info.market,frames:{},trends:{}};this.states.set(info.market,state);
     try {let cache=await this.collect(info,60,phase==='turnover'?72:HISTORY_BARS);state.turnover=turnoverClass(cache,this.clock());
@@ -362,7 +366,9 @@ export class Radar {
       const primaryEnd=endOf(15,this.clock());
       for(let page=0;page<maxPages;page++){
         if(this.clock()>=deadline||endOf(15,this.clock())!==primaryEnd)break;
+        this.stage('상위봉 캔들 수집·검증',info.market,unit);
         const changed=await collectCandles(cache,info.market,unit,this.clock(),HISTORY_BARS,this.request);
+        this.progress('상위봉 캔들 수집·검증 완료');
         if(!changed)break;this.dirty.add(info.market);await sleep(135);
         if(assessHistory(cache,unit,this.clock()).ready)break;
       }
@@ -379,9 +385,9 @@ export class Radar {
     }
     await this.flush(true);return {market,name:info.koreanName,generatedAt:this.clock(),quote:this.quotes.get(market),frames};
   }
-  async cycle({maxMarkets=Infinity,retainLease=false}={}){if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
+  async cycle({maxMarkets=Infinity,retainLease=false}={}){this.stage('분석 잠금 확인');if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
     this.processing=true;this.emit({type:'started',at:this.clock()});let used=0;
-    try {await this.refreshMarkets();await this.refreshQuotes();await this.flush(true);
+    try {this.stage('분석 대상·시세 조회');await this.refreshMarkets();await this.refreshQuotes();await this.flush(true);
       const primaryAt=this.clock(),eligible=this.markets.filter(m=>!m.warned&&m.market!=='KRW-USDT');
       // 초기에는 모든 거래대금을 먼저 분류한다. 재실행은 DB 분류를 이어서 처리한다.
       const classify=eligible.filter(m=>this.states.get(m.market)?.turnover?.asOf!==endOf(60,this.clock())||!this.states.get(m.market)?.turnover?.ready);
@@ -397,7 +403,8 @@ export class Radar {
         if(this.clock()>=upperDeadline||endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
         await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000),maxPages:4});
       }
-    } finally {this.processing=false;try{await this.flush(true);}finally{if(!retainLease)await this.release();}this.emit({type:'completed',at:this.clock()});}
+    } finally {this.processing=false;try{await this.flush(true);}finally{if(!retainLease)await this.release();}}
+    this.progress('분석 회차 완료');this.emit({type:'completed',at:this.clock()});
   }
   async runDetail(){const market=this.detailQueue.shift();this.emit({type:'detail_started',market,at:this.clock()});try{this.emit({type:'detail',payload:await this.detail(market)});}catch(e){this.emit({type:'detail_error',market,message:e.message});}}
 }
