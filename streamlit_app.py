@@ -1,6 +1,7 @@
 # ST Buy 추적과 타겟 트렌드 가격이 완성된 추천을 구분해 표시한다.
 import atexit
 import hashlib
+import json
 import math
 import os
 import re
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from quant_worker import AnalysisWorker, SECRET_KEYS
+from quant_worker import AnalysisWorker, SECRET_KEYS, R2_SECRET_KEYS
 
 KST = timezone(timedelta(hours=9))
 FRAME_LABELS = {15: '단타·15분', 60: '스윙·1시간', 240: '4시간', 1440: '일봉'}
@@ -74,7 +75,7 @@ def credentials():
     if os.environ.get('QUANT_LOCAL_DB'):
         return {'QUANT_LOCAL_DB': os.environ['QUANT_LOCAL_DB']}
     values = {}
-    for key in SECRET_KEYS:
+    for key in SECRET_KEYS + R2_SECRET_KEYS:
         try:
             values[key] = str(st.secrets.get(key, os.environ.get(key, '')))
         except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
@@ -208,6 +209,33 @@ def render(worker):
     view = worker.snapshot()
     payload = view.get('payload')
     st.title('KRW 퀀트 레이더')
+    storage = view.get('storage') or {}
+    backup = storage.get('r2') or {}
+    if backup.get('enabled'):
+        st.caption(f"15분 정기 백업 · 중요 기록 별도 백업 · 마지막 R2 저장 {stamp(backup.get('lastBackupAt'))}")
+        if backup.get('error'):
+            st.warning(backup['error'])
+        if not backup.get('ready'):
+            st.warning('R2 백업 연결·복원 확인 중입니다. 아직 영구 백업 완료 상태가 아닙니다.')
+    elif storage:
+        st.warning('R2 미연결. D1 전송 실패 시 서버 내부 임시 저장만 가능하며 서버 교체 시 미전송 자료를 잃을 수 있습니다.')
+    if storage:
+        with st.expander('저장·백업 사용량'):
+            report = {'확인 시각': datetime.now(KST).isoformat(), 'D1': {'오늘 전송 예산 사용': storage.get('used'), '예산': storage.get('budget'), '대기 행': storage.get('pending'), '최근 집계': storage.get('d1Usage', {})}, 'R2': backup}
+            st.caption('이 서버가 기록한 집계입니다. 계정 전체 요금 통계는 Cloudflare에서 최종 확인해야 합니다. R2 저장 완료 전의 자료는 로컬에만 있을 수 있습니다.')
+            st.json(report)
+            st.download_button('사용량 기록 내려받기', json.dumps(report, ensure_ascii=False, indent=2), file_name='storage-usage.json', mime='application/json', key='storage_usage_download')
+    if storage.get('mode') == 'local':
+        st.warning(f"D1 전송 대기 · 로컬 DB 저장 사용 중 · 전송 대기 {storage.get('pending', 0)}행. 분석 중단 여부와는 별개입니다.")
+        st.caption('서버 임시 저장 후 R2로 백업합니다. R2 저장 성공 전의 자료는 서버 교체 시 유실될 수 있습니다.' if backup.get('enabled') else '서버의 db-buffer 폴더에 저장합니다. 서버 재생성·재배포 시 미전송 자료가 사라질 수 있습니다.')
+        if storage.get('retryAt'):
+            st.caption(f"다음 D1 전송 재시도 {stamp(storage['retryAt'])}")
+        if storage.get('reason'):
+            st.caption(storage['reason'])
+    elif storage.get('mode') == 'syncing':
+        st.caption(f"로컬 저장 완료 · D1에 전송 중 · {storage.get('pending', 0)}행 대기")
+    if storage and not storage.get('historyRestored'):
+        st.warning('D1 기존 기록 복원이 아직 끝나지 않았습니다. 로컬에 없는 과거 추천 이력은 복구 대기 중입니다.')
     if not payload or payload.get('version') != 7:
         st.info('새 분석 구조의 거래대금 분류와 ST·TT 검사를 시작하고 있습니다.')
         if view.get('error'):
@@ -322,7 +350,7 @@ def main():
         return
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ('engine.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs'):
+    for name in ('engine.mjs', 'buffered_storage.mjs', 'r2_client.mjs', 'r2_backup.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs'):
         digest.update((root / name).read_bytes())
     for k, v in sorted(config.items()):
         digest.update(f'{k}={v}'.encode())

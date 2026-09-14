@@ -12,6 +12,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 SECRET_KEYS = ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID', 'CLOUDFLARE_API_TOKEN')
+R2_SECRET_KEYS = ('CLOUDFLARE_R2_BUCKET', 'CLOUDFLARE_R2_ACCESS_KEY_ID', 'CLOUDFLARE_R2_SECRET_ACCESS_KEY')
 ANALYSIS_STALL_SECONDS = 180
 SUPERVISE_POLL_SECONDS = 1
 RESTART_DELAY_SECONDS = 60
@@ -171,6 +172,9 @@ class AnalysisWorker:
                 if event["type"] in {"detail", "detail_error"}:
                     state["checked_at"] = time.monotonic()
                     self._next_detail()
+            elif event["type"] == "storage":
+                # 원격 전송 상태는 분석 진척·중단 상태를 바꾸지 않는다.
+                self._state['storage'] = {k: event.get(k) for k in ('mode', 'reason', 'file', 'pending', 'retryAt', 'used', 'budget', 'historyRestored', 'lastSyncAt', 'r2', 'd1Usage')}
             elif event["type"] in {"stage", "progress"}:
                 self._state["stage"] = event["stage"]
                 if event["type"] == "progress":
@@ -210,7 +214,7 @@ class AnalysisWorker:
         for line in process.stdout:
             try:
                 event = json.loads(line)
-                if isinstance(event, dict) and event.get("type") in {"stage", "progress", "started", "snapshot", "completed", "waiting", "error", "detail", "detail_started", "detail_error"}:
+                if isinstance(event, dict) and event.get("type") in {"storage", "stage", "progress", "started", "snapshot", "completed", "waiting", "error", "detail", "detail_started", "detail_error"}:
                     self._accept(event)
             except (ValueError, KeyError, TypeError):
                 # 라이브러리 경고는 서버 로그에만 남기며 비밀을 포함한 원문을 화면에 보내지 않는다.

@@ -1,7 +1,9 @@
 // 전 종목 거래대금 수집과 ST 추적·TT 전용 추천을 증분 저장한다.
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { bufferedDatabase, mergePlanRows, mergeCohort } from './buffered_storage.mjs';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { SurgeBeta } from './surge_beta.mjs';
 import { VERSION, ST_SETTINGS, HISTORY_BARS, RETAINED_BARS, compactCandles, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
@@ -134,9 +136,11 @@ function remoteDatabase(config, transport = fetch, intervalMs = 350) {
   }
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${config.accountId}/d1/database/${config.databaseId}/query`;
   let nextRequestAt = 0;
+  let quotaError = null;
   let queue = Promise.resolve();
   return databaseAdapter((queries) => {
     const operation = queue.then(async () => {
+      if (quotaError && Date.now() < quotaError.retryAt) throw quotaError;
       await sleep(Math.max(0, nextRequestAt - Date.now()));
       nextRequestAt = Date.now() + intervalMs;
       const batch = queries.map(({ sql, params }) => ({ sql, params }));
@@ -160,7 +164,12 @@ function remoteDatabase(config, transport = fetch, intervalMs = 350) {
           : /daily row write limit/i.test(message) ? '일일 쓰기 한도 초과'
           : /daily row read limit/i.test(message) ? '일일 읽기 한도 초과'
           : [401, 403].includes(response.status) ? '인증·권한 확인 필요' : '요청 실패';
-        throw new Error(`D1 ${reason}(HTTP ${response.status}, 코드 ${failure?.code ?? 'unknown'}). ${message.replace(/[\r\n]+/g, ' ').slice(0, 200)}`);
+        const error = new Error(`D1 ${reason}(HTTP ${response.status}, 코드 ${failure?.code ?? 'unknown'}). ${message.replace(/[\r\n]+/g, ' ').slice(0, 200)}`);
+        if (/daily row (write|read) limit/i.test(message)) {
+          error.retryAt = (Math.floor(Date.now()/86400000)+1)*86400000+60000;
+          quotaError = error;
+        }
+        throw error;
       }
       return data.result.map((r) => ({ ...r, results: r.results ?? [] }));
     });
@@ -204,6 +213,9 @@ export async function ensureSchema(db) {
   ].map(s=>db.prepare(s)));
 }
 const parse = (text, fallback={}) => {try{return JSON.parse(text);}catch{return fallback;}};
+const fingerprint = text => createHash('sha256').update(text).digest('hex');
+// 원장 확인 위치만 바뀐 경우는 저장하지 않는다. 실제 진입·목표·손절 시각은 모두 비교한다.
+function planFingerprint(row){const copy=structuredClone(row);if(copy?.plan?.entryTracking)delete copy.plan.entryTracking.checkedThrough;return fingerprint(JSON.stringify(copy));}
 // 캔들 전체와 검증 메타데이터를 손실 없이 보존하며 구형 JSON도 읽는다.
 function encodeCache(cache){return JSON.stringify({encoding:'gzip-base64-v1',data:gzipSync(JSON.stringify(cache),{level:1}).toString('base64')});}
 function decodeCache(text){const value=JSON.parse(text);return value.encoding==='gzip-base64-v1'?JSON.parse(gunzipSync(Buffer.from(value.data,'base64')).toString('utf8')):value;}
@@ -250,24 +262,25 @@ export class Radar {
     this.markets=[];this.exclusions={ready:false};this.states=new Map();this.caches=new Map();this.plans=new Map();this.quotes=new Map();this.errors=[];this.processing=false;this.detailQueue=[];this.token=null;this.dirty=new Set();this.planDirty=new Set();this.lastSave=0;this.lastMarkets=0;this.lastQuote=0;
     this.progressAt=0;this.savedAt=0;this.activeStage='분석기 시작';
     this.beta=new SurgeBeta();
+    this.savedCaches=new Map();this.savedStates=new Map();this.savedPlans=new Map();this.marketSavedAt=new Map();
   }
   stage(label,market='',unit=null){this.activeStage=[label,market,unit===null?'':unit===1440?'일봉':unit+'분'].filter(Boolean).join(' · ');this.emit({type:'stage',at:this.clock(),stage:this.activeStage});}
   progress(label){this.progressAt=this.clock();this.activeStage=label;this.emit({type:'progress',at:this.progressAt,stage:label});}
   async init(){this.stage('저장 이력 불러오기');await ensureSchema(this.db);
-    for(const row of (await this.db.prepare('SELECT market,payload_json FROM radar_state').all()).results){const v=parse(row.payload_json);if(v.version===VERSION)this.states.set(row.market,v);}
-    for(const row of (await this.db.prepare('SELECT id,payload_json FROM radar_plans').all()).results){const v=parse(row.payload_json);if(v.plan?.id===row.id){this.plans.set(row.id,v);if(row.id.startsWith('v7:')&&UNITS.includes(v.unit)&&v.firstShownAt)this.registerUpper(v.market,v.firstShownAt);}}
-    const old=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(old&&parse(old.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(old.payload_json)});
+    for(const row of (await this.db.prepare('SELECT market,payload_json FROM radar_state').all()).results){const v=parse(row.payload_json);if(v.version===VERSION){const savedAt=v.storageSavedAt;delete v.storageSavedAt;this.states.set(row.market,v);this.savedStates.set(row.market,fingerprint(JSON.stringify(v)));if(Number.isFinite(savedAt)&&savedAt<=this.clock())this.marketSavedAt.set(row.market,savedAt);}}
+    for(const row of (await this.db.prepare('SELECT id,payload_json FROM radar_plans').all()).results){const v=parse(row.payload_json);if(v.plan?.id===row.id){this.plans.set(row.id,v);this.savedPlans.set(row.id,planFingerprint(v));if(row.id.startsWith('v7:')&&UNITS.includes(v.unit)&&v.firstShownAt)this.registerUpper(v.market,v.firstShownAt);}}
+    const old=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(old&&parse(old.payload_json).stSettings===ST_SETTINGS){const payload=parse(old.payload_json),savedAt=payload.pipeline?.savedAt;if(Number.isFinite(savedAt)&&savedAt<=this.clock()){this.snapshotSavedAt=savedAt;this.savedAt=savedAt;}this.emit({type:'snapshot',payload});}
     this.progress('저장 이력 불러오기 완료');
   }
   registerUpper(market,at){
     const state=this.states.get(market)??{version:VERSION,market,frames:{},trends:{}};
     if(!state.upperTracking){state.upperTracking={firstQualifiedAt:at,attempts:{}};this.states.set(market,state);this.dirty.add(market);}
   }
-  error(message){this.errors.push({at:this.clock(),message,stage:this.activeStage});this.errors=this.errors.slice(-12);this.emit({type:'error',at:this.clock(),message,stage:this.activeStage});}
+  error(value){const message=value instanceof Error?value.message:String(value);this.errors.push({at:this.clock(),message,stage:this.activeStage});this.errors=this.errors.slice(-12);this.emit({type:'error',at:this.clock(),message,stage:this.activeStage,retryAt:value?.retryAt});}
   async load(code){if(this.caches.has(code))return this.caches.get(code);
     let row=await this.db.prepare('SELECT candles_json FROM candle_cache WHERE market=?').bind(code).first();
     if(!row){const table=await this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_analysis'").first();if(table)row=await this.db.prepare('SELECT candles_json FROM market_analysis WHERE market=?').bind(code).first();}
-    const cache=row?decodeCache(row.candles_json):{};cache.verified??={};this.caches.set(code,cache);return cache;
+    const cache=row?decodeCache(row.candles_json):{};cache.verified??={};this.caches.set(code,cache);if(row)this.savedCaches.set(code,fingerprint(encodeCache(cache)));return cache;
   }
   async acquire(){if(this.token)return this.renew();const now=this.clock(),token=randomUUID();const row=await this.db.prepare('UPDATE scan_lease SET token=?, until_ms=?, last_run=? WHERE id=1 AND until_ms<=? RETURNING token').bind(token,now+180000,now,now).first();if(row?.token===token){this.token=token;this.leaseRenewedAt=now;return true;}return false;}
   async renew(){if(!this.token)return false;const now=this.clock();if(now>=this.leaseRenewedAt&&now-this.leaseRenewedAt<60000)return true;const row=await this.db.prepare('UPDATE scan_lease SET until_ms=? WHERE id=1 AND token=? RETURNING token').bind(this.clock()+180000,this.token).first();if(!row){this.token=null;throw new Error('분석 저장 잠금이 변경되었습니다. 다음 회차에 다시 연결합니다.');}this.leaseRenewedAt=now;return true;}
@@ -331,10 +344,22 @@ export class Radar {
         compactCandles(cache,unit,now,history);
       }
     }
-    const codes=[...this.dirty],ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[];codes.forEach(code=>{if(this.caches.has(code))queries.push(this.db.prepare('INSERT OR REPLACE INTO candle_cache VALUES (?,?)').bind(code,encodeCache(this.caches.get(code))));queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify(this.states.get(code))));});
-    ids.forEach(id=>{const row=this.plans.get(id);queries.unshift(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));});
-    for(let i=0;i<queries.length;i+=20){await this.db.batch(queries.slice(i,i+20));this.progress('분석 기록 저장 완료');}codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
-    const payload=this.snapshot();if(queries.length||!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){this.stage('화면 결과 DB 저장');payload.pipeline.savedAt=this.clock();await this.db.prepare('INSERT OR REPLACE INTO radar_snapshot VALUES (1,?)').bind(JSON.stringify(payload)).run();this.savedAt=payload.pipeline.savedAt;this.snapshotSavedAt=now;}this.lastSave=now;this.progress('분석 결과 확인 완료');payload.pipeline.progressAt=this.progressAt;this.emit({type:'snapshot',payload});
+    const codes=[...this.dirty].filter(code=>this.db.storageStatus||now-(this.marketSavedAt.get(code)??-Infinity)>=900000),ids=[...this.planDirty],planVersions=new Map(ids.map(id=>[id,JSON.stringify(this.plans.get(id))])),queries=[],saved=[];
+    for(const code of codes){
+      if(this.caches.has(code)){
+        const value=encodeCache(this.caches.get(code)),hash=fingerprint(value);
+        if(this.savedCaches.get(code)!==hash){queries.push(this.db.prepare('INSERT INTO candle_cache VALUES (?,?) ON CONFLICT(market) DO UPDATE SET candles_json=excluded.candles_json WHERE candle_cache.candles_json IS NOT excluded.candles_json').bind(code,value));saved.push([this.savedCaches,code,hash]);}
+      }
+      if(this.states.has(code)){
+        const value=JSON.stringify(this.states.get(code)),hash=fingerprint(value);
+        if(this.savedStates.get(code)!==hash||saved.some(s=>s[0]===this.savedCaches&&s[1]===code)){
+          queries.push(this.db.prepare('INSERT INTO radar_state VALUES (?,?) ON CONFLICT(market) DO UPDATE SET payload_json=excluded.payload_json').bind(code,JSON.stringify({...this.states.get(code),storageSavedAt:now})));saved.push([this.savedStates,code,hash]);
+        }
+      }
+    }
+    ids.forEach(id=>{const row=this.plans.get(id),hash=planFingerprint(row);if(this.savedPlans.get(id)!==hash){queries.unshift(this.db.prepare('INSERT INTO radar_plans VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(id,row.market,planVersions.get(id)));saved.push([this.savedPlans,id,hash]);}});
+    for(let i=0;i<queries.length;i+=20){await this.db.batch(queries.slice(i,i+20));this.progress('분석 기록 저장 완료');}saved.forEach(([map,code,hash])=>{map.set(code,hash);if(map===this.savedStates)this.marketSavedAt.set(code,now);});codes.forEach(c=>this.dirty.delete(c));ids.forEach(id=>{if(JSON.stringify(this.plans.get(id))===planVersions.get(id))this.planDirty.delete(id);});
+    const payload=this.snapshot();if(!this.snapshotSavedAt||now-this.snapshotSavedAt>=30000){this.stage('화면 결과 DB 저장');payload.pipeline.savedAt=this.clock();await this.db.prepare('INSERT INTO radar_snapshot VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json').bind(JSON.stringify(payload)).run();this.savedAt=payload.pipeline.savedAt;this.snapshotSavedAt=now;}this.lastSave=now;this.progress('분석 결과 확인 완료');payload.pipeline.progressAt=this.progressAt;this.emit({type:'snapshot',payload});
   }
   async collect(info,unit,desired){this.stage('캔들 캐시 조회',info.market,unit);const cache=await this.load(info.market);let changed=false;
     for(let pass=0;pass<3;pass++){this.stage('캔들 수집·검증',info.market,unit);const did=await collectCandles(cache,info.market,unit,this.clock(),desired,this.request);this.progress('캔들 수집·검증 완료');changed||=did;if(!did)break;await sleep(135);}
@@ -390,6 +415,9 @@ export class Radar {
     await this.flush(true);return {market,name:info.koreanName,generatedAt:this.clock(),quote:this.quotes.get(market),frames};
   }
   async cycle({maxMarkets=Infinity,retainLease=false}={}){this.stage('분석 잠금 확인');if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
+    const restored=this.db.takeRestored?.();
+    for(const row of restored?.plans??[]){const id=row.plan.id,merged=mergePlanRows(row,this.plans.get(id));if(JSON.stringify(merged)!==JSON.stringify(this.plans.get(id))){this.plans.set(id,merged);this.planDirty.add(id);}if(UNITS.includes(row.unit)&&row.firstShownAt)this.registerUpper(row.market,row.firstShownAt);}
+    for(const row of restored?.cohorts??[])this.beta.cohorts.set(row.id,mergeCohort(row,this.beta.cohorts.get(row.id)));
     this.processing=true;this.emit({type:'started',at:this.clock()});let used=0;
     try {this.stage('분석 대상·시세 조회');await this.refreshMarkets();await this.refreshQuotes();await this.flush(true);
       const primaryAt=this.clock(),eligible=this.markets.filter(m=>!m.warned&&m.market!=='KRW-USDT');
@@ -414,15 +442,24 @@ export class Radar {
   }
   async runDetail(){const market=this.detailQueue.shift();this.emit({type:'detail_started',market,at:this.clock()});try{this.emit({type:'detail',payload:await this.detail(market)});}catch(e){this.emit({type:'detail_error',market,message:e.message});}}
 }
-export { localDatabase, remoteDatabase, fetchKrwMarkets, fetchKrwTickers };
+export { localDatabase, remoteDatabase, fetchKrwMarkets, fetchKrwTickers, databaseAdapter };
 async function main(){const local=process.env.QUANT_LOCAL_DB?await localDatabase(process.env.QUANT_LOCAL_DB):null;
-  const db=local?.db??remoteDatabase({accountId:process.env.CLOUDFLARE_ACCOUNT_ID??'',databaseId:process.env.CLOUDFLARE_D1_DATABASE_ID??'',token:process.env.CLOUDFLARE_API_TOKEN??''});
-  const emit=v=>process.stdout.write(JSON.stringify(v)+'\n'),radar=new Radar(db,{emit});let stopping=false,quoteBusy=false;
+  const emit=v=>process.stdout.write(JSON.stringify(v)+'\n');
+  const config={accountId:process.env.CLOUDFLARE_ACCOUNT_ID??'',databaseId:process.env.CLOUDFLARE_D1_DATABASE_ID??'',token:process.env.CLOUDFLARE_API_TOKEN??''};
+  const identity=fingerprint(config.accountId+':'+config.databaseId).slice(0,24);
+  const r2Keys=['CLOUDFLARE_R2_BUCKET','CLOUDFLARE_R2_ACCESS_KEY_ID','CLOUDFLARE_R2_SECRET_ACCESS_KEY'];
+  const r2=r2Keys.every(k=>process.env[k])?{accountId:config.accountId,identity,bucket:process.env.CLOUDFLARE_R2_BUCKET,accessKey:process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,secretKey:process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY}:null;
+  const buffer=local?null:bufferedDatabase({remote:remoteDatabase(config),file:join(dirname(fileURLToPath(import.meta.url)),'db-buffer',identity+'.sqlite'),adapter:databaseAdapter,emit,r2});
+  const db=local?.db??buffer.db,radar=new Radar(db,{emit});let stopping=false,quoteBusy=false;
   process.on('SIGTERM',()=>{stopping=true;});process.on('SIGINT',()=>{stopping=true;});
   const input=createInterface({input:process.stdin});input.on('line',line=>{try{const c=JSON.parse(line);if(c.type==='detail'&&/^KRW-[A-Z0-9]{1,20}$/.test(c.market)&&!radar.detailQueue.includes(c.market))radar.detailQueue.push(c.market);}catch{}});
   await radar.init();
-  const timer=setInterval(async()=>{if(!radar.token||quoteBusy)return;quoteBusy=true;try{await radar.refreshMarkets();await radar.refreshQuotes();radar.beta.observe(radar);emit({type:'snapshot',payload:radar.snapshot()});}catch(e){radar.error(e.message);}finally{quoteBusy=false;}},10000);
-  try{do{try{await radar.cycle({maxMarkets:Number(process.env.QUANT_TEST_MAX_MARKETS)||Infinity,retainLease:true});}catch(e){radar.error(e.message);if(e.status===429||e.status===418)await sleep(60000);}if(process.argv.includes('--once'))break;for(let i=0;i<5&&!stopping;i++)await sleep(1000);}while(!stopping);}
-  finally{clearInterval(timer);while(quoteBusy)await sleep(50);try{await radar.release();}finally{input.close();local?.close();}}
+  if(buffer)void buffer.sync({bootstrapOnly:true}).catch(e=>radar.error(e));
+  if(buffer)void buffer.backup().catch(e=>radar.error(e));
+  const backupTimer=buffer?setInterval(()=>{void buffer.backup().catch(e=>radar.error(e));},1000):null;
+  const syncTimer=buffer?setInterval(()=>{void buffer.sync().catch(e=>radar.error(e));},5000):null;
+  const timer=setInterval(async()=>{if(!radar.token||quoteBusy)return;quoteBusy=true;try{await radar.refreshMarkets();await radar.refreshQuotes();radar.beta.observe(radar);if(radar.planDirty.size)await radar.flush(true);emit({type:'snapshot',payload:radar.snapshot()});}catch(e){radar.error(e.message);}finally{quoteBusy=false;}},10000);
+  try{do{try{await radar.cycle({maxMarkets:Number(process.env.QUANT_TEST_MAX_MARKETS)||Infinity,retainLease:true});}catch(e){radar.error(e);if(e.status===429||e.status===418)await sleep(60000);}if(process.argv.includes('--once'))break;for(let i=0;i<5&&!stopping;i++)await sleep(1000);}while(!stopping);}
+  finally{clearInterval(timer);clearInterval(syncTimer);clearInterval(backupTimer);while(quoteBusy)await sleep(50);try{await radar.release();}finally{input.close();local?.close();if(buffer)await buffer.close();}}
 }
-if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(e=>{process.stdout.write(JSON.stringify({type:'error',at:Date.now(),message:e.message})+'\n');process.exitCode=1;});
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(e=>{process.stdout.write(JSON.stringify({type:'error',at:Date.now(),message:e.message,retryAt:e.retryAt})+'\n');process.exitCode=1;});
