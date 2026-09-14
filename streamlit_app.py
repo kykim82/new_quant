@@ -141,6 +141,62 @@ def toggle_promising():
     st.session_state['promising_open'] = not st.session_state.get('promising_open', True)
 
 
+def beta_table(rows):
+    result = []
+    for row in rows:
+        q = row.get('quote') or {}
+        value = q.get('tradePrice')
+        entry = row['entryPrice']
+        result.append({'순위': row['rank'], '종목': symbol(row), '시험 점수': row['score'],
+                       '선정가': entry, '현재가': value, '시세 시각': stamp(q.get('timestamp'), True) if value else '확인 중',
+                       '선정 후(%)': (value / entry - 1) * 100 if value else None,
+                       '관측 최고(%)': (row['windows']['72']['high'] / entry - 1) * 100,
+                       '선정 이유': row['reason']})
+    return pd.DataFrame(result)
+
+
+def draw_beta(payload):
+    st.subheader('3. 급등 코인 · 베타')
+    st.caption('급등 준비 가설 점수입니다. 상승 확률·매수 추천이 아닙니다. 하루 한 번 최대 10종목을 고정해 24·72시간 관찰합니다.')
+    beta = payload.get('surgeBeta') or {}
+    if beta.get('error'):
+        st.warning(beta['error'])
+    if beta.get('selectedAt'):
+        st.caption(f"선정 {stamp(beta['selectedAt'])} · 최근 DB 저장 {stamp(beta.get('savedAt'))}")
+        if beta.get('stale'):
+            st.caption('분석 연결 확인 중입니다. 선정 당시 기록은 유지하며 최신 시세가 없는 칸은 비워 둡니다.')
+        rows = beta.get('rows') or []
+        if rows:
+            frame = beta_table(rows)
+            st.dataframe(frame.style.format({'선정가': price, '현재가': price,
+                '선정 후(%)': '{:+.2f}', '관측 최고(%)': '{:+.2f}'}, na_rep='—'),
+                hide_index=True, width='stretch', key='surge_beta_candidates')
+        else:
+            st.info('오늘 전체 검사를 마쳤지만 시험 기준에 맞는 후보가 없습니다. 다음 일봉에서 다시 선정합니다.')
+    else:
+        st.info(f"베타 일봉 확인 {beta.get('scanned', 0)}/{beta.get('total', 0)}종목. 기존 추천 분석 후 나누어 수집하며, 전체 확인이 끝나면 후보를 확정합니다.")
+    with st.expander('베타 관찰 기록·시험 기준'):
+        st.write('7·20일선 상승과 모임, 이평선 부근 가격 유지, 장기선 회복, 거래량 유입·축소를 점수화합니다. 점수 50 이상 중 최대 10개이며 10개를 강제로 채우지 않습니다.')
+        st.write('당일·직전 3일에 시가 대비 고가 +30%가 있었거나, 현재가가 20일선보다 +12%·5일 전 종가보다 +20%를 초과하면 새 준비 후보에서 제외합니다. 기존 추천 조건에는 적용하지 않습니다.')
+        st.caption('관측 최고는 선정 이후 받은 시세와 선정 이후 시작된 완료 1시간봉 기준입니다. 초기 부분 시간·중단 구간의 최고가는 놓칠 수 있습니다. 24·72시간 변화는 종료 시각 이후 2분 이내 시세가 있을 때만 기록하며, 수수료 미반영 관찰값입니다.')
+        history = []
+        for cohort in beta.get('history', []):
+            for row in [*cohort['selected'], *cohort.get('controls', [])]:
+                a, b = row['windows']['24'], row['windows']['72']
+                history.append({'선정일': cohort['day'], '구분': '후보' if row['role'] == 'candidate' else '비선정 비교군',
+                    '종목': symbol(row), '선정가': row['entryPrice'],
+                    '24시간 변화(%)': (a['returnPrice'] / row['entryPrice'] - 1) * 100 if a.get('returnPrice') else None,
+                    '72시간 변화(%)': (b['returnPrice'] / row['entryPrice'] - 1) * 100 if b.get('returnPrice') else None,
+                    '72시간 관측 최고(%)': (b['high'] / row['entryPrice'] - 1) * 100,
+                    '+30% 관측': '있음' if b.get('hit30At') else '관측 없음',
+                    '상태': '72시간 경과' if b.get('closed') else '관찰 중'})
+        if history:
+            st.dataframe(pd.DataFrame(history).style.format({'선정가': price,
+                '24시간 변화(%)': '{:+.2f}', '72시간 변화(%)': '{:+.2f}', '72시간 관측 최고(%)': '{:+.2f}'}, na_rep='—'),
+                hide_index=True, width='stretch', key='surge_beta_history')
+        st.caption('최근 7일 기록을 표시합니다. 이전 기록은 별도 DB 표에 보존합니다. 비교군도 선정 당시에 고정하며 아직 오르지 않았다고 미리 분류한 종목이 아닙니다.')
+
+
 def render(worker):
     view = worker.snapshot()
     payload = view.get('payload')
@@ -247,8 +303,7 @@ def render(worker):
             st.dataframe(pd.DataFrame([{'종목': symbol(r), '현재가': quote_label(r), '24시간 거래대금': turnover((r.get('quote') or {}).get('quoteVolume24h')), '선정 이유': r['reason']} for r in payload['promising'][:20]]), hide_index=True, width='stretch')
         else:
             st.info('현재 유망 조건을 충족한 종목이 없거나 거래대금을 분류 중입니다.')
-    st.subheader('3. 급등 코인')
-    st.caption('별도 급등 예측 규칙은 아직 설정하지 않았습니다.')
+    draw_beta(payload)
     draw_detail(worker)
 
 
@@ -260,7 +315,7 @@ def main():
         return
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ('engine.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py'):
+    for name in ('engine.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs'):
         digest.update((root / name).read_bytes())
     for k, v in sorted(config.items()):
         digest.update(f'{k}={v}'.encode())

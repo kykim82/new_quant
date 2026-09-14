@@ -72,6 +72,13 @@ def public_snapshot(state, now_ms=None):
     payload['promising'] = [r for r in payload.get('promising', []) if allowed and r.get('market') not in excluded
                             and r.get('turnover', {}).get('asOf') == now_ms // 3_600_000 * 3_600_000]
     payload['stale'] = not fresh_payload(payload, now_ms)
+    beta = payload.get('surgeBeta')
+    if beta:
+        beta['stale'] = payload['stale']
+        for row in beta.get('rows', []):
+            q = row.get('quote') or {}
+            if not 0 <= now_ms - q.get('receivedAt', 0) <= 45_000:
+                row['quote'] = None
     return view
 
 

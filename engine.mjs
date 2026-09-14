@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { SurgeBeta } from './surge_beta.mjs';
 import { VERSION, ST_SETTINGS, HISTORY_BARS, RETAINED_BARS, compactCandles, assessHistory, UNITS, RECOMMEND_UNITS, endOf, rawBars, validBar, covered, mergeRanges, turnoverClass, evaluateMarket, promisingMarket, pricePlan, observePlan, rsi, sma } from './quant_core.mjs';
 // lib/upbit.ts
 var API_BASE = "https://api.upbit.com/v1";
@@ -92,6 +93,8 @@ async function fetchKrwTickers() {
     receivedAt,
     market: item.market,
     tradePrice: item.trade_price,
+    dayOpen: item.opening_price,
+    dayHigh: item.high_price,
     signedChangeRate: item.signed_change_rate,
     quoteVolume24h: item.acc_trade_price_24h,
     timestamp: item.timestamp
@@ -246,6 +249,7 @@ export class Radar {
     this.db=db;this.request=request;this.getMarkets=markets;this.getTickers=tickers;this.emit=emit;this.clock=clock;
     this.markets=[];this.exclusions={ready:false};this.states=new Map();this.caches=new Map();this.plans=new Map();this.quotes=new Map();this.errors=[];this.processing=false;this.detailQueue=[];this.token=null;this.dirty=new Set();this.planDirty=new Set();this.lastSave=0;this.lastMarkets=0;this.lastQuote=0;
     this.progressAt=0;this.savedAt=0;this.activeStage='분석기 시작';
+    this.beta=new SurgeBeta();
   }
   stage(label,market='',unit=null){this.activeStage=[label,market,unit===null?'':unit===1440?'일봉':unit+'분'].filter(Boolean).join(' · ');this.emit({type:'stage',at:this.clock(),stage:this.activeStage});}
   progress(label){this.progressAt=this.clock();this.activeStage=label;this.emit({type:'progress',at:this.progressAt,stage:label});}
@@ -316,7 +320,7 @@ export class Radar {
       if(exclusionReady){const p=cache?promisingMarket(info,cache,turnover,this.quotes.get(info.market),now):group==='low'?state?.promising:null;if(p)promising.push({...p,quote:this.quotes.get(info.market)??p.quote});}
     }
     rows.sort((a,b)=>b.score-a.score||(b.turnover.average3d-a.turnover.average3d)||a.market.localeCompare(b.market));
-    return {version:VERSION,stSettings:ST_SETTINGS,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,pipeline:{progressAt:this.progressAt,savedAt:this.savedAt,stage:this.activeStage},exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
+    return {version:VERSION,stSettings:ST_SETTINGS,generatedAt:now,analysisAt:Math.max(0,...[...this.states.values()].map(s=>s.checkedAt??0)),processing:this.processing,pipeline:{progressAt:this.progressAt,savedAt:this.savedAt,stage:this.activeStage},exclusions:{...this.exclusions,ready:exclusionReady},total:this.markets.length,excluded:this.markets.filter(m=>m.warned||m.market==='KRW-USDT').map(m=>({market:m.market,name:m.koreanName,reason:m.market==='KRW-USDT'?'테더 제외':m.exclusionReason})),coverage:{total:eligible.length,high:details.filter(d=>d.group==='high').length,low:details.filter(d=>d.group==='low').length,pending:details.filter(d=>d.group==='pending').length},details,rows,waiting,promising:promising.sort((a,b)=>b.score-a.score),history:[...this.plans.values()].filter(p=>p.firstShownAt).sort((a,b)=>b.firstShownAt-a.firstShownAt).slice(0,100),surgeBeta:this.beta.snapshot(this),errors:this.errors.slice(-5),lastQuoteAt:this.lastQuote};
   }
   async flush(force=false){if(!this.token)return;const now=this.clock();if(!force&&now-this.lastSave<3000)return;this.stage('분석 결과 DB 저장');await this.renew();
     // 가격 추적을 먼저 갱신·저장한 뒤 같은 캐시 안의 누적 상태와 최근 봉을 교체한다.
@@ -403,6 +407,8 @@ export class Radar {
         if(this.clock()>=upperDeadline||endOf(15,this.clock())!==endOf(15,primaryAt))break;const job=this.upperQueue()[0];if(!job)break;
         await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000),maxPages:4});
       }
+      if(endOf(15,this.clock())===endOf(15,primaryAt))
+        await this.beta.run(this,(cache,market,now)=>collectCandles(cache,market,1440,now,63,this.request));
     } finally {this.processing=false;try{await this.flush(true);}finally{if(!retainLease)await this.release();}}
     this.progress('분석 회차 완료');this.emit({type:'completed',at:this.clock()});
   }
@@ -415,7 +421,7 @@ async function main(){const local=process.env.QUANT_LOCAL_DB?await localDatabase
   process.on('SIGTERM',()=>{stopping=true;});process.on('SIGINT',()=>{stopping=true;});
   const input=createInterface({input:process.stdin});input.on('line',line=>{try{const c=JSON.parse(line);if(c.type==='detail'&&/^KRW-[A-Z0-9]{1,20}$/.test(c.market)&&!radar.detailQueue.includes(c.market))radar.detailQueue.push(c.market);}catch{}});
   await radar.init();
-  const timer=setInterval(async()=>{if(!radar.token||quoteBusy)return;quoteBusy=true;try{await radar.refreshMarkets();await radar.refreshQuotes();emit({type:'snapshot',payload:radar.snapshot()});}catch(e){radar.error(e.message);}finally{quoteBusy=false;}},10000);
+  const timer=setInterval(async()=>{if(!radar.token||quoteBusy)return;quoteBusy=true;try{await radar.refreshMarkets();await radar.refreshQuotes();radar.beta.observe(radar);emit({type:'snapshot',payload:radar.snapshot()});}catch(e){radar.error(e.message);}finally{quoteBusy=false;}},10000);
   try{do{try{await radar.cycle({maxMarkets:Number(process.env.QUANT_TEST_MAX_MARKETS)||Infinity,retainLease:true});}catch(e){radar.error(e.message);if(e.status===429||e.status===418)await sleep(60000);}if(process.argv.includes('--once'))break;for(let i=0;i<5&&!stopping;i++)await sleep(1000);}while(!stopping);}
   finally{clearInterval(timer);while(quoteBusy)await sleep(50);try{await radar.release();}finally{input.close();local?.close();}}
 }
