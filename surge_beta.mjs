@@ -1,8 +1,10 @@
-// 급등 준비 가설 점수와 하루 고정 후보·비선정 비교군의 관측 결과를 별도 보존한다.
+// 실제 급등 전 사례의 유사 후보와 하루 고정 평가 원장·비선정 비교군을 보존한다.
 import {createHash} from 'node:crypto';
 import {endOf, rawBars, covered, sma, mean} from './quant_core.mjs';
+import {preSurgeFeatures, priorRise, matchSurgePattern, MIN_SIMILARITY} from './surge_patterns.mjs';
+import {SURGE_TEMPLATES} from './surge_templates.mjs';
 
-export const BETA_RULE = 'surge-preparation-v1';
+export const BETA_RULE = 'surge-pattern-v2';
 export const DAY = 86400000;
 const HOUR = 3600000;
 const pct = (value, base) => (value / base - 1) * 100;
@@ -29,26 +31,22 @@ export function inspectBeta(market, cache, quote, now) {
     const old = sma(bars, n, 3); return [n, old === null ? null : ma[n] - old];
   }));
   const current = quote.tradePrice, distance20 = pct(current, ma[20]), rise5 = pct(current, bars.at(-6).close);
-  const recentSurge = bars.slice(-3).some(b => b.high / b.open >= 1.3) || quote.dayHigh / quote.dayOpen >= 1.3;
+  const riseHistory = priorRise(bars, {open:quote.dayOpen,high:quote.dayHigh,openTime:end});
+  const recentSurge = riseHistory.alreadyRisen;
   const baseline = mean(bars.slice(-25, -5).map(b => b.baseVolume));
   const volume3 = baseline > 0 ? mean(bars.slice(-3).map(b => b.baseVolume)) / baseline : null;
   const volume5 = baseline > 0 ? mean(bars.slice(-5).map(b => b.baseVolume)) / baseline : null;
   const evidence = {dailyThrough: end, dailyBars: bars.length, ma, slopes, distance20, rise5, recentSurge,
-    volume3, volume5, price: current, quoteAt: quote.receivedAt};
+    volume3, volume5, riseHistory, price: current, quoteAt: quote.receivedAt};
   if (recentSurge || distance20 > 12 || rise5 > 20)
     return {...base, ready: true, eligible: false, score: 0, evidence, reason: '이미 큰 상승 · 새 준비 후보 제외'};
-  let score = 0;
-  const reasons = [], add = (points, reason) => {score += points; reasons.push(reason);};
-  if (slopes[7] > 0) add(15, '7일선 상승');
-  if (slopes[20] > 0) add(20, '20일선 상승');
-  const gap = pct(ma[7], ma[20]);
-  if (gap >= -3 && gap <= 8) add(15, '단기 이평선 모임');
-  if ([7,20].some(n => current >= ma[n] * .99 && current <= ma[n] * 1.03)) add(20, '7·20일선 부근 유지');
-  if ([60,100].some(n => ma[n] !== null && current >= ma[n] && current <= ma[n] * 1.05))
-    add(15, '장기 이평선 부근 회복');
-  if (volume3 !== null && (volume3 >= 1.5 || volume5 >= 1.5 && volume3 < volume5))
-    add(15, volume3 >= 1.5 ? '최근 거래량 유입' : '거래량 유입 후 축소');
-  return {...base, ready: true, eligible: true, score, evidence, reason: reasons.join(' · ') || '준비 근거 약함',
+  const features = preSurgeFeatures(bars, end);
+  if (!features) return {...base, reason:'패턴 비교용 연속 일봉·거래량 확인 필요', evidence};
+  const pattern = matchSurgePattern(features, SURGE_TEMPLATES, now, market.market);
+  Object.assign(evidence, {features,pattern});
+  const reason = pattern.matches.map(m=>m.name+' '+m.date.slice(5)).join(' · ');
+  return {...base, ready: true, eligible: pattern.available >= 3, score:pattern.score, evidence,
+    reason:pattern.available >= 3 ? reason+' 급등 전과 유사' : '서로 다른 과거 비교 사례 3개 미만',
     quote, quoteVolume24h: quote.quoteVolume24h};
 }
 
@@ -56,7 +54,7 @@ export function makeBetaCohort(assessments, now) {
   const pool = assessments.filter(a => a.ready && a.eligible);
   const ranked = [...pool].sort((a,b) => b.score - a.score
     || (b.quoteVolume24h ?? 0) - (a.quoteVolume24h ?? 0) || a.market.localeCompare(b.market));
-  const selected = ranked.filter(a => a.score >= 50).slice(0, 10), markets = new Set(selected.map(a => a.market));
+  const selected = ranked.filter(a => a.score >= MIN_SIMILARITY).slice(0, 10), markets = new Set(selected.map(a => a.market));
   const day = betaDay(now), hash = a => createHash('sha256').update(day + ':' + a.market).digest('hex');
   const controls = pool.filter(a => !markets.has(a.market)).sort((a,b) => hash(a).localeCompare(hash(b))).slice(0, 10);
   const record = (a, role, index) => ({market: a.market, name: a.name, role, rank: index + 1, score: a.score,
@@ -76,6 +74,12 @@ export function observeBeta(cohort, caches, quotes, now) {
   const next = structuredClone(cohort);
   for (const row of [...next.selected, ...next.controls]) {
     const quote = quotes.get(row.market), bars = rawBars(caches.get(row.market), 60, now);
+    if (cohort.rule === BETA_RULE && !row.preparationEndedAt && freshBetaQuote(quote, now)
+        && positive(quote.dayOpen) && positive(quote.dayHigh)) {
+      const daily = rawBars(caches.get(row.market), 1440, endOf(1440, now));
+      if (daily.length >= 20 && priorRise(daily, {open:quote.dayOpen,high:quote.dayHigh,openTime:endOf(1440,now)}).alreadyRisen)
+        row.preparationEndedAt = now;
+    }
     for (const [hours, window] of Object.entries(row.windows)) {
       const until = row.selectedAt + Number(hours) * HOUR;
       const observe = (high, low, at) => {
@@ -199,9 +203,12 @@ export class SurgeBeta {
     const display = row => ({...publicRow(row), quote: freshBetaQuote(radar.quotes.get(row.market), now) ? radar.quotes.get(row.market) : null});
     return {rule: BETA_RULE, experimental: true, error: this.error, storageReady: this.ready,
       scanned: this.scanned, total: this.total, selectedAt: current?.selectedAt ?? null,
-      savedAt: current?.savedAt ?? null, rows: current?.selected.map(display) ?? [],
+      savedAt: current?.savedAt ?? null,
+      templateCount:SURGE_TEMPLATES.length, templateMarkets:new Set(SURGE_TEMPLATES.map(t=>t.market)).size,
+      rows: current?.selected.filter(r=>!r.preparationEndedAt && !r.windows[72].hit30At).map(display) ?? [],
+      progressed: current?.selected.filter(r=>r.preparationEndedAt || r.windows[72].hit30At).length ?? 0,
       history: [...this.cohorts.values()].sort((a,b) => b.selectedAt - a.selectedAt).map(c => ({
-        day: c.day, selectedAt: c.selectedAt, savedAt: c.savedAt, selected: c.selected.map(publicRow), controls: c.controls.map(publicRow)
+        rule:c.rule, day: c.day, selectedAt: c.selectedAt, savedAt: c.savedAt, selected: c.selected.map(publicRow), controls: c.controls.map(publicRow)
       }))};
   }
 }
