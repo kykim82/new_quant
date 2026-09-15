@@ -148,21 +148,31 @@ def beta_table(rows):
         q = row.get('quote') or {}
         value = q.get('tradePrice')
         entry = row['entryPrice']
-        result.append({'순위': row['rank'], '종목': symbol(row), '패턴 유사도': row['score'],
+        result.append({'순위': row['rank'], '종목': symbol(row), '공통점 일치': row.get('commonHits', 0),
                        '선정가': entry, '현재가': value, '시세 시각': stamp(q.get('timestamp'), True) if value else '확인 중',
                        '선정 후(%)': (value / entry - 1) * 100 if value else None,
                        '관측 최고(%)': (row['windows']['72']['high'] / entry - 1) * 100,
-                       '닮은 급등 전 사례': row['reason']})
+                       '최근 1시간 흐름': row.get('flowLabel', '확인 중'), '일치 근거': row['reason']})
     return pd.DataFrame(result)
 
 
 def draw_beta(payload):
     st.subheader('3. 급등 코인 · 베타')
-    st.caption('실제 급등 전 1~3일의 일봉 패턴과 비교합니다. 유사도는 상승 확률이 아닙니다. 하루 최대 10개를 선정해 24·72시간 관찰합니다.')
+    st.caption('누적 급등 사례의 전일 공통점과 비교해 하루 최대 10개를 선정합니다. 일치 개수는 상승 확률이 아닙니다.')
     beta = payload.get('surgeBeta') or {}
-    if beta.get('rule') and beta['rule'] != 'surge-pattern-v2':
-        st.info('이전 시험 점수를 새 패턴 유사도로 다시 분석 중입니다. 기존 기록은 보존합니다.')
+    if beta.get('rule') and beta['rule'] != 'surge-common-v1':
+        st.info('누적 공통점 기준으로 전환 중입니다. 이전 시험 기록은 보존합니다.')
         return
+    research = beta.get('research') or {}
+    criterion = beta.get('criterion') or research
+    if criterion.get('through'):
+        st.caption(f"적용 사례 일봉 {criterion['through']}까지 · 누적 {criterion.get('cases', 0)}건 · 일봉 비교 가능 {criterion.get('dailyReady', 0)}건 · 기준 생성 {stamp(criterion.get('createdAt'))}")
+    if research.get('stage'):
+        st.info(research['stage'] + '. 완료 후 이전 기준 검증과 새 공통점 갱신을 순서대로 수행합니다.')
+    if research.get('error'):
+        st.warning('급등 연구 갱신 재시도 대기. ' + research['error'])
+    if research and not research.get('current'):
+        st.info('최신 완료 일자 연구가 아직 끝나지 않았습니다. 새 일자 후보 확정은 대기하며 기존 기록은 보존합니다.')
     if beta.get('error'):
         st.warning(beta['error'])
     if beta.get('selectedAt'):
@@ -175,6 +185,7 @@ def draw_beta(payload):
         if rows:
             frame = beta_table(rows)
             st.dataframe(frame.style.format({'선정가': price, '현재가': price,
+                '공통점 일치': lambda n: f"{int(n)}/{rows[0].get('commonTotal', 0)}",
                 '선정 후(%)': '{:+.2f}', '관측 최고(%)': '{:+.2f}'}, na_rep='—'),
                 hide_index=True, width='stretch', key='surge_beta_candidates')
         else:
@@ -182,9 +193,19 @@ def draw_beta(payload):
     else:
         st.info(f"베타 일봉 확인 {beta.get('scanned', 0)}/{beta.get('total', 0)}종목. 기존 추천 분석 후 나누어 수집하며, 전체 확인이 끝나면 후보를 확정합니다.")
     with st.expander('베타 관찰 기록·시험 기준'):
-        st.write(f"실제 급등 {beta.get('templateMarkets', 0)}종목의 사전 모습 {beta.get('templateCount', 0)}개를 사용합니다. 가격 위치·이평선 배열/기울기·가격 변동폭·거래량 변화를 비교하며, 서로 다른 가까운 사례 3개의 평균 유사도 70 이상 중 최대 10개를 선정합니다.")
+        st.write('매일 한국시간 09시 이후 완료 일봉의 시가 대비 장중 고가 +30% 이상 사례를 서버에서 수집합니다. 이전 기준을 먼저 검증한 뒤 새 사례를 합쳐 공통점을 갱신합니다. 이력 부족 사례도 저장하고 통계에서는 미확인으로 구분합니다.')
+        st.write('확인 가능한 사례 5건 이상에서 70% 이상 반복된 특징을 잠정 공통점으로 삼습니다. 일치 개수가 많은 순이며, 동점은 확인 항목 수 → 최근 완료 1시간 가격·거래량 동반 상승 → 최근 3일 상대 거래량 → 24시간 거래대금 순입니다. 미확인 항목은 일치로 세지 않습니다.')
+        st.caption('1시간 흐름은 양봉·직전 종가 상승·직전 20시간 평균보다 거래량 증가 여부입니다. 매수 체결 비율이나 순매수 금액을 측정한 값은 아닙니다.')
+        common = criterion.get('features') or research.get('common') or []
+        if common:
+            st.dataframe(pd.DataFrame([{'공통점': f['label'], '사례 재현': f"{f['hits']}/{f['total']}", '미확인': f['missing']} for f in common]), hide_index=True, width='stretch')
+        assessment = research.get('assessment')
+        if assessment:
+            st.caption(f"기존 기준 {assessment['baselineThrough']} 검증 · 새 급등 사례 {assessment['newCases']}건. 재현 빈도는 급등 확률·매수 승률이 아닙니다.")
+            if not assessment.get('beforeNewDays'):
+                st.caption('기준 생성이 새 사례 일봉 시작 이후여서 엄격한 하루 전체 사전 검증과 구분합니다.')
         st.write('최근 20개 일봉·당일에 시가 또는 선행 저가 대비 고가 +30% 이상 오른 종목은 반락해도 제외합니다. 현재가의 20일선 +12%·5일 전 종가 +20% 초과도 제외합니다. 기존 추천·유망 조건에는 적용하지 않습니다.')
-        st.caption('사례와 후보는 기준일 이전 완료 일봉만 사용합니다. 사례 수와 검증 기간이 짧은 베타이며, 기간·문턱값은 검증된 최적값이 아닙니다. 새 사례는 검토 후 비교 자료에 추가합니다.')
+        st.caption('사례는 급등일 이전, 후보는 선정일 이전 완료 일봉만 비교합니다. 매일 확정한 기준과 후보는 고정하며 과거 성과를 새 기준으로 덮어쓰지 않습니다. 재급등 사례도 포함한 전체 공통점이므로 미상승 후보의 예측 성능은 별도 검증이 필요합니다.')
         st.caption('관측 최고는 선정 이후 받은 시세와 선정 이후 시작된 완료 1시간봉 기준입니다. 초기 부분 시간·중단 구간의 최고가는 놓칠 수 있습니다. 24·72시간 변화는 종료 시각 이후 2분 이내 시세가 있을 때만 기록하며, 수수료 미반영 관찰값입니다.')
         history = []
         for cohort in beta.get('history', []):
@@ -350,7 +371,7 @@ def main():
         return
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ('engine.mjs', 'buffered_storage.mjs', 'r2_client.mjs', 'r2_backup.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs'):
+    for name in ('engine.mjs', 'buffered_storage.mjs', 'r2_client.mjs', 'r2_backup.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs', 'surge_common.mjs', 'surge_common_rules.mjs', 'surge_study.mjs', 'surge_common_seed.json', 'surge_indicator_baseline.txt'):
         digest.update((root / name).read_bytes())
     for k, v in sorted(config.items()):
         digest.update(f'{k}={v}'.encode())

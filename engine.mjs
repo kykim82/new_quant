@@ -416,6 +416,7 @@ export class Radar {
   }
   async cycle({maxMarkets=Infinity,retainLease=false}={}){this.stage('분석 잠금 확인');if(!await this.acquire()){const row=await this.db.prepare('SELECT payload_json FROM radar_snapshot WHERE id=1').first();if(row&&parse(row.payload_json).stSettings===ST_SETTINGS)this.emit({type:'snapshot',payload:parse(row.payload_json)});this.emit({type:'waiting',message:'다른 실행이 수집한 저장 결과를 확인 중입니다.'});return;}
     const restored=this.db.takeRestored?.();
+    this.beta.research.clock=this.clock;void this.beta.research.tick(this.db);
     for(const row of restored?.plans??[]){const id=row.plan.id,merged=mergePlanRows(row,this.plans.get(id));if(JSON.stringify(merged)!==JSON.stringify(this.plans.get(id))){this.plans.set(id,merged);this.planDirty.add(id);}if(UNITS.includes(row.unit)&&row.firstShownAt)this.registerUpper(row.market,row.firstShownAt);}
     for(const row of restored?.cohorts??[])this.beta.cohorts.set(row.id,mergeCohort(row,this.beta.cohorts.get(row.id)));
     this.processing=true;this.emit({type:'started',at:this.clock()});let used=0;
@@ -436,7 +437,7 @@ export class Radar {
         await this.processUpper(job.info,job.unit,{deadline:Math.min(upperDeadline,this.clock()+3000),maxPages:4});
       }
       if(endOf(15,this.clock())===endOf(15,primaryAt))
-        await this.beta.run(this,(cache,market,now)=>collectCandles(cache,market,1440,now,63,this.request));
+        await this.beta.run(this,(cache,market,now)=>collectCandles(cache,market,1440,now,400,this.request));
     } finally {this.processing=false;try{await this.flush(true);}finally{if(!retainLease)await this.release();}}
     this.progress('분석 회차 완료');this.emit({type:'completed',at:this.clock()});
   }

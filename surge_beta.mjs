@@ -1,10 +1,10 @@
 // 실제 급등 전 사례의 유사 후보와 하루 고정 평가 원장·비선정 비교군을 보존한다.
 import {createHash} from 'node:crypto';
 import {endOf, rawBars, covered, sma, mean} from './quant_core.mjs';
-import {preSurgeFeatures, priorRise, matchSurgePattern, MIN_SIMILARITY} from './surge_patterns.mjs';
-import {SURGE_TEMPLATES} from './surge_templates.mjs';
+import {priorRise} from './surge_patterns.mjs';
+import {CommonResearch,SEED,latestRecord,dailyDescription,scoreCommon,completedDate} from './surge_common.mjs';
 
-export const BETA_RULE = 'surge-pattern-v2';
+export const BETA_RULE = 'surge-common-v1';
 export const DAY = 86400000;
 const HOUR = 3600000;
 const pct = (value, base) => (value / base - 1) * 100;
@@ -15,10 +15,11 @@ export function freshBetaQuote(quote, now) {
     && now >= quote.receivedAt && now - quote.receivedAt <= 45000;
 }
 
-export function inspectBeta(market, cache, quote, now) {
+export function inspectBeta(market, cache, quote, now, record=latestRecord(SEED)) {
   const end = endOf(1440, now), meta = cache?.verified?.[1440], bars = rawBars(cache, 1440, end);
   const base = {market: market.market, name: market.koreanName, inspected: false, ready: false};
   if (!meta || meta.checkedThrough < end) return {...base, reason: '일봉 수집 중'};
+  if(bars.length<400&&!meta.exhausted)return {...base,reason:'장기 공통점 비교용 일봉 수집 중'};
   base.inspected = true;
   if (bars.length < 63) return {...base, reason: '일봉 이력 부족'};
   if (!covered(cache, 1440, bars.at(-63).openTime, end) || bars.at(-1).closeTime !== end)
@@ -40,34 +41,48 @@ export function inspectBeta(market, cache, quote, now) {
     volume3, volume5, riseHistory, price: current, quoteAt: quote.receivedAt};
   if (recentSurge || distance20 > 12 || rise5 > 20)
     return {...base, ready: true, eligible: false, score: 0, evidence, reason: '이미 큰 상승 · 새 준비 후보 제외'};
-  const features = preSurgeFeatures(bars, end);
-  if (!features) return {...base, reason:'패턴 비교용 연속 일봉·거래량 확인 필요', evidence};
-  const pattern = matchSurgePattern(features, SURGE_TEMPLATES, now, market.market);
-  Object.assign(evidence, {features,pattern});
-  const reason = pattern.matches.map(m=>m.name+' '+m.date.slice(5)).join(' · ');
-  return {...base, ready: true, eligible: pattern.available >= 3, score:pattern.score, evidence,
-    reason:pattern.available >= 3 ? reason+' 급등 전과 유사' : '서로 다른 과거 비교 사례 3개 미만',
+  if(record.through!==completedDate(now)||record.createdAt>now)
+    return {...base,reason:'오늘 적용할 누적 공통점 갱신 대기',evidence};
+  const raw=bars.map(b=>({candle_date_time_utc:new Date(b.openTime).toISOString(),opening_price:b.open,
+    high_price:b.high,low_price:b.low,trade_price:b.close,candle_acc_trade_volume:b.baseVolume,candle_acc_trade_price:b.quoteVolume}));
+  const description=dailyDescription(raw,end,market.market),common=scoreCommon(description,record);
+  if(!description.valid)return {...base,reason:'공통점 비교용 일봉 이력 확인 필요',evidence};
+  const hourly=rawBars(cache,60,endOf(60,now)).slice(-21),last=hourly.at(-1);
+  const flowKnown=hourly.length===21&&last.closeTime===endOf(60,now)
+    &&covered(cache,60,hourly[0].openTime,last.closeTime);
+  const average=flowKnown?mean(hourly.slice(0,-1).map(b=>b.baseVolume)):null;
+  const flow=flowKnown&&average>0?last.close>last.open&&last.close>hourly.at(-2).close&&last.baseVolume>average:null;
+  Object.assign(evidence,{description,common,flow,criterionThrough:record.through,criterionCreatedAt:record.createdAt});
+  const reason=common.hits+'/'+common.total+'개 일치 · '+common.labels.join(' · ');
+  return {...base, ready: true, eligible: common.total>0, score:common.score, evidence,
+    reason,commonHits:common.hits,commonTotal:common.total,commonKnown:common.known,
+    flowRank:flow===true?2:flow===false?1:0,flowLabel:flow===true?'가격·거래량 동반 상승':flow===false?'동반 상승 미확인':'1시간 이력 확인 중',
     quote, quoteVolume24h: quote.quoteVolume24h};
 }
 
-export function makeBetaCohort(assessments, now) {
+export function makeBetaCohort(assessments, now, record=latestRecord(SEED)) {
   const pool = assessments.filter(a => a.ready && a.eligible);
   const ranked = [...pool].sort((a,b) => b.score - a.score
+    || (b.commonKnown??0)-(a.commonKnown??0) || (b.flowRank??0)-(a.flowRank??0)
+    || (b.evidence?.volume3??-Infinity)-(a.evidence?.volume3??-Infinity)
     || (b.quoteVolume24h ?? 0) - (a.quoteVolume24h ?? 0) || a.market.localeCompare(b.market));
-  const selected = ranked.filter(a => a.score >= MIN_SIMILARITY).slice(0, 10), markets = new Set(selected.map(a => a.market));
+  const selected = ranked.filter(a => a.commonHits>0).slice(0, 10), markets = new Set(selected.map(a => a.market));
   const day = betaDay(now), hash = a => createHash('sha256').update(day + ':' + a.market).digest('hex');
   const controls = pool.filter(a => !markets.has(a.market)).sort((a,b) => hash(a).localeCompare(hash(b))).slice(0, 10);
-  const record = (a, role, index) => ({market: a.market, name: a.name, role, rank: index + 1, score: a.score,
+  const recordRow = (a, role, index) => ({market: a.market, name: a.name, role, rank: index + 1, score: a.score,
+    commonHits:a.commonHits,commonTotal:a.commonTotal,commonKnown:a.commonKnown,flowLabel:a.flowLabel,
     reason: a.reason, selectedAt: now, entryPrice: a.quote.tradePrice, quoteAt: a.quote.receivedAt,
     evidence: a.evidence, windows: Object.fromEntries([24,72].map(hours => [hours, {
       high: a.quote.tradePrice, low: a.quote.tradePrice, hit30At: null, returnPrice: null,
       returnAt: null, lastObservationAt: now, closed: false
     }]))});
   return {id: BETA_RULE + ':' + day, rule: BETA_RULE, day, selectedAt: now, sourceDayThrough: endOf(1440, now),
+    criterion:{through:record.through,createdAt:record.createdAt,cases:record.cases,dailyReady:record.dailyReady,
+      commonIds:record.commonIds,features:record.features.filter(f=>record.commonIds.includes(f.id))},
     universe: assessments.length, ready: assessments.filter(a => a.ready).length,
     excluded: assessments.filter(a => !a.eligible).map(a => ({market: a.market, reason: a.reason})),
-    selected: selected.map((a,i) => record(a, 'candidate', i)),
-    controls: controls.map((a,i) => record(a, 'control', i)), savedAt: null};
+    selected: selected.map((a,i) => recordRow(a, 'candidate', i)),
+    controls: controls.map((a,i) => recordRow(a, 'control', i)), savedAt: null};
 }
 
 export function observeBeta(cohort, caches, quotes, now) {
@@ -104,6 +119,7 @@ export function observeBeta(cohort, caches, quotes, now) {
 
 export class SurgeBeta {
   constructor() {
+    this.research = new CommonResearch();
     this.cohorts = new Map(); this.attempts = new Map(); this.ready = false; this.error = null;
     this.initAttempt = -Infinity; this.lastWrite = -Infinity; this.scanned = 0; this.total = 0;
   }
@@ -143,6 +159,8 @@ export class SurgeBeta {
   }
   async run(radar, collectDaily, {maxRequests = 4, budgetMs = 2500} = {}) {
     const start = radar.clock();
+    this.research.clock=radar.clock;
+    void this.research.tick(radar.db);
     if (this.ready && this.ownerToken !== radar.token) {this.ready = false; this.initAttempt = -Infinity;}
     if (!this.ready && start - this.initAttempt >= 60000) await this.init(radar);
     if (!this.ready) return;
@@ -150,11 +168,13 @@ export class SurgeBeta {
     try {
       const id = BETA_RULE + ':' + betaDay(start);
       const allowed = radar.exclusions.ready && start >= radar.exclusions.checkedAt && start - radar.exclusions.checkedAt <= 120000;
-      if (!this.cohorts.has(id) && allowed && radar.markets.length) {
+      if (!this.cohorts.has(id) && allowed && radar.markets.length && this.research.status().current && !this.research.error) {
         const markets = radar.markets.filter(m => !m.warned && m.market !== 'KRW-USDT');
         this.total = markets.length;
         const end = endOf(1440, start);
-        const pending = markets.filter(m => (radar.caches.get(m.market)?.verified?.[1440]?.checkedThrough ?? 0) < end)
+        const needsDaily=m=>{const cache=radar.caches.get(m.market),meta=cache?.verified?.[1440];
+          return (meta?.checkedThrough??0)<end||(!meta?.exhausted&&rawBars(cache,1440,end).length<400);};
+        const pending = markets.filter(needsDaily)
           .sort((a,b) => (this.attempts.get(a.market) ?? 0) - (this.attempts.get(b.market) ?? 0) || a.market.localeCompare(b.market));
         let requests = 0;
         for (const info of pending) {
@@ -163,7 +183,7 @@ export class SurgeBeta {
           this.attempts.set(info.market, radar.clock());
           radar.stage('베타 일봉 수집', info.market, 1440);
           const cache = await radar.load(info.market);
-          if ((cache.verified?.[1440]?.checkedThrough ?? 0) < end) {
+          if (needsDaily(info)) {
             requests++;
             const changed = await collectDaily(cache, info.market, radar.clock());
             if (changed) radar.dirty.add(info.market);
@@ -171,11 +191,12 @@ export class SurgeBeta {
           radar.progress('베타 일봉 확인 완료');
         }
         const now = radar.clock();
-        const assessments = markets.map(m => inspectBeta(m, radar.caches.get(m.market), radar.quotes.get(m.market), now));
+        const criterion=latestRecord(this.research.model);
+        const assessments = markets.map(m => inspectBeta(m, radar.caches.get(m.market), radar.quotes.get(m.market), now,criterion));
         this.scanned = assessments.filter(a => a.inspected).length;
         // 시장 전체의 일봉 조회가 끝난 뒤 한 번 확정한다. 시세 장애로 빈 원장을 확정하지 않는다.
         if (betaDay(now) === betaDay(start) && this.scanned === markets.length && assessments.some(a => a.ready)) {
-          const cohort = makeBetaCohort(assessments, now);
+          const cohort = makeBetaCohort(assessments, now,criterion);
           this.cohorts.set(cohort.id, await this.save(radar, cohort, true));
           radar.snapshotSavedAt = 0;
         }
@@ -202,9 +223,9 @@ export class SurgeBeta {
     const publicRow = ({evidence, ...row}) => row;
     const display = row => ({...publicRow(row), quote: freshBetaQuote(radar.quotes.get(row.market), now) ? radar.quotes.get(row.market) : null});
     return {rule: BETA_RULE, experimental: true, error: this.error, storageReady: this.ready,
+      research:this.research.status(),criterion:current?.criterion??null,
       scanned: this.scanned, total: this.total, selectedAt: current?.selectedAt ?? null,
       savedAt: current?.savedAt ?? null,
-      templateCount:SURGE_TEMPLATES.length, templateMarkets:new Set(SURGE_TEMPLATES.map(t=>t.market)).size,
       rows: current?.selected.filter(r=>!r.preparationEndedAt && !r.windows[72].hit30At).map(display) ?? [],
       progressed: current?.selected.filter(r=>r.preparationEndedAt || r.windows[72].hit30At).length ?? 0,
       history: [...this.cohorts.values()].sort((a,b) => b.selectedAt - a.selectedAt).map(c => ({

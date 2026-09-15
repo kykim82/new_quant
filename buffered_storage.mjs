@@ -129,6 +129,9 @@ export function bufferedDatabase({remote,file,adapter,clock=Date.now,emit=()=>{}
             const saved=JSON.parse(incoming.payload_json),current=JSON.parse(local.payload_json);
             if(saved.selectedAt!==current.selectedAt)sqlite.prepare('INSERT OR IGNORE INTO buffer_conflicts VALUES (?,?)').run('cohort:'+current.id+':'+current.selectedAt,local.payload_json);
             row={...incoming,payload_json:JSON.stringify(mergeCohort(saved,current))};
+          }else if(t.name==='radar_snapshot'&&Number(key)===2){
+            const saved=JSON.parse(incoming.payload_json),current=JSON.parse(local.payload_json);
+            if((current.generatedAt??0)>=(saved.generatedAt??0))continue;
           }else continue;
           changed=row.payload_json!==incoming.payload_json;
         }
