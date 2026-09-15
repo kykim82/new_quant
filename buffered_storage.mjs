@@ -4,6 +4,7 @@ import {mkdirSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {createBackup} from './r2_backup.mjs';
+import {mergePerformance} from './recommendation_performance.mjs';
 
 const DAY=86400000;
 const TABLES=[
@@ -20,6 +21,7 @@ export function mergePlanRows(saved,current){
   if(!saved)return current;if(!current)return saved;
   if(saved.plan?.id!==current.plan?.id)throw new Error('서로 다른 추천 원장은 합칠 수 없습니다.');
   const result=structuredClone(saved),a=saved.plan,b=current.plan,p=result.plan;
+  if(saved.performance||current.performance)result.performance=mergePerformance(saved.performance,current.performance);
   result.firstShownAt=first(saved.firstShownAt,current.firstShownAt);
   p.createdAt=first(a.createdAt,b.createdAt);
   p.hits=[0,1,2].map(i=>Boolean(a.hits?.[i]||b.hits?.[i]));

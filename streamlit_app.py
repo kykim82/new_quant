@@ -58,6 +58,67 @@ def plan_status(plan, now_ms=None):
     return code
 
 
+def performance_tables(rows):
+    summary = []
+    for unit, label in FRAME_LABELS.items():
+        group = [r for r in rows if r['unit'] == unit]
+        known = [r for r in group if r.get('price') and not r.get('error')]
+        observed = [r for r in known if r['cursor'] > math.ceil(r['at'] / 900_000) * 900_000]
+        summary.append({'시간대': label, '추천 건수': len(group), '가격 관찰 건수': len(observed),
+                        '+5% 확인': sum(r['maxPct'] >= 5 for r in observed),
+                        '+10% 확인': sum(r['maxPct'] >= 10 for r in observed),
+                        '추천 후 1차 도달': sum(bool(r['targetTimes'][0]) for r in observed),
+                        '손절가 접촉': sum(bool(r.get('stopAt')) for r in observed),
+                        '관찰 종료': sum(bool(r.get('done')) for r in observed)})
+    detail = []
+    for r in rows[:200]:
+        state = '기준 가격 없음 · 복구 불가' if not r.get('price') else r.get('error') or ('관찰 종료' if r.get('done') else '관찰·복구 중')
+        notes = []
+        if r.get('initialPartial'):
+            notes.append('첫 15분봉 일부 제외')
+        if r.get('finalPartial'):
+            notes.append('종료 봉 일부 제외')
+        if r.get('sameBarConflict'):
+            notes.append('같은 봉 목표·손절 순서 불명')
+        detail.append({'종목': symbol(r), '시간대': FRAME_LABELS.get(r['unit'], str(r['unit'])),
+                       '기준 시각': stamp(r['at']), '기준가': r.get('price'),
+                       '확인 최고 상승(%)': r.get('maxPct'), '마지막 관찰 등락(%)': r.get('lastPct'),
+                       '관찰 가격 시각': stamp(r.get('lastAt')), '최근 일별 집계 기준': stamp(r.get('lastSummaryAt')), '봉 확인 시각': stamp(r.get('checkedThrough')),
+                       '상태': state, '주의': ' · '.join(notes)})
+    return pd.DataFrame(summary), pd.DataFrame(detail)
+
+
+def draw_performance(payload):
+    with st.expander('추천 성과 · 신규 기록 / 과거 참고'):
+        data = payload.get('recommendationPerformance')
+        if not data:
+            st.info('성과 기록 기능이 시작되면 이곳에 표시됩니다.')
+            return
+        st.caption(data.get('stage', '성과 관찰 중'))
+        if data.get('error'):
+            st.warning(data['error'])
+        st.caption('신규 기록은 서버가 시간대별 상위 10개 목록에 처음 포함한 시점부터입니다. 화면을 실제로 열었는지나 실제 매수 체결을 뜻하지 않습니다. 같은 계획은 한 번만 셉니다.')
+        st.caption('최초 포함 정보는 기존 추천 원장 저장에 함께 기록합니다. 성과는 매일 오전 9시 이후 완료된 거래일까지 하루씩 집계합니다. 15분봉은 계산 자료이며 15분마다 성과를 저장하지 않습니다. 서버가 중단되면 다음 실행 때 빠진 날짜를 이어서 집계합니다.')
+        st.caption('기준 당시 현재가 대비 상승폭이며 손절가·3차 목표 접촉 또는 기존 계획 종료까지 관찰합니다. 첫·마지막 일부 봉은 제외될 수 있어 최고 상승폭은 하한값이며 실제 수익률·승률이 아닙니다. 관찰 중인 기록도 포함됩니다. 일별 누적 결과는 원장에 보존하며 이 화면은 최신 집계입니다.')
+        for tab, source in zip(st.tabs(['신규 상위 10개 성과', '과거 참고 · 표시 여부 미확인']), ['live', 'legacy']):
+            with tab:
+                rows = [r for r in data['rows'] if r['source'] == source]
+                if source == 'legacy':
+                    st.caption('기존 추천 조건 통과 시각·가격으로 복구합니다. 당시 상위 10개 표시 증거가 없어 신규 성과와 합치지 않습니다. 기준 가격이 없으면 임의 매수가로 대체하지 않습니다.')
+                summary, detail = performance_tables(rows)
+                if data.get('totals'):
+                    summary = pd.DataFrame([{'시간대': FRAME_LABELS[r['unit']], '추천 건수': r['total'], '가격 관찰 건수': r['observed'],
+                                             '+5% 확인': r['up5'], '+10% 확인': r['up10'], '추천 후 1차 도달': r['target1'],
+                                             '손절가 접촉': r['stopped'], '관찰 종료': r['ended']}
+                                            for r in data['totals'] if r['source'] == source])
+                st.dataframe(summary, hide_index=True, width='stretch')
+                if not detail.empty:
+                    st.dataframe(detail, hide_index=True, width='stretch')
+                st.caption('목표가가 기준 시점에 이미 현재가 이하였던 경우 추천 후 도달 건수에서 제외합니다. 종료는 15분봉 접촉 확인 기준이며 봉 안의 순서는 확정하지 않습니다. 집계는 전체, 상세 표·다운로드는 최근 200건입니다. 전체 원장은 DB에 보존합니다.')
+                st.download_button('최근 성과 기록 다운로드', json.dumps(rows, ensure_ascii=False, indent=2),
+                                   file_name=f'recommendation-performance-{source}.json', mime='application/json', key=f'performance_{source}')
+
+
 def recommendation_table(rows, now_ms=None):
     result = []
     for row in rows:
@@ -347,6 +408,7 @@ def render(worker):
                             **{f'{i + 1}차 매도가': relative_price(t, p['entry']) for i, t in enumerate(p['targets'])}})
         st.dataframe(pd.DataFrame(history), hide_index=True, width='stretch')
         st.caption('이 표는 새 구조에서 표시된 계획의 관찰 기록입니다. 이전 구조의 DB 원장은 삭제하지 않고 보존합니다.')
+    draw_performance(payload)
     st.session_state.setdefault('promising_open', True)
     with st.container(horizontal=True, vertical_alignment='center', gap='small'):
         st.subheader('2. 유망 종목', width='content')
@@ -371,7 +433,7 @@ def main():
         return
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ('engine.mjs', 'buffered_storage.mjs', 'r2_client.mjs', 'r2_backup.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs', 'surge_common.mjs', 'surge_common_rules.mjs', 'surge_study.mjs', 'surge_common_seed.json', 'surge_indicator_baseline.txt'):
+    for name in ('engine.mjs', 'buffered_storage.mjs', 'r2_client.mjs', 'r2_backup.mjs', 'quant_core.mjs', 'quant_worker.py', 'streamlit_app.py', 'surge_beta.mjs', 'surge_patterns.mjs', 'surge_templates.mjs', 'surge_common.mjs', 'surge_common_rules.mjs', 'surge_study.mjs', 'surge_common_seed.json', 'surge_indicator_baseline.txt', 'recommendation_performance.mjs'):
         digest.update((root / name).read_bytes())
     for k, v in sorted(config.items()):
         digest.update(f'{k}={v}'.encode())

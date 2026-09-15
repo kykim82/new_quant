@@ -77,6 +77,9 @@ def public_snapshot(state, now_ms=None):
     if beta:
         beta['stale'] = payload['stale']
         for row in beta.get('rows', []):
+            pressure = row.get('pressure') or {}
+            if pressure.get('asOf') is not None and not 0 <= now_ms - pressure['asOf'] <= 20_000:
+                row['pressure'] = {'ready': False, 'state': '최신 체결 확인 중', 'bidShare': None, 'cash': None}
             q = row.get('quote') or {}
             if not 0 <= now_ms - q.get('receivedAt', 0) <= 45_000:
                 row['quote'] = None
